@@ -1,95 +1,150 @@
-use ipc_channel::ipc::{self};
 use serde::{Serialize, Deserialize};
-use std::env;
-use kameo::{Actor, message::{Context, Message as KameoMessage}};
-use kameo_child_process::{Control, spawn_subprocess, register_subprocess_actors};
+use kameo::{Actor, message::{Context, Message}};
+use kameo_child_process::{
+    KameoChildProcessMessage, Handler, register_subprocess_actors_async,
+    SubprocessActor, handshake, Control
+};
+use tracing::{debug, info, Level};
 use tracing_subscriber;
-use tracing::{debug, info, trace, Level};
+use std::collections::HashMap;
+use bincode::{Encode, Decode};
 
-// Define a Counter actor
-#[derive(Default)]
-struct Counter {
-    count: i64,
+// Ork types and behaviors
+#[derive(Debug, Default)]
+pub struct OrkMob {
+    boyz: HashMap<String, i32>,  // Name -> WAAAGH! power
+    total_waaagh: i32,
 }
 
-// Implement kameo::Actor for Counter
-impl Actor for Counter {
+#[derive(Debug, Serialize, Deserialize, Clone, Encode, Decode)]
+pub enum OrkMessage {
+    RecruitBoy { name: String, power: i32 },
+    StartWaaagh { target: String },
+    CheckPower { boy_name: String },
+}
+
+// Implement KameoChildProcessMessage for our message type
+impl KameoChildProcessMessage for OrkMessage {}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Encode, Decode)]
+pub enum OrkResponse {
+    Recruited { name: String, power: i32 },
+    WaaaghStarted { target: String, total_power: i32 },
+    BoyPower { name: String, power: Option<i32> },
+}
+
+// Local actor implementation
+impl Actor for OrkMob {
     type Error = std::convert::Infallible;
 }
 
-// Define an increment message
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Inc {
-    amount: i64,
-}
+impl Message<OrkMessage> for OrkMob {
+    type Reply = OrkResponse;
 
-// Implement Kameo's Message trait for Counter
-impl KameoMessage<Inc> for Counter {
-    type Reply = i64;
-    async fn handle(&mut self, msg: Inc, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        self.count += msg.amount;
-        self.count
+    async fn handle(&mut self, msg: OrkMessage, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        match msg {
+            OrkMessage::RecruitBoy { name, power } => {
+                debug!(event = "ork_action", action = "recruit", ?name, ?power, "RECRUITIN' A NEW BOY!");
+                self.boyz.insert(name.clone(), power);
+                self.total_waaagh += power;
+                OrkResponse::Recruited { name, power }
+            }
+            OrkMessage::StartWaaagh { target } => {
+                info!(event = "ork_action", action = "waaagh", ?target, total_power = self.total_waaagh, "WAAAAAAAAAAAAAAAGH!");
+                OrkResponse::WaaaghStarted { 
+                    target,
+                    total_power: self.total_waaagh 
+                }
+            }
+            OrkMessage::CheckPower { boy_name } => {
+                debug!(event = "ork_action", action = "check_power", ?boy_name, "CHECKIN' DA BOY'Z POWER!");
+                OrkResponse::BoyPower { 
+                    name: boy_name.clone(),
+                    power: self.boyz.get(&boy_name).copied()
+                }
+            }
+        }
     }
 }
 
-impl kameo_child_process::Handler<Inc, i64> for Counter {
-    fn handle(&mut self, msg: Inc) -> i64 {
-        self.count += msg.amount;
-        self.count
+// Subprocess handler implementation
+impl Handler<OrkMessage> for OrkMob {
+    type Output = OrkResponse;
+
+    async fn handle(&mut self, msg: OrkMessage) -> Self::Output {
+        match msg {
+            OrkMessage::RecruitBoy { name, power } => {
+                debug!(event = "ork_action", action = "recruit", ?name, ?power, "RECRUITIN' A NEW BOY!");
+                self.boyz.insert(name.clone(), power);
+                self.total_waaagh += power;
+                OrkResponse::Recruited { name, power }
+            }
+            OrkMessage::StartWaaagh { target } => {
+                info!(event = "ork_action", action = "waaagh", ?target, total_power = self.total_waaagh, "WAAAAAAAAAAAAAAAGH!");
+                OrkResponse::WaaaghStarted { 
+                    target,
+                    total_power: self.total_waaagh 
+                }
+            }
+            OrkMessage::CheckPower { boy_name } => {
+                debug!(event = "ork_action", action = "check_power", ?boy_name, "CHECKIN' DA BOY'Z POWER!");
+                OrkResponse::BoyPower { 
+                    name: boy_name.clone(),
+                    power: self.boyz.get(&boy_name).copied()
+                }
+            }
+        }
     }
 }
 
-register_subprocess_actors! {
-    (Counter, Inc) => {
-        debug!("[subprocess] Running handler for Counter/Inc, will exit after loop");
-        kameo_child_process::default_actor_loop::<Counter, Inc, i64>();
-        debug!("[subprocess] Exiting after handler loop");
-    }
-}
+// Register our Ork actor for subprocess handling
+register_subprocess_actors_async!((OrkMob, OrkMessage));
 
-fn main() {
-    // Initialize tracing as early as possible, explicitly to stderr
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt().with_max_level(Level::DEBUG).init();
-    // Check subprocess first
-    let is_child = std::env::var("KAMEO_CHILD_ACTOR").is_ok();
-    let process_role = if is_child { "child" } else { "parent" };
-    let span = tracing::span!(Level::INFO, "process", process_role);
-    let _enter = span.enter();
-    if maybe_run_subprocess_registry_and_exit() {
+    
+    // Check if we're a subprocess and handle that case
+    if maybe_run_subprocess_registry_and_exit_async().await {
         unreachable!("Subprocess should have exited");
     }
-    info!("Parent process starting");
-    eprintln!("Parent process starting");
-    let actor_env = std::env::var("KAMEO_CHILD_ACTOR").ok();
-    debug!("KAMEO_CHILD_ACTOR={:?}", actor_env);
-    info!("Entered main()");
-    eprintln!("Entered main()");
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(run_main());
-    info!("Exiting main()");
-    eprintln!("Exiting main()");
-}
 
-async fn run_main() {
-    info!("[run_main] Parent process");
-    // Spawn and interact with multiple Counter actors in subprocesses
-    let mut actors = Vec::new();
-    for i in 0..5 {
-        let (tx, rx) = spawn_subprocess::<Counter, Inc, i64>();
-        debug!("[parent] Spawned subprocess Counter actor #{}", i);
-        actors.push((tx, rx));
+    info!("STARTIN' DA WAAAGH!");
+
+    // Create a local Ork Mob
+    let local_mob = kameo::spawn(OrkMob::default());
+    
+    // Create a subprocess Ork Mob using our SubprocessActor
+    let (stream, child, socket_path) = handshake::host::<OrkMessage, OrkResponse>("OrkMob", std::env::current_exe().unwrap().to_str().unwrap())
+        .await
+        .expect("Failed to spawn subprocess");
+    
+    let subprocess_mob = SubprocessActor::<OrkMessage>::new(stream, child, socket_path);
+    let subprocess_mob = kameo::spawn(subprocess_mob);
+
+    // Test both mobs
+    let mobs = vec![&local_mob, &subprocess_mob];
+    
+    for (i, mob) in mobs.iter().enumerate() {
+        // Recruit some boyz
+        let reply = mob.send(OrkMessage::RecruitBoy { 
+            name: format!("GrimSkull_{}", i), 
+            power: 100 * (i as i32 + 1)
+        }).await;
+        info!(mob_index = i, ?reply, "RECRUITED A BOY!");
+
+        // Start a WAAAGH!
+        let reply = mob.send(OrkMessage::StartWaaagh { 
+            target: format!("Humie Base {}", i)
+        }).await;
+        info!(mob_index = i, ?reply, "STARTED A WAAAGH!");
+
+        // Check a boy's power
+        let reply = mob.send(OrkMessage::CheckPower { 
+            boy_name: format!("GrimSkull_{}", i)
+        }).await;
+        info!(mob_index = i, ?reply, "CHECKED BOY'Z POWER!");
     }
-    // Send each actor a message and log the reply
-    for (i, (tx, rx)) in actors.into_iter().enumerate() {
-        let amount = (i as i64 + 1) * 10;
-        debug!("[parent] Sending Inc {{ amount: {} }} to actor #{}", amount, i);
-        tx.send(Control::Real(Inc { amount })).unwrap();
-        debug!("[parent] Waiting for reply from actor #{}", i);
-        let reply = rx.recv().unwrap();
-        debug!("[parent] Received reply from actor #{}: {:?}", i, reply);
-        info!("[parent] Final reply from actor #{}: {:?}", i, reply);
-    }
-    info!("[run_main] All subprocess actors tested");
-    eprintln!("[run_main] Exiting run_main() (parent)");
-    info!("[run_main] Exiting run_main() (parent)");
+
+    info!("WAAAGH COMPLETE! BACK TO DA BASE!");
 } 
