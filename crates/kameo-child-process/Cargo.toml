@@ -1,0 +1,29 @@
+[package]
+name = "kameo-child-process"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+ipc-channel = { workspace = true }
+kameo = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+interprocess = { workspace = true }
+nix = { workspace = true }
+rand = { workspace = true }
+parity-tokio-ipc = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+

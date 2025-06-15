@@ -17,13 +17,10 @@ use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use thiserror::Error;
-use tracing_subscriber;
-use nix::unistd::{fork, ForkResult};
-use tokio::runtime::Runtime;
 use futures::StreamExt;
-use std::pin::Pin;
 use std::future::Future;
-use ipc_channel::ipc::{IpcSender, IpcReceiver, channel};
+use ipc_channel::ipc::{IpcSender, IpcReceiver};
+use tokio::runtime::Runtime;
 
 /// Trait object for async read/write operations
 #[async_trait]
@@ -281,7 +278,7 @@ pub mod handshake {
     pub fn unique_socket_path(actor_name: &str) -> PathBuf {
         let mut path = std::path::PathBuf::from("/tmp");
         let short_name = &actor_name[0..std::cmp::min(8, actor_name.len())];
-        path.push(format!("kameo-{}-{}.sock", short_name, Uuid::new_v4().simple().to_string()));
+        path.push(format!("kameo-{}-{}.sock", short_name, Uuid::new_v4().simple()));
         path
     }
 
@@ -333,66 +330,30 @@ pub mod handshake {
     }
 }
 
-/// Macro to register subprocess actors and provide child process handling
+/// Macro to register subprocess actors
 #[macro_export]
-macro_rules! kameo_main {
-    // Main macro pattern that takes actor registrations
+macro_rules! register_subprocess_actors {
     (
-        actors = { $(($actor:ty, $msg:ty)),* $(,)? },
-        parent_runtime = { worker_threads = $worker_threads:expr $(,)? },
-        parent_main = $parent_main:expr
+        actors = { $(($actor:ty, $msg:ty)),* $(,)? }
         $(,)?
     ) => {
-        #[::tokio::main(flavor = "multi_thread", worker_threads = $worker_threads)]
-        async fn main() -> Result<(), Box<dyn std::error::Error>> {
-            // Initialize tracing
-            ::tracing_subscriber::fmt()
-                .with_max_level(::tracing::Level::DEBUG)
-                .init();
-
-            // Check if we're a child process - if so, run the actor and exit
+        pub fn maybe_run_subprocess_registry() -> Option<Result<(), Box<dyn std::error::Error>>> {
+            // Check if we're a child process
             if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
-                let span = ::tracing::span!(::tracing::Level::INFO, "process", process_role = "child", pid = std::process::id());
-                let _enter = span.enter();
-
-                ::tracing::info!(
-                    event = "runtime",
-                    process = "child",
-                    runtime_type = "single-threaded",
-                    "Child process starting"
-                );
-
-                // Match on actor type and run the appropriate handler
-                match actor_name.as_str() {
+                Some(match actor_name.as_str() {
                     $(
                         stringify!($actor) => {
-                            let mut actor = <$actor>::default();
-                            let conn = $crate::handshake::child().await.expect("Failed to establish child connection");
-                            $crate::run_child_actor_loop(&mut actor, conn).await.expect("Actor loop failed");
-                            ::tracing::info!(event = "lifecycle", status = "complete", actor = actor_name, "Handler complete, exiting");
-                            std::process::exit(0);
+                            ::kameo_child_process::child_process_main::<$actor, $msg>()
                         }
                     )*
                     _ => {
                         ::tracing::error!(event = "lifecycle", status = "error", actor = actor_name, "Unknown actor type");
-                        std::process::exit(1);
+                        Err("Unknown actor type".into())
                     }
-                }
+                })
+            } else {
+                None
             }
-
-            // Parent process main logic
-            ::tracing::info!(
-                event = "runtime",
-                process = "parent",
-                runtime_type = "multi-threaded",
-                worker_threads = $worker_threads,
-                "Parent process starting"
-            );
-
-            // Run the parent main function
-            $parent_main.await?;
-
-            Ok(())
         }
     };
 }
@@ -412,6 +373,17 @@ where
 {
     config: ChildProcessConfig,
     _phantom: PhantomData<(A, M)>,
+}
+
+impl<A, M> Default for ChildProcessBuilder<A, M>
+where 
+    A: Default + Message<M> + Send + Sync + 'static,
+    M: KameoChildProcessMessage + Send + 'static,
+    <A as Message<M>>::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+ {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<A, M> ChildProcessBuilder<A, M>
@@ -546,7 +518,7 @@ where
                         return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to handle message: {:?}", e)));
                     }
                 };
-                let reply_bytes = bincode::encode_to_vec(&Control::Real(reply), bincode::config::standard())
+                let reply_bytes = bincode::encode_to_vec(Control::Real(reply), bincode::config::standard())
                     .expect("Failed to encode reply");
                 conn.write_all(&reply_bytes).await?;
                 debug!(event = "message", status = "complete", "Message handled successfully");
@@ -557,12 +529,47 @@ where
     Ok(())
 }
 
+/// Macro to set up the complete subprocess actor system with custom runtime initialization
+#[macro_export]
+macro_rules! setup_subprocess_system {
+    (
+        actors = { $(($actor:ty, $msg:ty)),* $(,)? },
+        child_init = $child_init:block,
+        parent_init = $parent_init:block $(,)?
+    ) => {
+        fn main() -> Result<(), Box<dyn std::error::Error>> {
+            if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
+                // Child process branch
+                match actor_name.as_str() {
+                    $(
+                        stringify!($actor) => {
+                            // Initialize child process with custom config
+                            let config = $child_init;
+                            ::kameo_child_process::child_process_main_with_config::<$actor, $msg>(config)
+                        }
+                    )*
+                    _ => {
+                        ::tracing::error!(event = "lifecycle", status = "error", actor = actor_name, "Unknown actor type");
+                        Err("Unknown actor type".into())
+                    }
+                }
+            } else {
+                // Parent process branch - call user-provided initialization
+                $parent_init
+            }
+        }
+    };
+}
+
 /// Prelude module for commonly used items
 pub mod prelude {
-    pub use crate::kameo_main;
+    pub use crate::setup_subprocess_system;
     pub use crate::ChildProcessBuilder;
     pub use crate::SubprocessActor;
     pub use crate::handshake;
+    pub use tokio::runtime;
+    pub use crate::child_process_main;
+    pub use crate::child_process_main_with_config;
 }
 
 #[async_trait]
@@ -572,8 +579,8 @@ where
 {
     type Reply = Result<<M as KameoChildProcessMessage>::Reply, SubprocessActorError>;
 
-    #[instrument(skip(self, ctx), fields(actor_type = "SubprocessActor"))]
-    fn handle(&mut self, msg: M, ctx: &mut Context<Self, Self::Reply>) -> impl Future<Output = Self::Reply> + Send {
+    #[instrument(skip(self, _ctx), fields(actor_type = "SubprocessActor"))]
+    fn handle(&mut self, msg: M, _ctx: &mut Context<Self, Self::Reply>) -> impl Future<Output = Self::Reply> + Send {
         async move {
             let mut conn = self.connection.lock().await;
             
@@ -601,4 +608,47 @@ where
             }
         }
     }
+}
+
+/// Run a child process actor with the default single-threaded runtime configuration.
+/// This is the default implementation used by the register_subprocess_actors macro.
+pub fn child_process_main<A, M>() -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Default + Message<M> + Clone + Send + 'static,
+    M: KameoChildProcessMessage + Send + 'static,
+    <A as Message<M>>::Reply: Reply + Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static,
+    <<A as Message<M>>::Reply as Reply>::Error: std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
+    <<A as Message<M>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
+{
+    let config = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    
+    config.block_on(async {
+        let mut actor = A::default();
+        let conn = handshake::child().await?;
+        run_child_actor_loop(&mut actor, conn).await
+    })?;
+    
+    Ok(())
+}
+
+/// Run a child process actor with a custom runtime configuration.
+pub fn child_process_main_with_config<A, M>(mut config: tokio::runtime::Builder) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Default + Message<M> + Clone + Send + 'static,
+    M: KameoChildProcessMessage + Send + 'static,
+    <A as Message<M>>::Reply: Reply + Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static,
+    <<A as Message<M>>::Reply as Reply>::Error: std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
+    <<A as Message<M>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
+{
+    let runtime = config.build()?;
+    
+    runtime.block_on(async {
+        let mut actor = A::default();
+        let conn = handshake::child().await?;
+        run_child_actor_loop(&mut actor, conn).await
+    })?;
+    
+    Ok(())
 }

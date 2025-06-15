@@ -1,0 +1,46 @@
+[package]
+name = "kameo-snake-handler"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+description = "A Kameo actor for running Python code with proper error handling and tracing"
+
+[dependencies]
+# Core dependencies
+kameo = { workspace = true }
+kameo-child-process = { path = "../kameo-child-process" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Python integration
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = "1.0"
+bincode = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging and instrumentation
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[build-dependencies]
+pyo3-build-config = "0.25"
+
+[package.metadata.maturin]
+python-source = "python"
+
+[env]
+DYLD_LIBRARY_PATH = "/Library/Frameworks/Python.framework/Versions/3.13/lib/"

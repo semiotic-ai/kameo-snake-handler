@@ -1,0 +1,27 @@
+[package]
+name = "kameo-snake-testing"
+version = "0.1.0"
+edition = "2021"
+authors = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+kameo = { workspace = true }
+kameo-child-process = { path = "../kameo-child-process" }
+kameo-snake-handler = { path = "../kameo-snake-handler" }
+tokio = { version = "1.0", features = ["full", "test-util", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+bincode = { workspace = true }
+async-trait = "0.1"
+futures = { workspace = true }
+indoc = "2.0"
+pyo3 = { workspace = true }
+pyo3-async-runtimes = { workspace = true }
+serde_json = "1.0"
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio-test = "0.4"
