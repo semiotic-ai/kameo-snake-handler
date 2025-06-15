@@ -128,6 +128,7 @@ pub enum OrkMessage {
     CheckKlanStrength { klan: OrkKlan },       // How strong is dis klan?
     FightOtherBoy { boy_name: String, target_name: String },
     WinFight { winner: String, loser: String },
+    PanicTest { reason: String }, // New message type for testing panics
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -326,6 +327,10 @@ impl Message<OrkMessage> for OrkMob {
                         OrkResponse::Error("Winner not found after initial check!".to_string())
                     }
                 }
+                OrkMessage::PanicTest { reason } => {
+                    debug!(event = "ork_action", action = "panic_test", reason = ?reason);
+                    panic!("WAAAGH! DELIBERATE PANIC: {}", reason);
+                }
             }
         }
     }
@@ -362,40 +367,16 @@ async fn parent_process_main() -> Result<(), Box<dyn std::error::Error>> {
     for (i, boss) in warbosses.iter().enumerate() {
         let boss = boss.clone();
         let handle = tokio::spawn(async move {
-            // Create some boyz
-            let klan1 = match i % 5 {
-                0 => OrkKlan::Goffs,
-                1 => OrkKlan::EvilSunz,
-                2 => OrkKlan::BadMoons,
-                3 => OrkKlan::DeathSkulls,
-                _ => OrkKlan::BloodAxes,
-            };
-            
-            let klan2 = match (i + 1) % 5 {
-                0 => OrkKlan::Goffs,
-                1 => OrkKlan::EvilSunz,
-                2 => OrkKlan::BadMoons,
-                3 => OrkKlan::DeathSkulls,
-                _ => OrkKlan::BloodAxes,
-            };
-
+            // First test normal operation
             let boy1_name = format!("Warboss_{}_Boy_1", i);
-            let boy2_name = format!("Warboss_{}_Boy_2", i);
-
-            // Recruit da boyz
+            
+            // Recruit one boy
             let response = boss.ask(OrkMessage::RecruitBoy {
                 name: boy1_name.clone(),
                 power: 100 + i as u32,
-                klan: klan1,
+                klan: OrkKlan::Goffs,
             }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            info!(event = "test", response = ?response, "Boy 1 recruited!");
-
-            let response = boss.ask(OrkMessage::RecruitBoy {
-                name: boy2_name.clone(),
-                power: 120 + i as u32,
-                klan: klan2,
-            }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            info!(event = "test", response = ?response, "Boy 2 recruited!");
+            info!(event = "test", response = ?response, "Boy recruited!");
 
             // Start a WAAAGH!
             let response = boss.ask(OrkMessage::StartWaaagh {
@@ -403,26 +384,40 @@ async fn parent_process_main() -> Result<(), Box<dyn std::error::Error>> {
             }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             info!(event = "test", response = ?response, "WAAAGH! started!");
 
-            // Let da boyz fight!
-            let response = boss.ask(OrkMessage::FightOtherBoy {
-                boy_name: boy1_name.clone(),
-                target_name: boy2_name.clone(),
-            }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            info!(event = "test", response = ?response, "Boyz had a fight!");
+            // Now test panic handling
+            info!(event = "test", warboss = i, "Testing panic handling...");
+            match boss.ask(OrkMessage::PanicTest {
+                reason: format!("Warboss {} testing panic handling!", i),
+            }).await {
+                Ok(_) => {
+                    error!(event = "test", warboss = i, "Expected panic but got success!");
+                    return Err(io::Error::new(io::ErrorKind::Other, "Expected panic but got success"));
+                }
+                Err(e) => {
+                    info!(event = "test", warboss = i, error = ?e, "Successfully caught panic!");
+                }
+            }
 
-            // Record da victory!
-            let response = boss.ask(OrkMessage::WinFight {
-                winner: boy2_name.clone(),
-                loser: boy1_name.clone(),
-            }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            info!(event = "test", response = ?response, "Victory recorded!");
+            // Try to send another message after panic to verify connection handling
+            info!(event = "test", warboss = i, "Testing post-panic message handling...");
+            match boss.ask(OrkMessage::CheckPower {
+                boy_name: boy1_name.clone(),
+            }).await {
+                Ok(_) => {
+                    error!(event = "test", warboss = i, "Expected failure but got success!");
+                    return Err(io::Error::new(io::ErrorKind::Other, "Expected failure but got success"));
+                }
+                Err(e) => {
+                    info!(event = "test", warboss = i, error = ?e, "Successfully detected dead actor!");
+                }
+            }
 
             Ok::<_, io::Error>(())
         });
         handles.push(handle);
     }
 
-    // Wait for all WAAAGH!s to complete
+    // Wait for all tests to complete
     for handle in handles {
         handle.await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Task join error: {}", e)))??;
     }
