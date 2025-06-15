@@ -1,14 +1,13 @@
+#![forbid(unsafe_code)]
+
 use serde::{Serialize, Deserialize};
-use std::{env, io};
-use std::process::Command;
-use tracing::{trace, debug, info, error, warn, Span, instrument};
-use kameo::actor::{Actor, ActorRef, WeakActorRef, ActorID};
-use kameo::message::{Context, Message, BoxMessage};
-use kameo::reply::{BoxReplySender, ReplyError};
+use std::io;
+use tracing::{debug, error, warn, info, instrument, Level};
+use kameo::actor::{Actor, ActorRef, WeakActorRef};
+use kameo::prelude::*;
 use kameo::error::{PanicError, ActorStopReason};
 use async_trait::async_trait;
-use parity_tokio_ipc::{Endpoint, Connection};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use std::path::PathBuf;
 use uuid::Uuid;
 use bincode::{Encode, Decode};
@@ -18,18 +17,57 @@ use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use thiserror::Error;
+use tracing_subscriber;
+use nix::unistd::{fork, ForkResult};
+use tokio::runtime::Runtime;
+use futures::StreamExt;
+use std::pin::Pin;
+use std::future::Future;
+use ipc_channel::ipc::{IpcSender, IpcReceiver, channel};
 
-/// Trait object for async read/write
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+/// Trait object for async read/write operations
+#[async_trait]
+pub trait AsyncReadWrite: Send + Unpin {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    async fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
+    async fn flush(&mut self) -> io::Result<()>;
+    async fn shutdown(&mut self) -> io::Result<()>;
+}
+
+impl std::fmt::Debug for dyn AsyncReadWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AsyncReadWrite")
+    }
+}
+
+#[async_trait]
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncReadWrite for T {
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        AsyncReadExt::read(self, buf).await
+    }
+
+    async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        AsyncWriteExt::write_all(self, buf).await
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        AsyncWriteExt::flush(self).await
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        AsyncWriteExt::shutdown(self).await
+    }
+}
+
+// Helper methods are now part of the trait itself
+impl dyn AsyncReadWrite {
+    // No need for helper methods here anymore since they're in the trait
+}
 
 /// Trait for messages that can be sent to a Kameo child process actor.
-pub trait KameoChildProcessMessage: Send + Serialize + DeserializeOwned + Encode + Decode<()> + 'static {}
-
-impl<T> KameoChildProcessMessage for T 
-where 
-    T: Send + Serialize + DeserializeOwned + Encode + Decode<()> + 'static 
-{}
+pub trait KameoChildProcessMessage: Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static {
+    type Reply: Reply + Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static;
+}
 
 /// Control message for handshake and real messages
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
@@ -48,16 +86,6 @@ impl<T> Control<T> {
             _ => None,
         }
     }
-}
-
-/// Trait for subprocess message handlers.
-#[async_trait]
-pub trait Handler<M> 
-where
-    M: Encode + Decode<()>
-{
-    type Output: Serialize + for<'de> Deserialize<'de> + Send + Sync + Encode + Decode<()> + 'static;
-    async fn handle(&mut self, msg: M) -> Self::Output;
 }
 
 /// Error types for subprocess actor
@@ -86,6 +114,7 @@ pub enum SubprocessActorError {
 }
 
 /// Actor that manages a subprocess and communicates with it via IPC
+#[derive(Debug)]
 pub struct SubprocessActor<M> {
     connection: Arc<Mutex<Box<dyn AsyncReadWrite>>>,
     child: Option<tokio::process::Child>,
@@ -96,14 +125,12 @@ pub struct SubprocessActor<M> {
 #[async_trait]
 impl<M> Actor for SubprocessActor<M> 
 where 
-    M: Message<M> + KameoChildProcessMessage + Send + 'static,
-    M::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
-    Self: Send + 'static,
+    M: KameoChildProcessMessage + Send + 'static,
 {
     type Error = SubprocessActorError;
 
-    #[instrument(skip(self, actor_ref), fields(actor_type = "SubprocessActor"))]
-    fn on_start(&mut self, actor_ref: ActorRef<Self>) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    #[instrument(skip(self, _actor_ref), fields(actor_type = "SubprocessActor"))]
+    fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         debug!(event = "lifecycle", status = "starting", "Starting subprocess actor");
         
         async move {
@@ -130,8 +157,8 @@ where
         }
     }
 
-    #[instrument(skip(self, actor_ref, reason), fields(actor_type = "SubprocessActor"))]
-    fn on_stop(&mut self, actor_ref: WeakActorRef<Self>, reason: ActorStopReason) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "SubprocessActor"))]
+    fn on_stop(&mut self, _actor_ref: WeakActorRef<Self>, reason: ActorStopReason) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         debug!(event = "lifecycle", status = "stopping", ?reason, "Stopping subprocess actor");
         
         async move {
@@ -152,69 +179,10 @@ where
         }
     }
 
-    #[instrument(skip(self, actor_ref, err), fields(actor_type = "SubprocessActor"))]
-    fn on_panic(&mut self, actor_ref: WeakActorRef<Self>, err: PanicError) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send {
+    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "SubprocessActor"))]
+    fn on_panic(&mut self, _actor_ref: WeakActorRef<Self>, err: PanicError) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send {
         error!(event = "lifecycle", status = "panicked", error = ?err, "Subprocess actor panicked");
         async move { Ok(ControlFlow::Break(ActorStopReason::Panicked(err))) }
-    }
-}
-
-impl<M> Message<M> for SubprocessActor<M>
-where
-    M: Message<M> + KameoChildProcessMessage + Send + 'static,
-    M::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
-{
-    type Reply = M::Reply;
-
-    #[instrument(skip(self, msg, ctx), fields(actor_type = "SubprocessActor", message_type = std::any::type_name::<M>()))]
-    async fn handle(&mut self, msg: M, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        debug!(event = "message", status = "handling", "Handling message");
-
-        let msg_bytes = match bincode::encode_to_vec(&Control::Real(msg), bincode::config::standard()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!(event = "message", error = ?e, "Failed to serialize message");
-                panic!("Failed to serialize message: {}", e);
-            }
-        };
-
-        let mut conn = self.connection.lock().await;
-        if let Err(e) = conn.write_all(&msg_bytes).await {
-            error!(event = "message", error = ?e, "Failed to send message");
-            panic!("Failed to send message: {}", e);
-        }
-
-        let mut resp_buf = vec![0u8; 4096];
-        let n = match conn.read(&mut resp_buf).await {
-            Ok(0) => {
-                error!(event = "message", "Connection closed while waiting for response");
-                panic!("Connection closed while waiting for response");
-            }
-            Ok(n) => n,
-            Err(e) => {
-                error!(event = "message", error = ?e, "Failed to read response");
-                panic!("Failed to read response: {}", e);
-            }
-        };
-
-        let (ctrl, _): (Control<M::Reply>, _) = match bincode::decode_from_slice(&resp_buf[..n], bincode::config::standard()) {
-            Ok(result) => result,
-            Err(e) => {
-                error!(event = "message", error = ?e, "Failed to deserialize response");
-                panic!("Failed to deserialize response: {}", e);
-            }
-        };
-
-        match ctrl {
-            Control::Real(reply) => {
-                debug!(event = "message", status = "completed", "Message handled successfully");
-                reply
-            }
-            Control::Handshake => {
-                error!(event = "message", "Received unexpected handshake response");
-                panic!("Received unexpected handshake response");
-            }
-        }
     }
 }
 
@@ -227,15 +195,88 @@ impl<M> SubprocessActor<M> {
             _phantom: PhantomData,
         }
     }
+
+    pub async fn run_subprocess<A, Msg>(actor: A, rx: IpcReceiver<Vec<u8>>, tx: IpcSender<Vec<u8>>) -> Result<(), Box<dyn std::error::Error>>
+    where
+        A: Message<Msg> + Clone + Send + 'static,
+        Msg: KameoChildProcessMessage + Send + 'static,
+        <A as Message<Msg>>::Reply: Reply + Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static,
+        <<A as Message<Msg>>::Reply as Reply>::Error: std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
+        <<A as Message<Msg>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
+    {
+        // First handle handshake
+        let handshake_msg = rx.recv()?;
+        let (control, _): (Control<Msg>, _) = bincode::decode_from_slice(&handshake_msg, bincode::config::standard())?;
+        
+        if !control.is_handshake() {
+            return Err("Expected handshake message".into());
+        }
+        
+        // Send handshake response
+        let handshake_response = Control::<()>::Handshake;
+        let response_bytes = bincode::encode_to_vec(&handshake_response, bincode::config::standard())?;
+        tx.send(response_bytes)?;
+
+        // Main message loop
+        loop {
+            let msg_bytes = match rx.recv() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    debug!(event = "subprocess", status = "connection_closed", error = ?e, "Connection closed");
+                    break;
+                }
+            };
+
+            let (control, _): (Control<Msg>, _) = match bincode::decode_from_slice(&msg_bytes, bincode::config::standard()) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    error!(event = "subprocess", error = ?e, "Failed to decode message");
+                    continue;
+                }
+            };
+
+            let msg = match control.into_real() {
+                Some(m) => m,
+                None => {
+                    error!(event = "subprocess", "Received unexpected handshake message");
+                    continue;
+                }
+            };
+
+            // Create a new actor ref for this message
+            let actor_ref = kameo::spawn(actor.clone());
+            
+            // Send the message using ask() and handle the result
+            let reply = match actor_ref.ask(msg).await {
+                Ok(r) => Ok(r),
+                Err(e) => match e {
+                    kameo::error::SendError::HandlerError(e) => Err(e),
+                    _ => {
+                        error!(event = "subprocess", error = ?e, "Failed to handle message");
+                        continue;
+                    }
+                }
+            };
+            
+            // Encode and send the response
+            let response = Control::Real(reply);
+            let response_bytes = bincode::encode_to_vec(&response, bincode::config::standard())?;
+            
+            if let Err(e) = tx.send(response_bytes) {
+                error!(event = "subprocess", error = ?e, "Failed to send response");
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub mod handshake {
     use super::*;
     use tokio::process::Command;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use parity_tokio_ipc::{Endpoint, Connection};
+    use parity_tokio_ipc::Endpoint;
     use futures::StreamExt;
-    use tokio::io::{AsyncRead, AsyncWrite};
 
     pub fn unique_socket_path(actor_name: &str) -> PathBuf {
         let mut path = std::path::PathBuf::from("/tmp");
@@ -292,20 +333,42 @@ pub mod handshake {
     }
 }
 
-/// Macro to register actors and generate subprocess entrypoint
+/// Macro to register subprocess actors and provide child process handling
 #[macro_export]
-macro_rules! register_subprocess_actors_async {
-    ($(($actor:ty, $msg:ty)),* $(,)?) => {
-        pub async fn maybe_run_subprocess_registry_and_exit_async() -> bool {
+macro_rules! kameo_main {
+    // Main macro pattern that takes actor registrations
+    (
+        actors = { $(($actor:ty, $msg:ty)),* $(,)? },
+        parent_runtime = { worker_threads = $worker_threads:expr $(,)? },
+        parent_main = $parent_main:expr
+        $(,)?
+    ) => {
+        #[::tokio::main(flavor = "multi_thread", worker_threads = $worker_threads)]
+        async fn main() -> Result<(), Box<dyn std::error::Error>> {
+            // Initialize tracing
+            ::tracing_subscriber::fmt()
+                .with_max_level(::tracing::Level::DEBUG)
+                .init();
+
+            // Check if we're a child process - if so, run the actor and exit
             if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
-                let pid = ::std::process::id();
-                let span = ::tracing::span!(::tracing::Level::INFO, "process", process_role = "child", pid);
+                let span = ::tracing::span!(::tracing::Level::INFO, "process", process_role = "child", pid = std::process::id());
                 let _enter = span.enter();
-                ::tracing::info!(event = "lifecycle", status = "starting", actor = actor_name, "Subprocess handler starting");
+
+                ::tracing::info!(
+                    event = "runtime",
+                    process = "child",
+                    runtime_type = "single-threaded",
+                    "Child process starting"
+                );
+
+                // Match on actor type and run the appropriate handler
                 match actor_name.as_str() {
                     $(
                         stringify!($actor) => {
-                            $crate::run_child_actor_async::<$actor, $msg>().await;
+                            let mut actor = <$actor>::default();
+                            let conn = $crate::handshake::child().await.expect("Failed to establish child connection");
+                            $crate::run_child_actor_loop(&mut actor, conn).await.expect("Actor loop failed");
                             ::tracing::info!(event = "lifecycle", status = "complete", actor = actor_name, "Handler complete, exiting");
                             std::process::exit(0);
                         }
@@ -316,25 +379,134 @@ macro_rules! register_subprocess_actors_async {
                     }
                 }
             }
-            false
+
+            // Parent process main logic
+            ::tracing::info!(
+                event = "runtime",
+                process = "parent",
+                runtime_type = "multi-threaded",
+                worker_threads = $worker_threads,
+                "Parent process starting"
+            );
+
+            // Run the parent main function
+            $parent_main.await?;
+
+            Ok(())
         }
     };
 }
 
-/// Async actor loop for a subprocess actor
-#[instrument(skip_all, fields(actor_type = std::any::type_name::<A>()))]
-pub async fn run_child_actor_async<A, M>()
-where
-    A: Default + Send + Sync + 'static + Handler<M>,
-    M: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static + Encode + Decode<()>,
-    A::Output: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
-{
-    debug!(event = "lifecycle", status = "connecting", "Establishing child connection");
-    let mut conn = handshake::child().await.expect("child connection failed");
-    let mut actor = A::default();
+/// Configuration for a child process actor
+pub struct ChildProcessConfig {
+    pub name: String,
+    pub log_level: Level,
+}
 
+/// A builder for creating child process actors
+pub struct ChildProcessBuilder<A, M> 
+where 
+    A: Default + Message<M> + Send + Sync + 'static,
+    M: KameoChildProcessMessage + Send + 'static,
+    <A as Message<M>>::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+{
+    config: ChildProcessConfig,
+    _phantom: PhantomData<(A, M)>,
+}
+
+impl<A, M> ChildProcessBuilder<A, M>
+where 
+    A: Default + Message<M> + Send + Sync + 'static,
+    M: KameoChildProcessMessage + Send + 'static,
+    <A as Message<M>>::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+{
+    pub fn new() -> Self {
+        // Get the type name at compile time
+        let type_name = std::any::type_name::<A>();
+        // Extract just the struct name (last part after ::)
+        let actor_name = type_name.split("::").last().unwrap_or(type_name);
+        
+        Self {
+            config: ChildProcessConfig {
+                name: actor_name.to_string(),
+                log_level: Level::DEBUG,
+            },
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn log_level(mut self, level: Level) -> Self {
+        self.config.log_level = level;
+        self
+    }
+
+    /// Spawn the child process actor and return a reference to it
+    pub async fn spawn(self) -> io::Result<ActorRef<SubprocessActor<M>>> {
+        let socket_path = handshake::unique_socket_path(&self.config.name);
+        
+        // Set up the Unix domain socket
+        let endpoint = parity_tokio_ipc::Endpoint::new(socket_path.to_string_lossy().to_string());
+        let mut incoming = endpoint.incoming()?;
+
+        // Get current executable path
+        let current_exe = std::env::current_exe()?;
+
+        // Spawn child process with clean environment
+        let mut cmd = tokio::process::Command::new(current_exe);
+        cmd.env("KAMEO_CHILD_ACTOR", &self.config.name);
+        cmd.env("KAMEO_ACTOR_SOCKET", socket_path.to_string_lossy().as_ref());
+        
+        // Inherit RUST_LOG for consistent logging
+        if let Ok(rust_log) = std::env::var("RUST_LOG") {
+            cmd.env("RUST_LOG", rust_log);
+        }
+
+        debug!(
+            event = "lifecycle",
+            status = "spawning",
+            actor = ?self.config.name,
+            "Spawning child process"
+        );
+
+        // Spawn the child process
+        let child = cmd.spawn()?;
+
+        debug!(
+            event = "lifecycle",
+            status = "spawned",
+            child_pid = child.id(),
+            "Child process spawned"
+        );
+
+        // Wait for child to connect
+        let conn = incoming.next().await.transpose()?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No child connection received")
+        })?;
+
+        let actor = SubprocessActor::new(
+            Box::new(conn),
+            child,
+            socket_path,
+        );
+
+        Ok(kameo::spawn(actor))
+    }
+}
+
+/// Run the actor loop in the child process
+#[instrument(skip(actor, conn))]
+pub async fn run_child_actor_loop<A, Msg>(actor: &mut A, mut conn: Box<dyn AsyncReadWrite>) -> io::Result<()>
+where
+    A: Message<Msg> + Clone + Send + 'static,
+    Msg: KameoChildProcessMessage + Send + 'static,
+    <A as Message<Msg>>::Reply: Reply + Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static,
+    <<A as Message<Msg>>::Reply as Reply>::Error: std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
+    <<A as Message<Msg>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
+{
     debug!(event = "lifecycle", status = "running", "Child actor loop started");
+
     let mut buf = vec![0u8; 4096];
+    let actor_ref = kameo::spawn(actor.clone());
     
     loop {
         let n = match conn.read(&mut buf).await {
@@ -349,7 +521,7 @@ where
             }
         };
 
-        let ctrl: Control<M> = match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
+        let ctrl: Control<Msg> = match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
             Ok((ctrl, _)) => ctrl,
             Err(e) => {
                 error!(event = "message", error = ?e, "Failed to decode message");
@@ -363,21 +535,69 @@ where
                 let resp = Control::<()>::Handshake;
                 let resp_bytes = bincode::encode_to_vec(&resp, bincode::config::standard())
                     .expect("Failed to encode handshake response");
-                if let Err(e) = conn.write_all(&resp_bytes).await {
-                    error!(event = "handshake", error = ?e, "Failed to send handshake response");
-                    break;
-                }
+                conn.write_all(&resp_bytes).await?;
             }
             Control::Real(msg) => {
                 debug!(event = "message", status = "handling", "Handling message");
-                let reply = actor.handle(msg).await;
+                let reply = match actor_ref.ask(msg).await {
+                    Ok(reply) => reply,
+                    Err(e) => {
+                        error!(event = "error", error = ?e, "Failed to handle message");
+                        return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to handle message: {:?}", e)));
+                    }
+                };
                 let reply_bytes = bincode::encode_to_vec(&Control::Real(reply), bincode::config::standard())
                     .expect("Failed to encode reply");
-                if let Err(e) = conn.write_all(&reply_bytes).await {
-                    error!(event = "message", error = ?e, "Failed to send reply");
-                    break;
-                }
+                conn.write_all(&reply_bytes).await?;
                 debug!(event = "message", status = "complete", "Message handled successfully");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Prelude module for commonly used items
+pub mod prelude {
+    pub use crate::kameo_main;
+    pub use crate::ChildProcessBuilder;
+    pub use crate::SubprocessActor;
+    pub use crate::handshake;
+}
+
+#[async_trait]
+impl<M> Message<M> for SubprocessActor<M>
+where
+    M: KameoChildProcessMessage + Send + 'static,
+{
+    type Reply = Result<<M as KameoChildProcessMessage>::Reply, SubprocessActorError>;
+
+    #[instrument(skip(self, ctx), fields(actor_type = "SubprocessActor"))]
+    fn handle(&mut self, msg: M, ctx: &mut Context<Self, Self::Reply>) -> impl Future<Output = Self::Reply> + Send {
+        async move {
+            let mut conn = self.connection.lock().await;
+            
+            // Encode and send the message
+            let control = Control::Real(msg);
+            let msg_bytes = bincode::encode_to_vec(&control, bincode::config::standard())?;
+            conn.write_all(&msg_bytes).await?;
+            conn.flush().await?;
+            
+            // Read response
+            let mut resp_buf = vec![0u8; 1024 * 64]; // 64KB buffer for responses
+            let n = conn.read(&mut resp_buf).await?;
+            
+            if n == 0 {
+                return Err(SubprocessActorError::ConnectionClosed);
+            }
+            
+            // Decode response
+            let (control, _): (Control<<M as KameoChildProcessMessage>::Reply>, _) = 
+                bincode::decode_from_slice(&resp_buf[..n], bincode::config::standard())?;
+                
+            match control {
+                Control::Handshake => Err(SubprocessActorError::Protocol("Unexpected handshake response".into())),
+                Control::Real(reply) => Ok(reply),
             }
         }
     }

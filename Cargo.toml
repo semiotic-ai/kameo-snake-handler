@@ -1,7 +1,7 @@
 [package]
 name = "kameo-child-process"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 kameo = "0.16"
@@ -17,3 +17,6 @@ tracing-subscriber = "*"
 futures = "0.3"
 thiserror = "1.0"
 interprocess = { version = "1.0", features = ["tokio_support"] }
+nix = { version = "0.30.1", features = ["process"] }
+ipc-channel = "0.18"
+rand = "0.8"
