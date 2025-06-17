@@ -538,6 +538,7 @@ dependencies = [
  "futures",
  "kameo",
  "kameo-child-process",
+ "kameo_macros",
  "proptest",
  "pyo3",
  "pyo3-async-runtimes",
@@ -547,6 +548,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -561,11 +563,13 @@ dependencies = [
  "kameo",
  "kameo-child-process",
  "kameo-snake-handler",
+ "kameo_macros",
  "proptest",
  "pyo3",
  "pyo3-async-runtimes",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-test",
  "tracing",

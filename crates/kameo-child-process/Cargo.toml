@@ -14,7 +14,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 ipc-channel = { workspace = true }
-kameo = { workspace = true }
+kameo = { workspace = true, features = ["macros"] }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }

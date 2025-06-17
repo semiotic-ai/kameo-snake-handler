@@ -21,6 +21,10 @@ use futures::StreamExt;
 use std::future::Future;
 use ipc_channel::ipc::{IpcSender, IpcReceiver};
 use tokio::runtime::Runtime;
+use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use anyhow::Result;
+use kameo::message::{Context, Message};
 
 /// Trait object for async read/write operations
 #[async_trait]
@@ -108,6 +112,23 @@ pub enum SubprocessActorError {
     
     #[error("Connection closed")]
     ConnectionClosed,
+
+    #[error("Unknown actor type: {actor_name}")]
+    UnknownActorType { actor_name: String },
+}
+
+/// Handle unknown actor type errors with proper tracing
+#[instrument(level = "error", fields(actor_name))]
+pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessActorError {
+    error!(
+        event = "lifecycle",
+        status = "error",
+        actor_type = actor_name,
+        "Unknown actor type encountered"
+    );
+    SubprocessActorError::UnknownActorType { 
+        actor_name: actor_name.to_string() 
+    }
 }
 
 /// Actor that manages a subprocess and communicates with it via IPC
@@ -347,8 +368,7 @@ macro_rules! register_subprocess_actors {
                         }
                     )*
                     _ => {
-                        ::tracing::error!(event = "lifecycle", status = "error", actor = actor_name, "Unknown actor type");
-                        Err("Unknown actor type".into())
+                        Err(Box::new(::kameo_child_process::handle_unknown_actor_error(&actor_name)))
                     }
                 })
             } else {
@@ -359,15 +379,27 @@ macro_rules! register_subprocess_actors {
 }
 
 /// Configuration for a child process actor
+#[derive(Debug)]
 pub struct ChildProcessConfig {
     pub name: String,
     pub log_level: Level,
+    pub env_vars: Vec<(String, String)>,
+}
+
+impl Default for ChildProcessConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            log_level: Level::DEBUG,
+            env_vars: Vec::new(),
+        }
+    }
 }
 
 /// A builder for creating child process actors
 pub struct ChildProcessBuilder<A, M> 
 where 
-    A: Default + Message<M> + Send + Sync + 'static,
+    A: Default + Message<M> + Send + Sync + Actor + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
 {
@@ -377,7 +409,7 @@ where
 
 impl<A, M> Default for ChildProcessBuilder<A, M>
 where 
-    A: Default + Message<M> + Send + Sync + 'static,
+    A: Default + Message<M> + Send + Sync + Actor + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
  {
@@ -388,20 +420,16 @@ where
 
 impl<A, M> ChildProcessBuilder<A, M>
 where 
-    A: Default + Message<M> + Send + Sync + 'static,
+    A: Default + Message<M> + Send + Sync + Actor + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
 {
     pub fn new() -> Self {
-        // Get the type name at compile time
-        let type_name = std::any::type_name::<A>();
-        // Extract just the struct name (last part after ::)
-        let actor_name = type_name.split("::").last().unwrap_or(type_name);
-        
         Self {
             config: ChildProcessConfig {
-                name: actor_name.to_string(),
+                name: A::name().to_string(),
                 log_level: Level::DEBUG,
+                env_vars: Vec::new(),
             },
             _phantom: PhantomData,
         }
@@ -409,6 +437,11 @@ where
 
     pub fn log_level(mut self, level: Level) -> Self {
         self.config.log_level = level;
+        self
+    }
+
+    pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.env_vars.push((key.into(), value.into()));
         self
     }
 
@@ -427,6 +460,11 @@ where
         let mut cmd = tokio::process::Command::new(current_exe);
         cmd.env("KAMEO_CHILD_ACTOR", &self.config.name);
         cmd.env("KAMEO_ACTOR_SOCKET", socket_path.to_string_lossy().as_ref());
+        
+        // Add custom environment variables
+        for (key, value) in self.config.env_vars {
+            cmd.env(key, value);
+        }
         
         // Inherit RUST_LOG for consistent logging
         if let Ok(rust_log) = std::env::var("RUST_LOG") {
@@ -549,8 +587,7 @@ macro_rules! setup_subprocess_system {
                         }
                     )*
                     _ => {
-                        ::tracing::error!(event = "lifecycle", status = "error", actor = actor_name, "Unknown actor type");
-                        Err("Unknown actor type".into())
+                        Err(Box::new(::kameo_child_process::handle_unknown_actor_error(&actor_name)))
                     }
                 }
             } else {

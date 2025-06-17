@@ -8,7 +8,8 @@ description = "A Kameo actor for running Python code with proper error handling 
 
 [dependencies]
 # Core dependencies
-kameo = { workspace = true }
+kameo = { workspace = true, features = ["macros"] }
+kameo_macros = { workspace = true }
 kameo-child-process = { path = "../kameo-child-process" }
 
 # Async runtime
@@ -29,8 +30,9 @@ bincode = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
-# Logging and instrumentation
+# Logging
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -41,6 +43,3 @@ pyo3-build-config = "0.25"
 
 [package.metadata.maturin]
 python-source = "python"
-
-[env]
-DYLD_LIBRARY_PATH = "/Library/Frameworks/Python.framework/Versions/3.13/lib/"

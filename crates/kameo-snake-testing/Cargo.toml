@@ -5,8 +5,13 @@ edition = "2021"
 authors = { workspace = true }
 license = { workspace = true }
 
+[[bin]]
+name = "kameo-snake-testing"
+path = "src/main.rs"
+
 [dependencies]
 kameo = { workspace = true }
+kameo_macros = { workspace = true }
 kameo-child-process = { path = "../kameo-child-process" }
 kameo-snake-handler = { path = "../kameo-snake-handler" }
 tokio = { version = "1.0", features = ["full", "test-util", "macros"] }
@@ -21,7 +26,13 @@ indoc = "2.0"
 pyo3 = { workspace = true }
 pyo3-async-runtimes = { workspace = true }
 serde_json = "1.0"
+proptest = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest = "1.4"
 tokio-test = "0.4"
+
+[package.metadata.maturin]
+python-source = "python"
+python-packages = ["kameo-snake-testing"]

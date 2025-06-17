@@ -1,162 +1,154 @@
-use kameo_snake_handler::{PythonActor, PythonConfig, PythonExecutionError};
-use tracing::{info, Level};
-use tracing_subscriber::{fmt, prelude::*, filter::EnvFilter};
-use bincode::{Encode, Decode};
-use serde::{Serialize, Deserialize};
-use kameo_child_process::{KameoChildProcessMessage, setup_subprocess_system, ChildProcessBuilder};
-use kameo::prelude::*;
-use std::future::Future;
-use std::process;
-use std::path::PathBuf;
+use kameo_snake_handler::prelude::*;
+use kameo_child_process::prelude::*;
+use kameo_child_process::KameoChildProcessMessage;
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn, error};
+use kameo::reply::Reply;
+use bincode::{Decode, Encode};
+use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub enum OrkCommand {
-    KlanBonus {
-        power: i32,
-        klan: String,
-    },
-    ScrapResult {
-        boy1_power: i32,
-        boy2_power: i32,
-    },
-    LootTeef {
-        base_teef: i32,
-    },
-    WaaaghPower {
-        boyz_count: i32,
-    },
+/// Custom error type for Ork operations
+#[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
+pub enum OrkError {
+    #[error("Not enough boyz for WAAAGH! (need {needed}, got {got})")]
+    NotEnoughBoyz { needed: i32, got: i32 },
+    #[error("Unknown klan: {0}")]
+    UnknownKlan(String),
+    #[error("Invalid power level: {0}")]
+    InvalidPower(String),
+    #[error("Python error: {0}")]
+    PythonError(String),
 }
 
+/// Message types that can be sent to Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct OrkResult {
-    pub result: i32,
-    pub message: String,
+pub enum OrkMessage {
+    CalculateWaaaghPower { boyz_count: u32 },
+    CalculateKlanBonus { klan_name: String, base_power: u32 },
+    CalculateScrapResult { attacker_power: u32, defender_power: u32 },
+    CalculateLoot { teef: u32, victory_points: u32 },
 }
 
-impl Reply for OrkResult {
-    type Ok = OrkResult;
-    type Error = PythonExecutionError;
-    type Value = OrkResult;
+impl Default for OrkMessage {
+    fn default() -> Self {
+        Self::CalculateWaaaghPower { boyz_count: 0 }
+    }
+}
 
-    fn to_result(self) -> Result<Self::Ok, Self::Error> {
-        Ok(self)
+/// Response types from Python subprocess
+#[derive(Debug, Serialize, Deserialize, Clone, Decode, Encode)]
+pub enum OrkResponse {
+    WaaaghPower { power: u32 },
+    KlanBonus { bonus: u32 },
+    ScrapResult { victory: bool },
+    LootResult { total_teef: u32, bonus_teef: u32 },
+    Error { error: String },
+}
+
+impl Reply for OrkResponse {
+    type Ok = Self;
+    type Error = OrkError;
+    type Value = Self;
+
+    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> {
+        match self {
+            OrkResponse::Error { error } => Err(OrkError::PythonError(error)),
+            _ => Ok(self),
+        }
+    }
+
+    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> {
+        match self {
+            OrkResponse::Error { error } => Some(Box::new(OrkError::PythonError(error))),
+            _ => None,
+        }
     }
 
     fn into_value(self) -> Self::Value {
         self
     }
-
-    fn into_any_err(self) -> Option<Box<dyn ReplyError>> {
-        None
-    }
 }
 
-impl KameoChildProcessMessage for OrkCommand {
-    type Reply = OrkResult;
-}
-
-// Our custom wrapper type for the Python actor
-#[derive(Clone)]
-pub struct OrkPythonActor(PythonActor<OrkCommand>);
-
-impl Default for OrkPythonActor {
-    fn default() -> Self {
-        let module_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("python")
-            .join("ork_logic.py");
-        
-        let config = PythonConfig {
-            python_path: vec![module_path.parent().unwrap().to_string_lossy().into_owned()],
-            env_vars: vec![],
-            module_name: "ork_logic".to_string(),
-            function_name: "handle_message".to_string(),
-        };
-        
-        Self(PythonActor::new(config))
-    }
-}
-
-impl Message<OrkCommand> for OrkPythonActor {
-    type Reply = Result<OrkResult, PythonExecutionError>;
-
-    fn handle(&mut self, msg: OrkCommand, _ctx: &mut Context<Self, Self::Reply>) -> impl Future<Output = Self::Reply> + Send {
-        let actor = self.0.clone();
-        async move {
-            let actor_ref = kameo::spawn(actor);
-            actor_ref.ask(msg).await.map_err(|e| match e {
-                kameo::error::SendError::HandlerError(e) => e,
-                _ => PythonExecutionError::Execution("Actor communication failed".to_string()),
-            })
-        }
-    }
-}
-
-impl Actor for OrkPythonActor {
-    type Error = PythonExecutionError;
-
-    fn name() -> &'static str {
-        "OrkPythonActor"
-    }
-
-    fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.0.clone();
-        async move {
-            inner.init_python()
-        }
-    }
-
-    fn on_stop(&mut self, _actor_ref: WeakActorRef<Self>, _reason: ActorStopReason) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async move { Ok(()) }
-    }
+impl KameoChildProcessMessage for OrkMessage {
+    type Reply = OrkResponse;
 }
 
 setup_subprocess_system! {
     actors = {
-        (OrkPythonActor, OrkCommand),
+        (PythonActor<OrkMessage>, OrkMessage),
     },
     child_init = {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        // Initialize tracing first
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_file(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .init();
+
+        let mut builder = tokio::runtime::Builder::new_current_thread();
         builder.enable_all();
         builder
     },
     parent_init = {
-        // Set up logging
-        let subscriber = tracing_subscriber::registry()
-            .with(fmt::layer())
-            .with(EnvFilter::from_default_env()
-                .add_directive(Level::DEBUG.into()));
-        
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("Failed to set tracing subscriber");
+        // Initialize tracing first
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_file(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .init();
 
-        let parent_pid = process::id();
-        info!(pid=%parent_pid, "STARTIN' UP DA PARENT PROCESS!");
-
-        // Create and run the tokio runtime
+        // Create parent runtime
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("ork-boss")
             .enable_all()
             .build()?;
 
         runtime.block_on(async {
-            // Create actor system and spawn Python actor
-            let builder = ChildProcessBuilder::<OrkPythonActor, OrkCommand>::new()
-                .log_level(Level::DEBUG);
+            // Set up Python subprocess
+            let python_path = std::env::current_dir()?
+                .join("crates")
+                .join("kameo-snake-testing")
+                .join("python");
 
-            info!(pid=%parent_pid, "GONNA SPAWN DA PYTHON ACTOR NOW!");
-            let python_ref = builder.spawn().await?;
+            info!("Starting Python subprocess with path: {:?}", python_path);
 
-            // Send a test message that will make the Python code panic
-            let msg = OrkCommand::WaaaghPower {
-                boyz_count: -1, // Negative boyz should cause a panic!
+            // Create Python config
+            let config = PythonConfig {
+                python_path: vec![python_path.to_string_lossy().to_string()],
+                module_name: "ork_logic".to_string(),
+                function_name: "handle_message".to_string(),
+                is_async: false,
+                env_vars: vec![],
             };
 
-            info!(pid=%parent_pid, "SENDIN' A PANIC-INDUCIN' MESSAGE!");
-            match python_ref.ask(msg).await {
-                Ok(result) => info!(pid=%parent_pid, "GOT RESULT (SHOULDN'T HAPPEN): {:?}", result),
-                Err(e) => info!(pid=%parent_pid, "GOT EXPECTED ERROR: {:?}", e),
+            // Create and spawn Python actor
+            let builder = PythonSubprocessBuilder::new()
+                .with_config(config);
+
+            let actor = builder.spawn().await?;
+            let actor_ref = kameo::spawn(actor);
+
+            // Test messages
+            let messages = vec![
+                OrkMessage::CalculateWaaaghPower { boyz_count: 100 },
+                OrkMessage::CalculateKlanBonus { klan_name: "Goffs".to_string(), base_power: 50 },
+                OrkMessage::CalculateScrapResult { attacker_power: 150, defender_power: 100 },
+                OrkMessage::CalculateLoot { teef: 100, victory_points: 5 },
+            ];
+
+            for msg in messages {
+                match actor_ref.ask(msg).await {
+                    Ok(response) => info!("Got response: {:?}", response),
+                    Err(e) => error!("Error: {:?}", e),
+                }
             }
 
-            Ok(())
+            Ok::<(), Box<dyn std::error::Error>>(())
         })
     }
 }
