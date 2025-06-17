@@ -212,7 +212,7 @@ where
                 let func = module.getattr(&self.config.function_name)
                     .map_err(|e| PythonExecutionError::AttributeError(e.to_string()))?;
 
-                // Call function
+                // Call function and get Python dict result
                 let result = if self.config.is_async {
                     error!("Async Python functions not yet supported");
                     return Err(PythonExecutionError::RuntimeError("Async Python functions not yet supported".to_string()));
@@ -221,10 +221,18 @@ where
                         .map_err(|e| PythonExecutionError::ExecutionError(e.to_string()))?
                 };
 
-                // Convert result back to Rust
-                let result_str = result.extract::<String>()
-                    .map_err(|e| PythonExecutionError::DeserializationError(e.to_string()))?;
-                serde_json::from_str(&result_str)
+                // Import json module for proper serialization
+                let json = py.import("json")
+                    .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
+                
+                // Convert Python dict to JSON string using json.dumps()
+                let json_str = json.call_method1("dumps", (result,))
+                    .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?
+                    .extract::<String>()
+                    .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+                
+                // Parse JSON string to our target type
+                serde_json::from_str(&json_str)
                     .map_err(|e| PythonExecutionError::DeserializationError(e.to_string()))
             })
         }

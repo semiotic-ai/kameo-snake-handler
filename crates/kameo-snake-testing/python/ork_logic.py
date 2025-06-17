@@ -81,7 +81,7 @@ def calculate_loot(teef: int, victory_points: int) -> Dict[str, int]:
     total = teef + bonus
     return {"total_teef": total, "bonus_teef": bonus}
 
-def handle_message(message: Dict[str, Any]) -> str:
+def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
     """
     Handle incoming messages from da Rust code.
     
@@ -89,7 +89,7 @@ def handle_message(message: Dict[str, Any]) -> str:
         message: Dictionary containing message data
         
     Returns:
-        JSON string containing response data
+        Dictionary containing response data
     """
     try:
         log_debug(f"PROCESSING MESSAGE: {json.dumps(message, indent=2)}")
@@ -104,13 +104,11 @@ def handle_message(message: Dict[str, Any]) -> str:
         except json.JSONDecodeError as e:
             raise OrkError(f"INVALID JSON FORMAT, YA GIT! {str(e)}")
         
-        response = None
-        
         if "CalculateWaaaghPower" in data:
             # CalculateWaaaghPower
             params = data["CalculateWaaaghPower"]
             power = calculate_waaagh_power(int(params["boyz_count"]))
-            response = {"WaaaghPower": {"power": power}}
+            return {"WaaaghPower": {"power": power}}
             
         elif "CalculateKlanBonus" in data:
             # CalculateKlanBonus
@@ -119,7 +117,7 @@ def handle_message(message: Dict[str, Any]) -> str:
                 str(params["klan_name"]), 
                 int(params["base_power"])
             )
-            response = {"KlanBonus": {"bonus": bonus}}
+            return {"KlanBonus": {"bonus": bonus}}
             
         elif "CalculateScrapResult" in data:
             # CalculateScrapResult
@@ -128,7 +126,7 @@ def handle_message(message: Dict[str, Any]) -> str:
                 int(params["attacker_power"]), 
                 int(params["defender_power"])
             )
-            response = {"ScrapResult": {"victory": result}}
+            return {"ScrapResult": {"victory": result}}
             
         elif "CalculateLoot" in data:
             # CalculateLoot
@@ -137,18 +135,44 @@ def handle_message(message: Dict[str, Any]) -> str:
                 int(params["teef"]), 
                 int(params["victory_points"])
             )
-            response = {"LootResult": {"total_teef": result["total_teef"], "bonus_teef": result["bonus_teef"]}}
+            return {"LootResult": {"total_teef": result["total_teef"], "bonus_teef": result["bonus_teef"]}}
             
         else:
             raise OrkError("INVALID MESSAGE TYPE, YA GIT!")
             
-        # Convert response to JSON string
-        return json.dumps(response)
-            
     except OrkError as e:
         log_debug(f"ORK ERROR: {str(e)}")
-        return json.dumps({"Error": {"error": str(e)}})
+        return {"Error": {"error": str(e)}}
             
     except Exception as e:
         log_debug(f"ERROR: {str(e)}\n{traceback.format_exc()}")
-        return json.dumps({"Error": {"error": str(e)}})
+        return {"Error": {"error": str(e)}}
+
+if __name__ == "__main__":
+    # Set up logging
+    import logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        stream=sys.stderr
+    )
+    logger = logging.getLogger(__name__)
+    
+    # Main loop
+    for line in sys.stdin:
+        try:
+            message = line.strip()
+            if not message:
+                continue
+                
+            if isinstance(message, str):
+                message = json.loads(message)
+                
+            response = handle_message(message)
+            print(json.dumps(response))
+            sys.stdout.flush()
+            
+        except Exception as e:
+            logger.exception("Error in main loop")
+            print(json.dumps({"Error": {"error": f"FATAL ERROR: {str(e)}"}}))
+            sys.stdout.flush()
