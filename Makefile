@@ -15,6 +15,6 @@ run:
 	PATH=crates/kameo-snake-testing/python/venv/bin:$$PATH \
 	DYLD_LIBRARY_PATH=/Library/Frameworks/Python.framework/Versions/3.13/lib/:$$DYLD_LIBRARY_PATH \
 	PYTHON_GIL=1 \
-	cargo run -p kameo-snake-testing
+	RUST_LOG=trace cargo run -p kameo-snake-testing
 
 .PHONY: pyenv install clean run 

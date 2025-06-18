@@ -1,22 +1,17 @@
-use std::future::Future;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use kameo::prelude::*;
 use kameo::message::{Context, Message};
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{PanicError, ActorStopReason};
-use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::{debug, info, instrument, warn, error};
+use serde::{Deserialize, Serialize};
+use tracing::{instrument, error};
 use thiserror::Error;
-use std::process;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyAny};
+use pyo3::types::PyDict;
 use pyo3::exceptions::{PyModuleNotFoundError, PyAttributeError, PyValueError, PyTypeError, PyImportError, PyRuntimeError};
 use kameo_child_process::KameoChildProcessMessage;
 use std::ops::ControlFlow;
@@ -149,8 +144,8 @@ where
 {
     type Error = PythonExecutionError;
 
-    #[instrument(skip(self, actor_ref), fields(actor_type = "PythonActor"))]
-    fn on_start(&mut self, actor_ref: ActorRef<Self>) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    #[instrument(skip(self, _actor_ref), fields(actor_type = "PythonActor"))]
+    fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
             // Initialize Python environment
             Python::with_gil(|py| {
@@ -169,16 +164,16 @@ where
         }
     }
 
-    #[instrument(skip(self, actor_ref, reason), fields(actor_type = "PythonActor"))]
-    fn on_stop(&mut self, actor_ref: WeakActorRef<Self>, reason: ActorStopReason) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "PythonActor"))]
+    fn on_stop(&mut self, _actor_ref: WeakActorRef<Self>, reason: ActorStopReason) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
             error!("Python actor stopped: {:?}", reason);
             Ok(())
         }
     }
 
-    #[instrument(skip(self, actor_ref, err), fields(actor_type = "PythonActor"))]
-    fn on_panic(&mut self, actor_ref: WeakActorRef<Self>, err: PanicError) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send {
+    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "PythonActor"))]
+    fn on_panic(&mut self, _actor_ref: WeakActorRef<Self>, err: PanicError) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send {
         async move {
             error!("Python actor panicked: {:?}", err);
             Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
@@ -193,48 +188,79 @@ where
 {
     type Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>;
 
-    #[instrument(skip(self, message, ctx), fields(actor_type = "PythonActor"))]
-    fn handle(&mut self, message: M, ctx: &mut Context<Self, Self::Reply>) -> impl std::future::Future<Output = Self::Reply> + Send {
+    #[instrument(skip(self, message, _ctx), fields(actor_type = "PythonActor"))]
+    fn handle(&mut self, message: M, _ctx: &mut Context<Self, Self::Reply>) -> impl std::future::Future<Output = Self::Reply> + Send {
+        let config = self.config.clone();
         async move {
-            // Convert message to Python dict
-            Python::with_gil(|py| {
-                let locals = PyDict::new(py);
-                let message_json = serde_json::to_value(&message)
-                    .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
-                let message_str = serde_json::to_string(&message_json)
-                    .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
-                locals.set_item("message", message_str)
-                    .map_err(|e| PythonExecutionError::ValueError(e.to_string()))?;
+            if config.is_async {
+                // Step 1: Create the future inside the GIL.
+                let future = Python::with_gil(|py| {
+                    let message_json = serde_json::to_value(&message)
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+                    let message_str = serde_json::to_string(&message_json)
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+                    
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("message", message_str)
+                        .map_err(|e| PythonExecutionError::ValueError(e.to_string()))?;
 
-                // Import module and get function
-                let module = py.import(&self.config.module_name)
-                    .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
-                let func = module.getattr(&self.config.function_name)
-                    .map_err(|e| PythonExecutionError::AttributeError(e.to_string()))?;
+                    let module = py.import(&config.module_name)
+                        .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
+                    let func = module.getattr(&config.function_name)
+                        .map_err(|e| PythonExecutionError::AttributeError(e.to_string()))?;
 
-                // Call function and get Python dict result
-                let result = if self.config.is_async {
-                    error!("Async Python functions not yet supported");
-                    return Err(PythonExecutionError::RuntimeError("Async Python functions not yet supported".to_string()));
-                } else {
-                    func.call1((locals,))
-                        .map_err(|e| PythonExecutionError::ExecutionError(e.to_string()))?
-                };
+                    let py_coro = func.call((), Some(&kwargs))
+                        .map_err(|e| PythonExecutionError::ExecutionError(e.to_string()))?;
 
-                // Import json module for proper serialization
-                let json = py.import("json")
-                    .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
-                
-                // Convert Python dict to JSON string using json.dumps()
-                let json_str = json.call_method1("dumps", (result,))
-                    .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?
-                    .extract::<String>()
-                    .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
-                
-                // Parse JSON string to our target type
-                serde_json::from_str(&json_str)
-                    .map_err(|e| PythonExecutionError::DeserializationError(e.to_string()))
-            })
+                    pyo3_async_runtimes::tokio::into_future(py_coro)
+                        .map_err(|e| PythonExecutionError::ExecutionError(e.to_string()))
+                })?;
+
+                // Step 2: Await the future outside the GIL.
+                let py_result = future.await
+                    .map_err(|e| PythonExecutionError::ExecutionError(e.to_string()))?;
+
+                // Step 3: Process the result inside the GIL.
+                Python::with_gil(|py| {
+                    let json = py.import("json")
+                        .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
+                    let json_str = json.call_method1("dumps", (py_result.bind(py),))
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?
+                        .extract::<String>()
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+                    serde_json::from_str(&json_str)
+                        .map_err(|e| PythonExecutionError::DeserializationError(e.to_string()))
+                })
+            } else {
+                // Handle synchronous Python function
+                Python::with_gil(|py| {
+                    let message_json = serde_json::to_value(&message)
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+                    let message_str = serde_json::to_string(&message_json)
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("message", message_str)
+                        .map_err(|e| PythonExecutionError::ValueError(e.to_string()))?;
+
+                    let module = py.import(&config.module_name)
+                        .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
+                    let func = module.getattr(&config.function_name)
+                        .map_err(|e| PythonExecutionError::AttributeError(e.to_string()))?;
+
+                    let result = func.call((), Some(&kwargs))
+                        .map_err(|e| PythonExecutionError::ExecutionError(e.to_string()))?;
+                    
+                    let json = py.import("json")
+                        .map_err(|e| PythonExecutionError::ImportError(e.to_string()))?;
+                    let json_str = json.call_method1("dumps", (result,))
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?
+                        .extract::<String>()
+                        .map_err(|e| PythonExecutionError::SerializationError(e.to_string()))?;
+                    serde_json::from_str(&json_str)
+                        .map_err(|e| PythonExecutionError::DeserializationError(e.to_string()))
+                })
+            }
         }
     }
 }

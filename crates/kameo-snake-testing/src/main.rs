@@ -1,11 +1,13 @@
-use kameo_snake_handler::prelude::*;
+use bincode::{Decode, Encode};
+use kameo::reply::Reply;
 use kameo_child_process::prelude::*;
 use kameo_child_process::KameoChildProcessMessage;
+use kameo_snake_handler::prelude::*;
+use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
-use kameo::reply::Reply;
-use bincode::{Decode, Encode};
 use thiserror::Error;
+use tracing::Level;
+use tracing::{error, info};
 
 /// Custom error type for Ork operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -23,10 +25,21 @@ pub enum OrkError {
 /// Message types that can be sent to Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum OrkMessage {
-    CalculateWaaaghPower { boyz_count: u32 },
-    CalculateKlanBonus { klan_name: String, base_power: u32 },
-    CalculateScrapResult { attacker_power: u32, defender_power: u32 },
-    CalculateLoot { teef: u32, victory_points: u32 },
+    CalculateWaaaghPower {
+        boyz_count: u32,
+    },
+    CalculateKlanBonus {
+        klan_name: String,
+        base_power: u32,
+    },
+    CalculateScrapResult {
+        attacker_power: u32,
+        defender_power: u32,
+    },
+    CalculateLoot {
+        teef: u32,
+        victory_points: u32,
+    },
 }
 
 impl Default for OrkMessage {
@@ -78,9 +91,20 @@ setup_subprocess_system! {
         (PythonActor<OrkMessage>, OrkMessage),
     },
     child_init = {
+        // Prepare Python for multi-threaded use
+        pyo3::prepare_freethreaded_python();
+
+        // Get the GIL and set up the asyncio event loop
+        pyo3::Python::with_gil(|py| {
+            let asyncio = py.import("asyncio")?;
+            let event_loop = asyncio.call_method0("new_event_loop")?;
+            asyncio.call_method1("set_event_loop", (&event_loop,))?;
+            Ok::<(), pyo3::PyErr>(())
+        }).expect("Failed to set up python event loop");
+
         // Initialize tracing first
         tracing_subscriber::fmt()
-            .with_env_filter("info")
+            .with_max_level(Level::TRACE)
             .with_file(true)
             .with_line_number(true)
             .with_thread_ids(true)
@@ -115,37 +139,48 @@ setup_subprocess_system! {
                 .join("kameo-snake-testing")
                 .join("python");
 
-            info!("Starting Python subprocess with path: {:?}", python_path);
-
-            // Create Python config
-            let config = PythonConfig {
+            // --- SYNC FLOW ---
+            info!("==== SYNC FLOW ====");
+            let sync_config = PythonConfig {
                 python_path: vec![python_path.to_string_lossy().to_string()],
                 module_name: "ork_logic".to_string(),
                 function_name: "handle_message".to_string(),
                 is_async: false,
                 env_vars: vec![],
             };
+            let sync_actor = PythonSubprocessBuilder::new().with_config(sync_config).spawn().await?;
+            let sync_ref = kameo::spawn(sync_actor);
+            // Valid message
+            match sync_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 100 }).await {
+                Ok(response) => info!("SYNC OK: {:?}", response),
+                Err(e) => error!("SYNC ERR: {:?}", e),
+            }
+            // Invalid message (unknown type)
+            match sync_ref.ask(OrkMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
+                Ok(response) => info!("SYNC OK (should error): {:?}", response),
+                Err(e) => error!("SYNC ERR (expected): {:?}", e),
+            }
 
-            // Create and spawn Python actor
-            let builder = PythonSubprocessBuilder::new()
-                .with_config(config);
-
-            let actor = builder.spawn().await?;
-            let actor_ref = kameo::spawn(actor);
-
-            // Test messages
-            let messages = vec![
-                OrkMessage::CalculateWaaaghPower { boyz_count: 100 },
-                OrkMessage::CalculateKlanBonus { klan_name: "Goffs".to_string(), base_power: 50 },
-                OrkMessage::CalculateScrapResult { attacker_power: 150, defender_power: 100 },
-                OrkMessage::CalculateLoot { teef: 100, victory_points: 5 },
-            ];
-
-            for msg in messages {
-                match actor_ref.ask(msg).await {
-                    Ok(response) => info!("Got response: {:?}", response),
-                    Err(e) => error!("Error: {:?}", e),
-                }
+            // --- ASYNC FLOW ---
+            info!("==== ASYNC FLOW ====");
+            let async_config = PythonConfig {
+                python_path: vec![python_path.to_string_lossy().to_string()],
+                module_name: "ork_logic_async".to_string(),
+                function_name: "handle_message_async".to_string(),
+                is_async: true,
+                env_vars: vec![],
+            };
+            let async_actor = PythonSubprocessBuilder::new().with_config(async_config).spawn().await?;
+            let async_ref = kameo::spawn(async_actor);
+            // Valid message
+            match async_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 100 }).await {
+                Ok(response) => info!("ASYNC OK: {:?}", response),
+                Err(e) => error!("ASYNC ERR: {:?}", e),
+            }
+            // Invalid message (unknown type)
+            match async_ref.ask(OrkMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
+                Ok(response) => info!("ASYNC OK (should error): {:?}", response),
+                Err(e) => error!("ASYNC ERR (expected): {:?}", e),
             }
 
             Ok::<(), Box<dyn std::error::Error>>(())
