@@ -37,8 +37,12 @@ class InvalidPowerError(OrkError):
 
 def calculate_waaagh_power(boyz_count: int) -> int:
     """Calculate da WAAAGH! power based on number of boyz."""
+    if not isinstance(boyz_count, int):
+        raise InvalidBoyzCountError("Boyz count must be a whole number, ya git!")
     if boyz_count < 0:
         raise InvalidBoyzCountError(f"Can't have {boyz_count} boyz, ya git!")
+    if boyz_count > 429496729:  # Ensure result won't exceed u32::MAX after multiplication and random addition
+        raise InvalidBoyzCountError(f"Too many boyz ({boyz_count})! Da WAAAGH! would overflow!")
     return boyz_count * 10 + random.randint(1, 100)
 
 def calculate_klan_bonus(klan_name: str, base_power: int) -> int:
@@ -52,18 +56,25 @@ def calculate_klan_bonus(klan_name: str, base_power: int) -> int:
         "Snakebites": 1.25
     }
     
+    if not isinstance(base_power, int):
+        raise InvalidPowerError("Power must be a whole number, ya git!")
     if klan_name not in klan_bonuses:
         raise InvalidKlanError(f"Never heard of da {klan_name} klan!")
-        
     if base_power < 0:
         raise InvalidPowerError(f"Can't have {base_power} power, ya git!")
+    if base_power > 3435973836:  # Ensure result won't exceed u32::MAX after applying max bonus (1.3)
+        raise InvalidPowerError(f"Too much power ({base_power})! It would overflow!")
         
     return int(base_power * klan_bonuses[klan_name])
 
 def calculate_scrap_result(attacker_power: int, defender_power: int) -> bool:
     """Calculate da result of a scrap between two orks."""
+    if not isinstance(attacker_power, int) or not isinstance(defender_power, int):
+        raise InvalidPowerError("Power must be whole numbers, ya git!")
     if attacker_power < 0 or defender_power < 0:
         raise InvalidPowerError("Can't have negative power in a scrap!")
+    if attacker_power > 4294967275 or defender_power > 4294967275:  # u32::MAX - 20 for the random roll
+        raise InvalidPowerError("Power too high! It would overflow!")
         
     # Add some random factor for da fun of it
     attacker_roll = random.randint(1, 20)
@@ -73,8 +84,14 @@ def calculate_scrap_result(attacker_power: int, defender_power: int) -> bool:
 
 def calculate_loot(teef: int, victory_points: int) -> Dict[str, int]:
     """Calculate da total loot from a battle."""
+    if not isinstance(teef, int) or not isinstance(victory_points, int):
+        raise InvalidTeefError("Teef and victory points must be whole numbers, ya git!")
     if teef < 0:
         raise InvalidTeefError(f"Can't have {teef} teef, ya git!")
+    if victory_points < 0:
+        raise InvalidTeefError("Can't have negative victory points, ya git!")
+    if teef > 4294967295 - (victory_points * 15):  # Ensure we won't overflow with max bonus
+        raise InvalidTeefError("Too much teef! It would overflow!")
         
     # More victory points means more teef!
     bonus = victory_points * random.randint(5, 15)
@@ -95,42 +112,37 @@ def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
         log_debug(f"PROCESSING MESSAGE: {json.dumps(message, indent=2)}")
         
         # Extract message fields
-        if not isinstance(message, dict) or "message" not in message:
+        if not isinstance(message, dict):
             raise OrkError("INVALID MESSAGE FORMAT, YA GIT!")
             
-        # Parse the message string
-        try:
-            data = json.loads(message["message"])
-        except json.JSONDecodeError as e:
-            raise OrkError(f"INVALID JSON FORMAT, YA GIT! {str(e)}")
-        
-        if "CalculateWaaaghPower" in data:
+        # Handle message types directly
+        if "CalculateWaaaghPower" in message:
             # CalculateWaaaghPower
-            params = data["CalculateWaaaghPower"]
-            power = calculate_waaagh_power(int(params["boyz_count"]))
+            boyz_count = message["CalculateWaaaghPower"]["boyz_count"]
+            power = calculate_waaagh_power(int(boyz_count))
             return {"WaaaghPower": {"power": power}}
             
-        elif "CalculateKlanBonus" in data:
+        elif "CalculateKlanBonus" in message:
             # CalculateKlanBonus
-            params = data["CalculateKlanBonus"]
+            params = message["CalculateKlanBonus"]
             bonus = calculate_klan_bonus(
                 str(params["klan_name"]), 
                 int(params["base_power"])
             )
             return {"KlanBonus": {"bonus": bonus}}
             
-        elif "CalculateScrapResult" in data:
+        elif "CalculateScrapResult" in message:
             # CalculateScrapResult
-            params = data["CalculateScrapResult"]
+            params = message["CalculateScrapResult"]
             result = calculate_scrap_result(
                 int(params["attacker_power"]), 
                 int(params["defender_power"])
             )
             return {"ScrapResult": {"victory": result}}
             
-        elif "CalculateLoot" in data:
+        elif "CalculateLoot" in message:
             # CalculateLoot
-            params = data["CalculateLoot"]
+            params = message["CalculateLoot"]
             result = calculate_loot(
                 int(params["teef"]), 
                 int(params["victory_points"])

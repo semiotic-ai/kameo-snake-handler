@@ -1,29 +1,28 @@
 [package]
 name = "kameo-child-process"
-version = { workspace = true }
-edition = { workspace = true }
+version = "0.1.0"
+edition = "2021"
 authors = { workspace = true }
 license = { workspace = true }
 
 [dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bincode = { workspace = true }
+futures = { workspace = true }
+ipc-channel = { workspace = true }
+kameo = { workspace = true }
+kameo_macros = { workspace = true }
+nix = { workspace = true }
+parity-tokio-ipc = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-serde = { workspace = true }
-bincode = { workspace = true }
-ipc-channel = { workspace = true }
-kameo = { workspace = true, features = ["macros"] }
-async-trait = { workspace = true }
-base64 = { workspace = true }
 uuid = { workspace = true }
-futures = { workspace = true }
-interprocess = { workspace = true }
-nix = { workspace = true }
-rand = { workspace = true }
-parity-tokio-ipc = { workspace = true }
+once_cell = "1.19"
 
 [dev-dependencies]
 proptest = { workspace = true }
+tokio-test = "0.4"
 

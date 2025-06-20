@@ -3,7 +3,6 @@ use kameo::reply::Reply;
 use kameo_child_process::prelude::*;
 use kameo_child_process::KameoChildProcessMessage;
 use kameo_snake_handler::prelude::*;
-use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Level;
@@ -91,29 +90,21 @@ setup_subprocess_system! {
         (PythonActor<OrkMessage>, OrkMessage),
     },
     child_init = {
-        // Prepare Python for multi-threaded use
-        pyo3::prepare_freethreaded_python();
-
-        // Get the GIL and set up the asyncio event loop
-        pyo3::Python::with_gil(|py| {
-            let asyncio = py.import("asyncio")?;
-            let event_loop = asyncio.call_method0("new_event_loop")?;
-            asyncio.call_method1("set_event_loop", (&event_loop,))?;
-            Ok::<(), pyo3::PyErr>(())
-        }).expect("Failed to set up python event loop");
-
         // Initialize tracing first
         tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .with_file(true)
-            .with_line_number(true)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .init();
+                .with_max_level(Level::TRACE)
+                .with_file(true)
+                .with_line_number(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .init();
 
-        let mut builder = tokio::runtime::Builder::new_current_thread();
-        builder.enable_all();
-        builder
+        // Create and return a multi-threaded runtime for better Python async support
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("python-worker")
+            .enable_all()
+            .build()?
     },
     parent_init = {
         // Initialize tracing first
@@ -138,7 +129,7 @@ setup_subprocess_system! {
                 .join("crates")
                 .join("kameo-snake-testing")
                 .join("python");
-
+            
             // --- SYNC FLOW ---
             info!("==== SYNC FLOW ====");
             let sync_config = PythonConfig {
@@ -148,17 +139,48 @@ setup_subprocess_system! {
                 is_async: false,
                 env_vars: vec![],
             };
-            let sync_actor = PythonSubprocessBuilder::new().with_config(sync_config).spawn().await?;
-            let sync_ref = kameo::spawn(sync_actor);
-            // Valid message
+            let sync_ref = PythonChildProcessBuilder::new(sync_config).spawn().await?;
+            
+            // Test 1: Valid message
+            info!("Test 1: Valid message (sync)");
             match sync_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 100 }).await {
                 Ok(response) => info!("SYNC OK: {:?}", response),
                 Err(e) => error!("SYNC ERR: {:?}", e),
             }
-            // Invalid message (unknown type)
+
+            // Test 2: Invalid message (unknown klan)
+            info!("Test 2: Invalid message - unknown klan (sync)");
             match sync_ref.ask(OrkMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
                 Ok(response) => info!("SYNC OK (should error): {:?}", response),
                 Err(e) => error!("SYNC ERR (expected): {:?}", e),
+            }
+
+            // Test 3: Edge case - zero boyz
+            info!("Test 3: Edge case - zero boyz (sync)");
+            match sync_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 0 }).await {
+                Ok(response) => info!("SYNC OK (zero boyz): {:?}", response),
+                Err(e) => error!("SYNC ERR: {:?}", e),
+            }
+
+            // Test 4: Edge case - massive number
+            info!("Test 4: Edge case - massive number (sync)");
+            match sync_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: u32::MAX }).await {
+                Ok(response) => info!("SYNC OK (max boyz): {:?}", response),
+                Err(e) => error!("SYNC ERR: {:?}", e),
+            }
+
+            // Test 5: Scrap result test
+            info!("Test 5: Scrap result test (sync)");
+            match sync_ref.ask(OrkMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await {
+                Ok(response) => info!("SYNC OK (scrap result): {:?}", response),
+                Err(e) => error!("SYNC ERR: {:?}", e),
+            }
+
+            // Test 6: Loot calculation
+            info!("Test 6: Loot calculation (sync)");
+            match sync_ref.ask(OrkMessage::CalculateLoot { teef: 100, victory_points: 5 }).await {
+                Ok(response) => info!("SYNC OK (loot calc): {:?}", response),
+                Err(e) => error!("SYNC ERR: {:?}", e),
             }
 
             // --- ASYNC FLOW ---
@@ -170,17 +192,113 @@ setup_subprocess_system! {
                 is_async: true,
                 env_vars: vec![],
             };
-            let async_actor = PythonSubprocessBuilder::new().with_config(async_config).spawn().await?;
-            let async_ref = kameo::spawn(async_actor);
-            // Valid message
+            let async_ref = PythonChildProcessBuilder::new(async_config).spawn().await?;
+            
+            // Test 1: Valid message
+            info!("Test 1: Valid message (async)");
             match async_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 100 }).await {
                 Ok(response) => info!("ASYNC OK: {:?}", response),
                 Err(e) => error!("ASYNC ERR: {:?}", e),
             }
-            // Invalid message (unknown type)
+
+            // Test 2: Invalid message (unknown klan)
+            info!("Test 2: Invalid message - unknown klan (async)");
             match async_ref.ask(OrkMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
                 Ok(response) => info!("ASYNC OK (should error): {:?}", response),
                 Err(e) => error!("ASYNC ERR (expected): {:?}", e),
+            }
+
+            // Test 3: Edge case - zero boyz
+            info!("Test 3: Edge case - zero boyz (async)");
+            match async_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 0 }).await {
+                Ok(response) => info!("ASYNC OK (zero boyz): {:?}", response),
+                Err(e) => error!("ASYNC ERR: {:?}", e),
+            }
+
+            // Test 4: Edge case - massive number
+            info!("Test 4: Edge case - massive number (async)");
+            match async_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: u32::MAX }).await {
+                Ok(response) => info!("ASYNC OK (max boyz): {:?}", response),
+                Err(e) => error!("ASYNC ERR: {:?}", e),
+            }
+
+            // Test 5: Scrap result test
+            info!("Test 5: Scrap result test (async)");
+            match async_ref.ask(OrkMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await {
+                Ok(response) => info!("ASYNC OK (scrap result): {:?}", response),
+                Err(e) => error!("ASYNC ERR: {:?}", e),
+            }
+
+            // Test 6: Loot calculation
+            info!("Test 6: Loot calculation (async)");
+            match async_ref.ask(OrkMessage::CalculateLoot { teef: 100, victory_points: 5 }).await {
+                Ok(response) => info!("ASYNC OK (loot calc): {:?}", response),
+                Err(e) => error!("ASYNC ERR: {:?}", e),
+            }
+
+            // Test 7: Rapid fire messages (stress test)
+            info!("Test 7: Rapid fire messages (async)");
+            let mut handles = Vec::new();
+            for i in 0..10 {
+                let ref_clone = async_ref.clone();
+                handles.push(tokio::spawn(async move {
+                    match ref_clone.ask(OrkMessage::CalculateWaaaghPower { boyz_count: i * 100 }).await {
+                        Ok(response) => info!("ASYNC OK (rapid fire {}): {:?}", i, response),
+                        Err(e) => error!("ASYNC ERR (rapid fire {}): {:?}", i, e),
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await?;
+            }
+
+            // Test 8: Invalid module test
+            info!("Test 8: Invalid module test");
+            let invalid_module_config = PythonConfig {
+                python_path: vec![python_path.to_string_lossy().to_string()],
+                module_name: "non_existent_module".to_string(),
+                function_name: "handle_message".to_string(),
+                is_async: false,
+                env_vars: vec![],
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                PythonChildProcessBuilder::new(invalid_module_config).spawn::<OrkMessage>()
+            ).await {
+                Ok(spawn_result) => match spawn_result {
+                    Ok(_) => error!("Expected error for invalid module, but got success"),
+                    Err(e) => info!("Got expected error for invalid module: {:?}", e),
+                },
+                Err(_) => info!("Got expected timeout for invalid module"),
+            }
+
+            // Test 9: Invalid function test
+            info!("Test 9: Invalid function test");
+            let invalid_function_config = PythonConfig {
+                python_path: vec![python_path.to_string_lossy().to_string()],
+                module_name: "ork_logic".to_string(),
+                function_name: "non_existent_function".to_string(),
+                is_async: false,
+                env_vars: vec![],
+            };
+            let invalid_function_ref = PythonChildProcessBuilder::new(invalid_function_config).spawn::<OrkMessage>().await?;
+            match invalid_function_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: 100 }).await {
+                Ok(_) => error!("Expected error for invalid function, but got success"),
+                Err(e) => info!("Got expected error for invalid function: {:?}", e),
+            }
+
+            // Test 10: Invalid Python path test
+            info!("Test 10: Invalid Python path test");
+            let invalid_path_config = PythonConfig {
+                python_path: vec!["non/existent/path".to_string()],
+                module_name: "ork_logic".to_string(),
+                function_name: "handle_message".to_string(),
+                is_async: false,
+                env_vars: vec![],
+            };
+            match PythonChildProcessBuilder::new(invalid_path_config).spawn::<OrkMessage>().await {
+                Ok(_) => error!("Expected error for invalid path, but got success"),
+                Err(e) => info!("Got expected error for invalid path: {:?}", e),
             }
 
             Ok::<(), Box<dyn std::error::Error>>(())

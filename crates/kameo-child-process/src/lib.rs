@@ -22,6 +22,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{debug, error, instrument, warn, Level};
 use uuid::Uuid;
+use once_cell::sync::OnceCell;
+
+/// Trait for actors that need access to the runtime
+#[async_trait]
+pub trait RuntimeAware: Actor 
+where
+    Self::Error: std::error::Error + Send + Sync + 'static
+{
+    /// Called when the runtime is available, before on_start
+    fn init_with_runtime<'a>(&'a mut self, runtime: &'static tokio::runtime::Runtime) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+}
 
 /// Trait object for async read/write operations
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -670,24 +681,25 @@ macro_rules! setup_subprocess_system {
         child_init = $child_init:block,
         parent_init = $parent_init:block $(,)?
     ) => {
-        fn main() -> Result<(), Box<dyn std::error::Error>> {
-            if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
-                // Child process branch
-                match actor_name.as_str() {
-                    $(
-                        stringify!($actor) => {
-                            // Run user-provided child initialization code
-                            $child_init;
 
-                            // Now, create the runtime builder
-                            let builder = tokio::runtime::Builder::new_current_thread();
-                            ::kameo_child_process::child_process_main_with_config::<$actor, $msg>(builder)
-                        }
-                    )*
-                    _ => {
-                        Err(Box::new(::kameo_child_process::handle_unknown_actor_error(&actor_name)))
+        #[tracing::instrument(fields(pid=std::process::id()))]
+        fn main() -> Result<(), Box<dyn std::error::Error>> {
+            let handlers: &[(&'static str, fn() -> Result<(), Box<dyn std::error::Error>>)] = &[
+                $(
+                    (
+                        std::any::type_name::<$actor>(),
+                        || ::kameo_child_process::child_process_main_with_config::<$actor, $msg>($child_init),
+                    ),
+                )*
+            ];
+            eprintln!("!!!!!!MAIN {:?}", std::env::var("KAMEO_CHILD_ACTOR"));
+            if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
+                for (name, handler) in handlers {
+                    if actor_name == *name {
+                        return handler();
                     }
                 }
+                Err(Box::new(::kameo_child_process::handle_unknown_actor_error(&actor_name)))
             } else {
                 // Parent process branch - call user-provided initialization
                 $parent_init
@@ -783,11 +795,12 @@ where
 }
 
 /// Run a child process actor with a custom runtime configuration.
+#[instrument(skip(runtime), fields(pid=std::process::id()))]
 pub fn child_process_main_with_config<A, M>(
-    mut config: tokio::runtime::Builder,
+    runtime: tokio::runtime::Runtime,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    A: Default + Message<M> + Clone + Send + 'static,
+    A: Default + Message<M> + Clone + Send + RuntimeAware + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply: Reply
         + Send
@@ -800,14 +813,15 @@ where
     <<A as Message<M>>::Reply as Reply>::Error:
         std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
     <<A as Message<M>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
+    <A as Actor>::Error: std::error::Error + Send + Sync + 'static,
 {
-    let runtime = config.build()?;
+    // Store the runtime in a static Box to ensure it lives for the entire program
+    static RUNTIME: OnceCell<Box<tokio::runtime::Runtime>> = OnceCell::new();
+    let runtime_ref = RUNTIME.get_or_init(|| Box::new(runtime));
 
-    runtime.block_on(async {
-        let mut actor = A::default();
-        let conn = handshake::child().await?;
-        run_child_actor_loop(&mut actor, conn).await
-    })?;
-
+    let mut actor = A::default();
+    runtime_ref.block_on(actor.init_with_runtime(&**runtime_ref))?;
+    let conn = runtime_ref.block_on(handshake::child())?;
+    runtime_ref.block_on(run_child_actor_loop(&mut actor, conn))?;
     Ok(())
 }
