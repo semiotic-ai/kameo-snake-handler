@@ -108,57 +108,48 @@ def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dictionary containing response data
     """
-    try:
-        log_debug(f"PROCESSING MESSAGE: {json.dumps(message, indent=2)}")
+    log_debug(f"PROCESSING MESSAGE: {json.dumps(message, indent=2)}")
+    
+    # Extract message fields
+    if not isinstance(message, dict):
+        raise OrkError("INVALID MESSAGE FORMAT, YA GIT!")
         
-        # Extract message fields
-        if not isinstance(message, dict):
-            raise OrkError("INVALID MESSAGE FORMAT, YA GIT!")
-            
-        # Handle message types directly
-        if "CalculateWaaaghPower" in message:
-            # CalculateWaaaghPower
-            boyz_count = message["CalculateWaaaghPower"]["boyz_count"]
-            power = calculate_waaagh_power(int(boyz_count))
-            return {"WaaaghPower": {"power": power}}
-            
-        elif "CalculateKlanBonus" in message:
-            # CalculateKlanBonus
-            params = message["CalculateKlanBonus"]
-            bonus = calculate_klan_bonus(
-                str(params["klan_name"]), 
-                int(params["base_power"])
-            )
-            return {"KlanBonus": {"bonus": bonus}}
-            
-        elif "CalculateScrapResult" in message:
-            # CalculateScrapResult
-            params = message["CalculateScrapResult"]
-            result = calculate_scrap_result(
-                int(params["attacker_power"]), 
-                int(params["defender_power"])
-            )
-            return {"ScrapResult": {"victory": result}}
-            
-        elif "CalculateLoot" in message:
-            # CalculateLoot
-            params = message["CalculateLoot"]
-            result = calculate_loot(
-                int(params["teef"]), 
-                int(params["victory_points"])
-            )
-            return {"LootResult": {"total_teef": result["total_teef"], "bonus_teef": result["bonus_teef"]}}
-            
-        else:
-            raise OrkError("INVALID MESSAGE TYPE, YA GIT!")
-            
-    except OrkError as e:
-        log_debug(f"ORK ERROR: {str(e)}")
-        return {"Error": {"error": str(e)}}
-            
-    except Exception as e:
-        log_debug(f"ERROR: {str(e)}\n{traceback.format_exc()}")
-        return {"Error": {"error": str(e)}}
+    # Handle message types directly
+    if "CalculateWaaaghPower" in message:
+        # CalculateWaaaghPower
+        boyz_count = message["CalculateWaaaghPower"]["boyz_count"]
+        power = calculate_waaagh_power(int(boyz_count))
+        return {"WaaaghPower": {"power": power}}
+        
+    elif "CalculateKlanBonus" in message:
+        # CalculateKlanBonus
+        params = message["CalculateKlanBonus"]
+        bonus = calculate_klan_bonus(
+            str(params["klan_name"]), 
+            int(params["base_power"])
+        )
+        return {"KlanBonus": {"bonus": bonus}}
+        
+    elif "CalculateScrapResult" in message:
+        # CalculateScrapResult
+        params = message["CalculateScrapResult"]
+        result = calculate_scrap_result(
+            int(params["attacker_power"]), 
+            int(params["defender_power"])
+        )
+        return {"ScrapResult": {"victory": result}}
+        
+    elif "CalculateLoot" in message:
+        # CalculateLoot
+        params = message["CalculateLoot"]
+        result = calculate_loot(
+            int(params["teef"]), 
+            int(params["victory_points"])
+        )
+        return {"LootResult": {"total_teef": result["total_teef"], "bonus_teef": result["bonus_teef"]}}
+        
+    else:
+        raise OrkError("INVALID MESSAGE TYPE, YA GIT!")
 
 if __name__ == "__main__":
     # Set up logging

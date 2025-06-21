@@ -2,14 +2,8 @@
 name = "kameo-snake-handler"
 version = "0.1.0"
 edition = "2021"
-authors = { workspace = true }
-license = { workspace = true }
 
 [dependencies]
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-bincode = { workspace = true }
-futures = { workspace = true }
 kameo = { workspace = true }
 kameo-child-process = { path = "../kameo-child-process" }
 kameo_macros = { workspace = true }
@@ -20,6 +14,9 @@ serde_json = "1.0"
 thiserror = "1.0"
 tokio = { workspace = true }
 tracing = "0.1"
+anyhow = "1.0"
+async-trait = "0.1"
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 
 [dev-dependencies]
 kameo-snake-testing = { path = "../kameo-snake-testing" }

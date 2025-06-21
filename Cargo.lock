@@ -425,7 +425,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode 2.0.1",
- "futures",
  "kameo",
  "kameo-child-process",
  "kameo-snake-testing",

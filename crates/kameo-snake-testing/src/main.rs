@@ -3,6 +3,7 @@ use kameo::reply::Reply;
 use kameo_child_process::prelude::*;
 use kameo_child_process::KameoChildProcessMessage;
 use kameo_snake_handler::prelude::*;
+use kameo_snake_handler::ErrorReply;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Level;
@@ -55,6 +56,14 @@ pub enum OrkResponse {
     ScrapResult { victory: bool },
     LootResult { total_teef: u32, bonus_teef: u32 },
     Error { error: String },
+}
+
+impl ErrorReply for OrkResponse {
+    fn from_error(err: PythonExecutionError) -> Self {
+        OrkResponse::Error {
+            error: err.to_string(),
+        }
+    }
 }
 
 impl Reply for OrkResponse {
@@ -151,8 +160,8 @@ setup_subprocess_system! {
             // Test 2: Invalid message (unknown klan)
             info!("Test 2: Invalid message - unknown klan (sync)");
             match sync_ref.ask(OrkMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
-                Ok(response) => info!("SYNC OK (should error): {:?}", response),
-                Err(e) => error!("SYNC ERR (expected): {:?}", e),
+                Ok(response) => error!("SYNC FAILED (should error): {:?}", response),
+                Err(e) => info!("SYNC ERR (expected): {:?}", e),
             }
 
             // Test 3: Edge case - zero boyz
@@ -165,8 +174,8 @@ setup_subprocess_system! {
             // Test 4: Edge case - massive number
             info!("Test 4: Edge case - massive number (sync)");
             match sync_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: u32::MAX }).await {
-                Ok(response) => info!("SYNC OK (max boyz): {:?}", response),
-                Err(e) => error!("SYNC ERR: {:?}", e),
+                Ok(response) => error!("SYNC FAILED (should error): {:?}", response),
+                Err(e) => info!("SYNC ERR (expected): {:?}", e),
             }
 
             // Test 5: Scrap result test
@@ -204,8 +213,8 @@ setup_subprocess_system! {
             // Test 2: Invalid message (unknown klan)
             info!("Test 2: Invalid message - unknown klan (async)");
             match async_ref.ask(OrkMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
-                Ok(response) => info!("ASYNC OK (should error): {:?}", response),
-                Err(e) => error!("ASYNC ERR (expected): {:?}", e),
+                Ok(response) => error!("ASYNC FAILED (should error): {:?}", response),
+                Err(e) => info!("ASYNC ERR (expected): {:?}", e),
             }
 
             // Test 3: Edge case - zero boyz
@@ -218,8 +227,8 @@ setup_subprocess_system! {
             // Test 4: Edge case - massive number
             info!("Test 4: Edge case - massive number (async)");
             match async_ref.ask(OrkMessage::CalculateWaaaghPower { boyz_count: u32::MAX }).await {
-                Ok(response) => info!("ASYNC OK (max boyz): {:?}", response),
-                Err(e) => error!("ASYNC ERR: {:?}", e),
+                Ok(response) => error!("ASYNC FAILED (should error): {:?}", response),
+                Err(e) => info!("ASYNC ERR (expected): {:?}", e),
             }
 
             // Test 5: Scrap result test

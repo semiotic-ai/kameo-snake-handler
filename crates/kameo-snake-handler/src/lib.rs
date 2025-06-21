@@ -22,8 +22,13 @@ use tracing::{error, instrument, info, Level};
 pub mod serde_py;
 pub use serde_py::{FromPyAny, to_pyobject, from_pyobject};
 
+/// Trait for creating a reply from a Python execution error
+pub trait ErrorReply: Sized {
+    fn from_error(err: PythonExecutionError) -> Self;
+}
+
 /// Error type for Python execution
-#[derive(Debug, Error, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Error, Serialize, Deserialize, Encode, Decode, Clone)]
 pub enum PythonExecutionError {
     #[error("Python module '{module}' not found: {message}")]
     ModuleNotFound {
@@ -91,50 +96,56 @@ pub enum PythonExecutionError {
     },
 }
 
+impl PythonExecutionError {
+    pub fn from_pyerr(err: PyErr, py: Python) -> Self {
+        if err.is_instance_of::<PyModuleNotFoundError>(py) {
+            let msg = err.to_string();
+            let module = msg.split('\'')
+                .nth(1)
+                .unwrap_or("unknown")
+                .to_string();
+            PythonExecutionError::ModuleNotFound {
+                module,
+                message: msg,
+            }
+        } else if err.is_instance_of::<PyAttributeError>(py) {
+            PythonExecutionError::AttributeError {
+                message: err.to_string(),
+            }
+        } else if err.is_instance_of::<PyValueError>(py) {
+            PythonExecutionError::ValueError {
+                message: err.to_string(),
+            }
+        } else if err.is_instance_of::<PyTypeError>(py) {
+            PythonExecutionError::TypeError {
+                message: err.to_string(),
+            }
+        } else if err.is_instance_of::<PyImportError>(py) {
+            let msg = err.to_string();
+            let module = msg.split('\'')
+                .nth(1)
+                .unwrap_or("unknown")
+                .to_string();
+            PythonExecutionError::ImportError {
+                module,
+                message: msg,
+            }
+        } else if err.is_instance_of::<PyRuntimeError>(py) {
+            PythonExecutionError::RuntimeError {
+                message: err.to_string(),
+            }
+        } else {
+            PythonExecutionError::ExecutionError {
+                message: err.to_string(),
+            }
+        }
+    }
+}
+
 impl From<PyErr> for PythonExecutionError {
     fn from(err: PyErr) -> Self {
         Python::with_gil(|py| {
-            if err.is_instance_of::<PyModuleNotFoundError>(py) {
-                let msg = err.to_string();
-                let module = msg.split('\'')
-                    .nth(1)
-                    .unwrap_or("unknown")
-                    .to_string();
-                PythonExecutionError::ModuleNotFound {
-                    module,
-                    message: msg,
-                }
-            } else if err.is_instance_of::<PyAttributeError>(py) {
-                PythonExecutionError::AttributeError {
-                    message: err.to_string(),
-                }
-            } else if err.is_instance_of::<PyValueError>(py) {
-                PythonExecutionError::ValueError {
-                    message: err.to_string(),
-                }
-            } else if err.is_instance_of::<PyTypeError>(py) {
-                PythonExecutionError::TypeError {
-                    message: err.to_string(),
-                }
-            } else if err.is_instance_of::<PyImportError>(py) {
-                let msg = err.to_string();
-                let module = msg.split('\'')
-                    .nth(1)
-                    .unwrap_or("unknown")
-                    .to_string();
-                PythonExecutionError::ImportError {
-                    module,
-                    message: msg,
-                }
-            } else if err.is_instance_of::<PyRuntimeError>(py) {
-                PythonExecutionError::RuntimeError {
-                    message: err.to_string(),
-                }
-            } else {
-                PythonExecutionError::ExecutionError {
-                    message: err.to_string(),
-                }
-            }
+            Self::from_pyerr(err, py)
         })
     }
 }
@@ -161,6 +172,7 @@ pub struct PythonConfig {
 #[derive(Debug)]
 pub struct PythonActor<M> {
     config: PythonConfig,
+    py_function: Option<Result<PyObject, PythonExecutionError>>,
     _phantom: PhantomData<M>,
 }
 
@@ -181,6 +193,7 @@ impl<M> Default for PythonActor<M> {
 
         Self {
             config,
+            py_function: None,
             _phantom: PhantomData,
         }
     }
@@ -190,6 +203,10 @@ impl<M> Clone for PythonActor<M> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            py_function: self.py_function.as_ref().map(|res| match res {
+                Ok(obj) => Ok(Python::with_gil(|py| obj.clone_ref(py))),
+                Err(e) => Err(e.clone()),
+            }),
             _phantom: PhantomData,
         }
     }
@@ -223,6 +240,7 @@ impl<M> PythonSubprocessBuilder<M> {
     pub async fn spawn(self) -> Result<PythonActor<M>> {
         Ok(PythonActor {
             config: self.config,
+            py_function: None,
             _phantom: PhantomData,
         })
     }
@@ -256,6 +274,7 @@ impl PythonChildProcessBuilder {
     pub async fn spawn<M>(self) -> Result<ActorRef<SubprocessActor<M>>>
     where
         M: KameoChildProcessMessage + Send + Sync + 'static,
+        <M as KameoChildProcessMessage>::Reply: ErrorReply,
     {
         info!("Spawning Python child process");
         let config_json = serde_json::to_string(&self.python_config)
@@ -267,40 +286,6 @@ impl PythonChildProcessBuilder {
             .spawn()
             .await
             .map_err(|e: std::io::Error| anyhow::anyhow!(e).into())
-    }
-}
-
-/// Manages Python event loop lifecycle
-struct EventLoopManager {
-    loop_: PyObject,
-}
-
-impl EventLoopManager {
-    /// Create a new event loop manager
-    fn new(py: Python) -> Result<Self, PythonExecutionError> {
-        let asyncio = py.import("asyncio")?;
-        let loop_: PyObject = asyncio.getattr("new_event_loop")?.call0()?.into();
-        asyncio.getattr("set_event_loop")?.call1((loop_.clone_ref(py),))?;
-        
-        Ok(Self { loop_ })
-    }
-
-    /// Run a coroutine to completion
-    fn run_coroutine(&self, py: Python, coro: PyObject) -> Result<PyObject, PythonExecutionError> {
-        Ok(self.loop_.call_method1(py, "run_until_complete", (coro,))?.into())
-    }
-
-    /// Clean up the event loop
-    fn cleanup(&self, py: Python) {
-        if let Ok(asyncio) = py.import("asyncio") {
-            let _ = asyncio.getattr("set_event_loop").and_then(|f| f.call1((py.None(),)));
-        }
-    }
-}
-
-impl Drop for EventLoopManager {
-    fn drop(&mut self) {
-        Python::with_gil(|py| self.cleanup(py));
     }
 }
 
@@ -362,49 +347,18 @@ where
 
     /// Convert a Python object back to our Reply type
     fn deserialize_py_to_reply(&self, py_obj: PyObject, py: Python) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError> {
-        from_pyobject(&py_obj.bind(py))
+        from_pyobject(&py_obj.bind(py).as_borrowed())
             .map_err(|e| PythonExecutionError::DeserializationError {
                 message: e.to_string(),
             })
     }
 
-    /// Handle async Python function call
-    fn handle_async(&self, message: &M, py: Python) -> Result<PyObject, PythonExecutionError> {
-        // Set up event loop manager
-        let loop_manager = EventLoopManager::new(py)?;
-
-        // Import module and convert message
-        let module = py.import(&self.config.module_name)
-            .map_err(|e| PythonExecutionError::ImportError {
-                module: self.config.module_name.clone(),
-                message: e.to_string(),
-            })?;
-        let py_dict = self.serialize_message_to_py(message, py)?;
-
-        // Get and run coroutine
-        let coro = module.getattr(&self.config.function_name)?
-            .call1((py_dict,))
-            .map_err(|e| PythonExecutionError::CallError {
-                function: self.config.function_name.clone(),
-                message: e.to_string(),
-            })?;
-
-        // Run the coroutine using the event loop manager
-        loop_manager.run_coroutine(py, coro.into())
-    }
-
     /// Handle sync Python function call
-    fn handle_sync(&self, message: &M, py: Python) -> Result<PyObject, PythonExecutionError> {
-        let module = py.import(&self.config.module_name)
-            .map_err(|e| PythonExecutionError::ImportError {
-                module: self.config.module_name.clone(),
-                message: e.to_string(),
-            })?;
+    fn handle_sync(&self, message: &M, py: Python, func: &Bound<PyAny>) -> Result<PyObject, PythonExecutionError> {
         let py_dict = self.serialize_message_to_py(message, py)?;
-
-        Ok(module.getattr(&self.config.function_name)?
-            .call1((py_dict,))?
-            .into())
+        let result = func.call1((py_dict,))
+            .map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+        Ok(result.into())
     }
 }
 
@@ -412,8 +366,9 @@ where
 impl<M> Message<M> for PythonActor<M>
 where
     M: KameoChildProcessMessage + Send + 'static,
+    <M as KameoChildProcessMessage>::Reply: ErrorReply,
 {
-    type Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>;
+    type Reply = <M as KameoChildProcessMessage>::Reply;
 
     #[instrument(skip(self, message, _ctx), fields(actor_type = "PythonActor"))]
     fn handle(
@@ -421,20 +376,49 @@ where
         message: M,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> impl std::future::Future<Output = Self::Reply> + Send {
-        let config = self.config.clone();
+        let actor = self.clone();
 
         async move {
-            Python::with_gil(|py| {
-                // Handle the Python call based on sync/async configuration
-                let result = if config.is_async {
-                    self.handle_async(&message, py)
-                } else {
-                    self.handle_sync(&message, py)
-                }?;
+            let py_function_res = actor.py_function.as_ref();
 
-                // Convert the result back to our expected type
-                self.deserialize_py_to_reply(result, py)
-            })
+            let result = match py_function_res {
+                Some(Ok(py_function)) => {
+                    if actor.config.is_async {
+                        let future_res = Python::with_gil(|py| {
+                            let func = py_function.bind(py);
+                            
+                            let py_dict = actor.serialize_message_to_py(&message, py)
+                                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string()))?;
+                            let coro = func.call1((py_dict,))?;
+
+                            pyo3_async_runtimes::tokio::into_future(coro.into())
+                        });
+
+                        match future_res {
+                            Ok(future) => match future.await {
+                                Ok(result_obj) => Python::with_gil(|py| actor.deserialize_py_to_reply(result_obj, py)),
+                                Err(py_err) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(py_err, py))),
+                            },
+                            Err(py_err) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(py_err, py))),
+                        }
+                    } else {
+                        Python::with_gil(|py| {
+                            let func = py_function.bind(py);
+                            let result_obj = actor.handle_sync(&message, py, func)?;
+                            actor.deserialize_py_to_reply(result_obj, py)
+                        })
+                    }
+                },
+                Some(Err(e)) => Err(e.clone()),
+                None => Err(PythonExecutionError::RuntimeError {
+                    message: "Python function not initialized. This is a bug.".to_string(),
+                }),
+            };
+
+            match result {
+                Ok(reply) => reply,
+                Err(e) => <Self as Message<M>>::Reply::from_error(e),
+            }
         }
     }
 }
@@ -446,53 +430,40 @@ where
 {
     #[instrument(skip(self, runtime), fields(python_paths = ?self.config.python_path, module_name = ?self.config.module_name, is_async = ?self.config.is_async))]
     fn init_with_runtime<'a>(&'a mut self, runtime: &'static tokio::runtime::Runtime) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-        // Clone the data we need to move into the async block
-        let python_paths = self.config.python_path.clone();
-        let module_name = self.config.module_name.clone();
+        let config = self.config.clone();
 
         Box::pin(async move {
-            // 1. FIRST: Initialize Python interpreter for multi-threading
-            tracing::info!("Preparing freethreaded Python");
             pyo3::prepare_freethreaded_python();
 
-            // 2. Initialize pyo3-async-runtimes with the provided runtime
-            tracing::info!("Initializing pyo3-async-runtimes with provided runtime");
             if let Err(e) = pyo3_async_runtimes::tokio::init_with_runtime(runtime) {
                 error!("Failed to initialize pyo3-async-runtimes: {:?}", e);
-                return Err(PythonExecutionError::RuntimeError {
+                let err = PythonExecutionError::RuntimeError {
                     message: format!("Failed to initialize pyo3-async-runtimes: {:?}", e),
-                });
+                };
+                self.py_function = Some(Err(err));
+                return Ok(());
             }
 
-            // 3. Set up Python paths and verify module
-            tracing::info!("Setting up Python paths and verifying module");
-            let module_result = Python::with_gil(|py| {
-                // Add Python paths to sys.path
-                let sys = py.import("sys")?;
-                let path = sys.getattr("path")?;
-                for p in python_paths {
-                    tracing::debug!(path = ?p, "Adding Python path");
-                    path.call_method1("append", (p,))?;
+            let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
+                let sys = py.import("sys").map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+                let path = sys.getattr("path").map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+                for p in &config.python_path {
+                    path.call_method1("append", (p,)).map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
                 }
 
-                // Import the module to verify it exists
-                tracing::debug!(module = ?module_name, "Importing module");
-                match py.import(&module_name) {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        error!(error = ?e, "Failed to import Python module");
-                        // Convert PyErr to our error type and return it
-                        Err(PythonExecutionError::from(e))
+                let module = py.import(&config.module_name).map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+                let function = module.getattr(&config.function_name).map_err(|e| {
+                    PythonExecutionError::FunctionNotFound {
+                        module: config.module_name.clone(),
+                        function: config.function_name.clone(),
+                        message: e.to_string(),
                     }
-                }
+                })?;
+
+                Ok(function.into())
             });
 
-            // If module import failed, return the error which will trigger actor shutdown
-            if let Err(e) = module_result {
-                error!("Module initialization failed, triggering shutdown: {:?}", e);
-                return Err(e);
-            }
-
+            self.py_function = Some(module_result);
             tracing::info!("Python runtime initialization complete");
             Ok(())
         })
