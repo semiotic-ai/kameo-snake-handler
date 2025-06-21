@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, instrument, info, Level};
 
+pub mod serde_py;
+pub use serde_py::{FromPyAny, to_pyobject, from_pyobject};
+
 /// Error type for Python execution
 #[derive(Debug, Error, Serialize, Deserialize, Encode, Decode)]
 pub enum PythonExecutionError {
@@ -351,32 +354,15 @@ where
 {
     /// Convert a Rust message to a Python dictionary
     fn serialize_message_to_py(&self, message: &M, py: Python) -> Result<PyObject, PythonExecutionError> {
-        let json_str = serde_json::to_string(message)
+        to_pyobject(py, message)
             .map_err(|e| PythonExecutionError::SerializationError {
                 message: e.to_string(),
-            })?;
-        let json_module = py.import("json")
-            .map_err(|e| PythonExecutionError::ImportError {
-                module: "json".to_string(),
-                message: e.to_string(),
-            })?;
-        Ok(json_module.getattr("loads")?
-            .call1((json_str,))?
-            .into())
+            })
     }
 
     /// Convert a Python object back to our Reply type
     fn deserialize_py_to_reply(&self, py_obj: PyObject, py: Python) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError> {
-        let json_module = py.import("json")
-            .map_err(|e| PythonExecutionError::ImportError {
-                module: "json".to_string(),
-                message: e.to_string(),
-            })?;
-        let json_str = json_module.getattr("dumps")?
-            .call1((py_obj,))?
-            .extract::<String>()?;
-
-        serde_json::from_str(&json_str)
+        from_pyobject(&py_obj.bind(py))
             .map_err(|e| PythonExecutionError::DeserializationError {
                 message: e.to_string(),
             })
