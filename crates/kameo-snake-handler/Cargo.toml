@@ -13,13 +13,13 @@ futures = { workspace = true }
 kameo = { workspace = true }
 kameo-child-process = { path = "../kameo-child-process" }
 kameo_macros = { workspace = true }
-pyo3 = { workspace = true }
+pyo3 = { version = "0.25.1", features = ["auto-initialize"] }
 pyo3-async-runtimes = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
 tokio = { workspace = true }
-tracing = { workspace = true }
+tracing = "0.1"
 
 [dev-dependencies]
 kameo-snake-testing = { path = "../kameo-snake-testing" }
