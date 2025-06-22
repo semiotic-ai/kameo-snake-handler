@@ -5,13 +5,12 @@ use std::ops::ControlFlow;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
-use kameo_child_process::{KameoChildProcessMessage, RuntimeAware, ChildProcessBuilder, SubprocessActor};
+use kameo_child_process::{KameoChildProcessMessage, RuntimeAware, ChildProcessBuilder, SubprocessActor, ChildCallbackMessage, CallbackHandler};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use opentelemetry::global;
-use opentelemetry::trace::TraceContextExt;
 use opentelemetry::Context as OTelContext;
 use pyo3::exceptions::{
     PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
@@ -161,6 +160,24 @@ impl From<serde_json::Error> for PythonExecutionError {
     }
 }
 
+/// A default implementation of a callback message.
+/// Users can define their own types that implement `ChildCallbackMessage`.
+#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+pub enum DefaultCallbackMessage {
+    Event {
+        name: String,
+        properties: std::collections::HashMap<String, String>,
+    },
+    Log {
+        level: String,
+        message: String,
+    },
+}
+
+impl ChildCallbackMessage for DefaultCallbackMessage {
+    type Reply = ();
+}
+
 /// Configuration for Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct PythonConfig {
@@ -283,12 +300,29 @@ impl PythonChildProcessBuilder {
         let config_json = serde_json::to_string(&self.python_config)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        ChildProcessBuilder::<PythonActor<M>, M>::new()
+        struct NoOpCallbackHandler;
+
+        #[async_trait]
+        impl CallbackHandler<DefaultCallbackMessage> for NoOpCallbackHandler {
+            async fn handle(&mut self, _callback: DefaultCallbackMessage) -> () {
+                // This handler does nothing.
+            }
+        }
+
+        let (actor_ref, callback_receiver) = ChildProcessBuilder::<PythonActor<M>, M, DefaultCallbackMessage>::new()
             .log_level(self.log_level)
             .with_env_var("KAMEO_PYTHON_CONFIG", config_json)
-            .spawn()
+            .spawn(NoOpCallbackHandler)
             .await
-            .map_err(|e: std::io::Error| anyhow::anyhow!(e).into())
+            .map_err(|e: std::io::Error| anyhow::anyhow!(e))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = callback_receiver.run().await {
+                error!("Callback receiver failed: {:?}", e);
+            }
+        });
+
+        Ok(actor_ref)
     }
 }
 
@@ -474,6 +508,18 @@ where
             tracing::info!("Python runtime initialization complete");
             Ok(())
         })
+    }
+}
+
+use kameo_child_process::CallbackSender;
+#[async_trait]
+impl<M> CallbackSender<DefaultCallbackMessage> for PythonActor<M>
+where
+    M: KameoChildProcessMessage + Send + 'static,
+{
+    fn set_callback_handle(&mut self, _handle: kameo_child_process::CallbackHandle<DefaultCallbackMessage>) {
+        // In this example, the PythonActor does not need to send callbacks.
+        // If it did, we would store the handle here.
     }
 }
 

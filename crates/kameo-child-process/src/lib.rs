@@ -1,16 +1,16 @@
 #![forbid(unsafe_code)]
 
+pub mod callback;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use futures::StreamExt;
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
 use kameo::prelude::*;
 use opentelemetry::global;
-use opentelemetry::trace::TraceContextExt;
 use opentelemetry::Context as OTelContext;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -23,15 +23,24 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, instrument, warn, Instrument, Level, Span};
+use tracing::{debug, error, instrument, warn, Instrument, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 use once_cell::sync::OnceCell;
+
+pub use callback::{CallbackHandle, ChildCallbackMessage, CallbackSender, CallbackReceiver, CallbackHandler};
 
 /// A serializable representation of a tracing span's context.
 /// This allows us to propagate traces across the process boundary.
 #[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone, Default)]
 pub struct TracingContext(pub std::collections::HashMap<String, String>);
+
+/// A wrapper to send a message with its tracing context.
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct WithTracingContext<T> {
+    pub inner: T,
+    pub context: TracingContext,
+}
 
 /// Trait for actors that need access to the runtime
 #[async_trait]
@@ -255,110 +264,6 @@ impl<M> SubprocessActor<M> {
             _phantom: PhantomData,
         }
     }
-
-    pub async fn run_subprocess<A, Msg>(
-        actor: A,
-        rx: IpcReceiver<Vec<u8>>,
-        tx: IpcSender<Vec<u8>>,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        A: Message<Msg> + Clone + Send + 'static,
-        Msg: KameoChildProcessMessage + Send + 'static,
-        <A as Message<Msg>>::Reply: Reply
-            + Send
-            + Serialize
-            + DeserializeOwned
-            + Encode
-            + Decode<()>
-            + std::fmt::Debug
-            + 'static,
-        <<A as Message<Msg>>::Reply as Reply>::Error:
-            std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
-        <<A as Message<Msg>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
-    {
-        // First handle handshake
-        let handshake_msg = rx.recv()?;
-        let (control, _): (Control<Msg>, _) =
-            bincode::decode_from_slice(&handshake_msg, bincode::config::standard())?;
-
-        if !control.is_handshake() {
-            return Err("Expected handshake message".into());
-        }
-
-        // Send handshake response
-        let handshake_response = Control::<()>::Handshake;
-        let response_bytes =
-            bincode::encode_to_vec(&handshake_response, bincode::config::standard())?;
-        tx.send(response_bytes)?;
-
-        // Main message loop
-        loop {
-            let msg_bytes = match rx.recv() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    debug!(event = "subprocess", status = "connection_closed", error = ?e, "Connection closed");
-                    break;
-                }
-            };
-
-            let (control, _): (Control<Msg>, _) =
-                match bincode::decode_from_slice(&msg_bytes, bincode::config::standard()) {
-                    Ok(decoded) => decoded,
-                    Err(e) => {
-                        error!(event = "subprocess", error = ?e, "Failed to decode message");
-                        continue;
-                    }
-                };
-
-            let (msg, trace_context) = match control.into_real() {
-                Some((msg, trace_context)) => (msg, trace_context),
-                None => {
-                    error!(
-                        event = "subprocess",
-                        "Received unexpected handshake message"
-                    );
-                    continue;
-                }
-            };
-
-            // Create a new actor ref for this message
-            let actor_ref = kameo::spawn(actor.clone());
-
-            let parent_cx =
-                global::get_text_map_propagator(|propagator| propagator.extract(&trace_context.0));
-            let span = tracing::info_span!("child_message_handler");
-            span.set_parent(parent_cx);
-
-            // Send the message using ask() and handle the result
-            let reply = async {
-                 actor_ref.ask(msg).await
-            }
-            .instrument(span)
-            .await;
-
-            let reply = match reply {
-                Ok(r) => Ok(r),
-                Err(e) => match e {
-                    kameo::error::SendError::HandlerError(e) => Err(e),
-                    _ => {
-                        error!(event = "subprocess", error = ?e, "Failed to handle message");
-                        continue;
-                    }
-                },
-            };
-
-            // Encode and send the response
-            let response = Control::Real(reply, TracingContext::default());
-            let response_bytes = bincode::encode_to_vec(&response, bincode::config::standard())?;
-
-            if let Err(e) = tx.send(response_bytes) {
-                error!(event = "subprocess", error = ?e, "Failed to send response");
-                break;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 pub mod handshake {
@@ -428,18 +333,35 @@ pub mod handshake {
     }
 
     #[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
-    pub async fn child() -> std::io::Result<Box<dyn AsyncReadWrite>> {
-        let socket_path = std::env::var("KAMEO_ACTOR_SOCKET")
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_ACTOR_SOCKET not set"))?;
+    pub async fn child_request() -> std::io::Result<Box<dyn AsyncReadWrite>> {
+        let socket_path = std::env::var("KAMEO_REQUEST_SOCKET")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_REQUEST_SOCKET not set"))?;
 
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child handshake");
+        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child request handshake");
 
         let conn = tokio::net::UnixStream::connect(&socket_path).await?;
 
         debug!(
             event = "handshake",
             status = "completed",
-            "Child handshake completed successfully"
+            "Child request handshake completed successfully"
+        );
+        Ok(Box::new(conn))
+    }
+
+    #[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
+    pub async fn child_callback() -> std::io::Result<Box<dyn AsyncReadWrite>> {
+        let socket_path = std::env::var("KAMEO_CALLBACK_SOCKET")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_CALLBACK_SOCKET not set"))?;
+
+        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child callback handshake");
+
+        let conn = tokio::net::UnixStream::connect(&socket_path).await?;
+
+        debug!(
+            event = "handshake",
+            status = "completed",
+            "Child callback handshake completed successfully"
         );
         Ok(Box::new(conn))
     }
@@ -449,7 +371,7 @@ pub mod handshake {
 #[macro_export]
 macro_rules! register_subprocess_actors {
     (
-        actors = { $(($actor:ty, $msg:ty)),* $(,)? }
+        actors = { $(($actor:ty, $msg:ty, $callback:ty)),* $(,)? }
         $(,)?
     ) => {
         pub fn maybe_run_subprocess_registry() -> Option<Result<(), Box<dyn std::error::Error>>> {
@@ -458,7 +380,7 @@ macro_rules! register_subprocess_actors {
                 Some(match actor_name.as_str() {
                     $(
                         stringify!($actor) => {
-                            ::kameo_child_process::child_process_main::<$actor, $msg>()
+                            ::kameo_child_process::child_process_main::<$actor, $msg, $callback>()
                         }
                     )*
                     _ => {
@@ -491,35 +413,38 @@ impl Default for ChildProcessConfig {
 }
 
 /// A builder for creating child process actors
-pub struct ChildProcessBuilder<A, M>
+pub struct ChildProcessBuilder<A, M, C>
 where
-    A: Default + Message<M> + Send + Sync + Actor + 'static,
+    A: Default + Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply:
         Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+    C: ChildCallbackMessage,
 {
     config: ChildProcessConfig,
-    _phantom: PhantomData<(A, M)>,
+    _phantom: PhantomData<(A, M, C)>,
 }
 
-impl<A, M> Default for ChildProcessBuilder<A, M>
+impl<A, M, C> Default for ChildProcessBuilder<A, M, C>
 where
-    A: Default + Message<M> + Send + Sync + Actor + 'static,
+    A: Default + Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply:
         Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+    C: ChildCallbackMessage,
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<A, M> ChildProcessBuilder<A, M>
+impl<A, M, C> ChildProcessBuilder<A, M, C>
 where
-    A: Default + Message<M> + Send + Sync + Actor + 'static,
+    A: Default + Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply:
         Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+    C: ChildCallbackMessage,
 {
     pub fn new() -> Self {
         Self {
@@ -543,12 +468,18 @@ where
     }
 
     /// Spawn the child process actor and return a reference to it
-    pub async fn spawn(self) -> io::Result<ActorRef<SubprocessActor<M>>> {
-        let socket_path = handshake::unique_socket_path(&self.config.name);
+    pub async fn spawn<H>(self, handler: H) -> io::Result<(ActorRef<SubprocessActor<M>>, CallbackReceiver<C, H>)>
+    where
+        H: CallbackHandler<C>,
+    {
+        let request_socket_path = handshake::unique_socket_path(&format!("{}-req", self.config.name));
+        let callback_socket_path = handshake::unique_socket_path(&format!("{}-cb", self.config.name));
 
-        // Set up the Unix domain socket
-        let endpoint = parity_tokio_ipc::Endpoint::new(socket_path.to_string_lossy().to_string());
-        let mut incoming = endpoint.incoming()?;
+        // Set up the Unix domain sockets
+        let request_endpoint = parity_tokio_ipc::Endpoint::new(request_socket_path.to_string_lossy().to_string());
+        let mut request_incoming = request_endpoint.incoming()?;
+        let callback_endpoint = parity_tokio_ipc::Endpoint::new(callback_socket_path.to_string_lossy().to_string());
+        let mut callback_incoming = callback_endpoint.incoming()?;
 
         // Get current executable path
         let current_exe = std::env::current_exe()?;
@@ -556,7 +487,8 @@ where
         // Spawn child process with clean environment
         let mut cmd = tokio::process::Command::new(current_exe);
         cmd.env("KAMEO_CHILD_ACTOR", &self.config.name);
-        cmd.env("KAMEO_ACTOR_SOCKET", socket_path.to_string_lossy().as_ref());
+        cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());
+        cmd.env("KAMEO_CALLBACK_SOCKET", callback_socket_path.to_string_lossy().as_ref());
 
         // Add custom environment variables
         for (key, value) in self.config.env_vars {
@@ -585,15 +517,23 @@ where
             "Child process spawned"
         );
 
-        // Wait for child to connect
-        let conn =
-            incoming.next().await.transpose()?.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "No child connection received")
-            })?;
+        // Wait for child to connect to both sockets
+        let (request_conn_res, callback_conn_res) = tokio::join!(
+            request_incoming.next(),
+            callback_incoming.next()
+        );
 
-        let actor = SubprocessActor::new(Box::new(conn), child, socket_path);
+        let request_conn = request_conn_res.transpose()?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No child request connection received")
+        })?;
+        let callback_conn = callback_conn_res.transpose()?.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No child callback connection received")
+        })?;
 
-        Ok(kameo::spawn(actor))
+        let actor = SubprocessActor::new(Box::new(request_conn), child, request_socket_path);
+        let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), handler);
+
+        Ok((kameo::spawn(actor), callback_receiver))
     }
 }
 
@@ -719,7 +659,7 @@ where
 #[macro_export]
 macro_rules! setup_subprocess_system {
     (
-        actors = { $(($actor:ty, $msg:ty)),* $(,)? },
+        actors = { $(($actor:ty, $msg:ty, $callback:ty)),* $(,)? },
         child_init = $child_init:block,
         parent_init = $parent_init:block $(,)?
     ) => {
@@ -730,7 +670,7 @@ macro_rules! setup_subprocess_system {
                 $(
                     (
                         std::any::type_name::<$actor>(),
-                        || ::kameo_child_process::child_process_main_with_config::<$actor, $msg>($child_init),
+                        || ::kameo_child_process::child_process_main_with_config::<$actor, $msg, $callback>($child_init),
                     ),
                 )*
             ];
@@ -813,9 +753,9 @@ where
 
 /// Run a child process actor with the default single-threaded runtime configuration.
 /// This is the default implementation used by the register_subprocess_actors macro.
-pub fn child_process_main<A, M>() -> Result<(), Box<dyn std::error::Error>>
+pub fn child_process_main<A, M, C>() -> Result<(), Box<dyn std::error::Error>>
 where
-    A: Default + Message<M> + Clone + Send + 'static,
+    A: Default + Message<M> + Clone + Send + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply: Reply
         + Send
@@ -828,6 +768,7 @@ where
     <<A as Message<M>>::Reply as Reply>::Error:
         std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
     <<A as Message<M>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
+    C: ChildCallbackMessage,
 {
     let config = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -835,7 +776,13 @@ where
 
     config.block_on(async {
         let mut actor = A::default();
-        let conn = handshake::child().await?;
+
+        // Setup callback channel
+        let callback_conn = handshake::child_callback().await?;
+        let handle = CallbackHandle::new(callback_conn);
+        actor.set_callback_handle(handle);
+
+        let conn = handshake::child_request().await?;
         run_child_actor_loop(&mut actor, conn).await
     })?;
 
@@ -844,11 +791,11 @@ where
 
 /// Run a child process actor with a custom runtime configuration.
 #[instrument(skip(runtime), fields(pid=std::process::id()))]
-pub fn child_process_main_with_config<A, M>(
+pub fn child_process_main_with_config<A, M, C>(
     runtime: tokio::runtime::Runtime,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    A: Default + Message<M> + Clone + Send + RuntimeAware + 'static,
+    A: Default + Message<M> + Clone + Send + RuntimeAware + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     <A as Message<M>>::Reply: Reply
         + Send
@@ -862,14 +809,28 @@ where
         std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
     <<A as Message<M>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
     <A as Actor>::Error: std::error::Error + Send + Sync + 'static,
+    C: ChildCallbackMessage,
 {
     // Store the runtime in a static Box to ensure it lives for the entire program
     static RUNTIME: OnceCell<Box<tokio::runtime::Runtime>> = OnceCell::new();
     let runtime_ref = RUNTIME.get_or_init(|| Box::new(runtime));
 
     let mut actor = A::default();
-    runtime_ref.block_on(actor.init_with_runtime(&**runtime_ref))?;
-    let conn = runtime_ref.block_on(handshake::child())?;
-    runtime_ref.block_on(run_child_actor_loop(&mut actor, conn))?;
+
+    runtime_ref.block_on(async {
+        // Setup callback channel
+        let callback_conn = handshake::child_callback().await?;
+        let handle = CallbackHandle::new(callback_conn);
+        actor.set_callback_handle(handle);
+
+        // Init actor with runtime
+        actor.init_with_runtime(&**runtime_ref).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        // Run main request loop
+        let request_conn = handshake::child_request().await?;
+        run_child_actor_loop(&mut actor, request_conn).await
+    })?;
+
     Ok(())
 }

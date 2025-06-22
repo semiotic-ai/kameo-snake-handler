@@ -3,7 +3,7 @@ use kameo::reply::Reply;
 use kameo_child_process::prelude::*;
 use kameo_child_process::KameoChildProcessMessage;
 use kameo_snake_handler::prelude::*;
-use kameo_snake_handler::ErrorReply;
+use kameo_snake_handler::{ErrorReply, DefaultCallbackMessage};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Level;
@@ -97,7 +97,7 @@ impl KameoChildProcessMessage for OrkMessage {
 
 setup_subprocess_system! {
     actors = {
-        (PythonActor<OrkMessage>, OrkMessage),
+        (PythonActor<OrkMessage>, OrkMessage, DefaultCallbackMessage),
     },
     child_init = {
         // Initialize tracing first
