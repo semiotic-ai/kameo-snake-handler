@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Level;
 use tracing::{error, info};
+use tracing_subscriber::fmt::format::FmtSpan;
 
 /// Custom error type for Ork operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -106,6 +107,7 @@ setup_subprocess_system! {
                 .with_line_number(true)
                 .with_thread_ids(true)
                 .with_thread_names(true)
+                .with_span_events(FmtSpan::FULL)
                 .init();
 
         // Create and return a multi-threaded runtime for better Python async support
@@ -123,6 +125,7 @@ setup_subprocess_system! {
             .with_line_number(true)
             .with_thread_ids(true)
             .with_thread_names(true)
+            .with_span_events(FmtSpan::FULL)
             .init();
 
         // Create parent runtime

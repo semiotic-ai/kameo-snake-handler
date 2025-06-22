@@ -9,6 +9,9 @@ use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
 use kameo::prelude::*;
+use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
+use opentelemetry::Context as OTelContext;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -20,9 +23,15 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, instrument, warn, Level};
+use tracing::{debug, error, instrument, warn, Instrument, Level, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 use once_cell::sync::OnceCell;
+
+/// A serializable representation of a tracing span's context.
+/// This allows us to propagate traces across the process boundary.
+#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone, Default)]
+pub struct TracingContext(pub std::collections::HashMap<String, String>);
 
 /// Trait for actors that need access to the runtime
 #[async_trait]
@@ -69,16 +78,16 @@ pub trait KameoChildProcessMessage:
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub enum Control<T> {
     Handshake,
-    Real(T),
+    Real(T, TracingContext),
 }
 
 impl<T> Control<T> {
     pub fn is_handshake(&self) -> bool {
         matches!(self, Control::Handshake)
     }
-    pub fn into_real(self) -> Option<T> {
+    pub fn into_real(self) -> Option<(T, TracingContext)> {
         match self {
-            Control::Real(t) => Some(t),
+            Control::Real(t, tc) => Some((t, tc)),
             _ => None,
         }
     }
@@ -301,8 +310,8 @@ impl<M> SubprocessActor<M> {
                     }
                 };
 
-            let msg = match control.into_real() {
-                Some(m) => m,
+            let (msg, trace_context) = match control.into_real() {
+                Some((msg, trace_context)) => (msg, trace_context),
                 None => {
                     error!(
                         event = "subprocess",
@@ -315,8 +324,19 @@ impl<M> SubprocessActor<M> {
             // Create a new actor ref for this message
             let actor_ref = kameo::spawn(actor.clone());
 
+            let parent_cx =
+                global::get_text_map_propagator(|propagator| propagator.extract(&trace_context.0));
+            let span = tracing::info_span!("child_message_handler");
+            span.set_parent(parent_cx);
+
             // Send the message using ask() and handle the result
-            let reply = match actor_ref.ask(msg).await {
+            let reply = async {
+                 actor_ref.ask(msg).await
+            }
+            .instrument(span)
+            .await;
+
+            let reply = match reply {
                 Ok(r) => Ok(r),
                 Err(e) => match e {
                     kameo::error::SendError::HandlerError(e) => Err(e),
@@ -328,7 +348,7 @@ impl<M> SubprocessActor<M> {
             };
 
             // Encode and send the response
-            let response = Control::Real(reply);
+            let response = Control::Real(reply, TracingContext::default());
             let response_bytes = bincode::encode_to_vec(&response, bincode::config::standard())?;
 
             if let Err(e) = tx.send(response_bytes) {
@@ -604,10 +624,10 @@ where
         "Child actor loop started"
     );
 
-    let mut buf = vec![0u8; 4096];
     let actor_ref = kameo::spawn(actor.clone());
 
     loop {
+        let mut buf = vec![0u8; 4096];
         let n = match conn.read(&mut buf).await {
             Ok(0) => {
                 debug!(
@@ -624,49 +644,71 @@ where
             }
         };
 
-        let ctrl: Control<Msg> =
-            match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
-                Ok((ctrl, _)) => ctrl,
-                Err(e) => {
-                    error!(event = "message", error = ?e, "Failed to decode message");
-                    continue;
-                }
-            };
-
-        match ctrl {
-            Control::Handshake => {
-                debug!(
-                    event = "handshake",
-                    status = "responding",
-                    "Responding to handshake"
-                );
-                let resp = Control::<()>::Handshake;
-                let resp_bytes = bincode::encode_to_vec(&resp, bincode::config::standard())
-                    .expect("Failed to encode handshake response");
-                conn.write_all(&resp_bytes).await?;
-            }
-            Control::Real(msg) => {
-                debug!(event = "message", status = "handling", "Handling message");
-                let reply = match actor_ref.ask(msg).await {
-                    Ok(reply) => reply,
+        let (msg, trace_context) = {
+            let (ctrl, _): (Control<Msg>, _) =
+                match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
+                    Ok((ctrl, len)) => (ctrl, len),
                     Err(e) => {
-                        error!(event = "error", error = ?e, "Failed to handle message");
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Failed to handle message: {:?}", e),
-                        ));
+                        error!(event = "message", error = ?e, "Failed to decode message");
+                        continue;
                     }
                 };
-                let reply_bytes =
-                    bincode::encode_to_vec(Control::Real(reply), bincode::config::standard())
-                        .expect("Failed to encode reply");
-                conn.write_all(&reply_bytes).await?;
-                debug!(
-                    event = "message",
-                    status = "complete",
-                    "Message handled successfully"
-                );
+
+            match ctrl {
+                Control::Handshake => {
+                    debug!(
+                        event = "handshake",
+                        status = "responding",
+                        "Responding to handshake"
+                    );
+                    let resp = Control::<()>::Handshake;
+                    let resp_bytes = bincode::encode_to_vec(&resp, bincode::config::standard())
+                        .expect("Failed to encode handshake response");
+                    conn.write_all(&resp_bytes).await?;
+                    continue;
+                }
+                Control::Real(msg, trace_context) => (msg, trace_context),
             }
+        };
+
+        let parent_cx =
+            global::get_text_map_propagator(|propagator| propagator.extract(&trace_context.0));
+        let span = tracing::info_span!("child_message_handler");
+        span.set_parent(parent_cx);
+
+        let reply = async {
+            debug!(event = "message", status = "handling", "Handling message");
+            let reply = match actor_ref.ask(msg).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    error!(event = "error", error = ?e, "Failed to handle message");
+                    // This is tricky. We need to construct a reply of the correct type,
+                    // but we don't have enough type information here.
+                    // For now, we'll just drop the connection.
+                    // A more robust implementation would require more complex error handling.
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to handle message: {:?}", e),
+                    ));
+                }
+            };
+            let reply_bytes =
+                bincode::encode_to_vec(Control::Real(reply, TracingContext::default()), bincode::config::standard())
+                    .expect("Failed to encode reply");
+            conn.write_all(&reply_bytes).await?;
+            debug!(
+                event = "message",
+                status = "complete",
+                "Message handled successfully"
+            );
+            Ok(())
+        }
+        .instrument(span)
+        .await;
+
+        if let Err(e) = reply {
+            error!(event = "message", error = ?e, "Failed to send reply");
+            break;
         }
     }
 
@@ -735,8 +777,14 @@ where
         async move {
             let mut conn = self.connection.lock().await;
 
+            let mut trace_context_map = std::collections::HashMap::new();
+            global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(&OTelContext::current(), &mut trace_context_map);
+            });
+            let trace_context = TracingContext(trace_context_map);
+
             // Encode and send the message
-            let control = Control::Real(msg);
+            let control = Control::Real(msg, trace_context);
             let msg_bytes = bincode::encode_to_vec(&control, bincode::config::standard())?;
             conn.write_all(&msg_bytes).await?;
             conn.flush().await?;
@@ -757,7 +805,7 @@ where
                 Control::Handshake => Err(SubprocessActorError::Protocol(
                     "Unexpected handshake response".into(),
                 )),
-                Control::Real(reply) => Ok(reply),
+                Control::Real(reply, _trace_context) => Ok(reply),
             }
         }
     }

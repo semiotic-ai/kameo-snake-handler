@@ -10,6 +10,9 @@ use kameo_child_process::{KameoChildProcessMessage, RuntimeAware, ChildProcessBu
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
+use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
+use opentelemetry::Context as OTelContext;
 use pyo3::exceptions::{
     PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
     PyValueError,
@@ -384,6 +387,10 @@ where
             let result = match py_function_res {
                 Some(Ok(py_function)) => {
                     if actor.config.is_async {
+                        let mut trace_context_map = std::collections::HashMap::new();
+                        global::get_text_map_propagator(|propagator| {
+                            propagator.inject_context(&OTelContext::current(), &mut trace_context_map);
+                        });
                         let future_res = Python::with_gil(|py| {
                             let func = py_function.bind(py);
                             
