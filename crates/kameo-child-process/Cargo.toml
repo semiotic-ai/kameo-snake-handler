@@ -15,7 +15,9 @@ kameo_macros = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
 parity-tokio-ipc = { workspace = true }
+pyo3 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

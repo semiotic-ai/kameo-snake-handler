@@ -1,28 +1,32 @@
-use std::marker::PhantomData;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::ops::ControlFlow;
-
-use kameo::actor::{Actor, ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, PanicError};
-use kameo::message::{Context, Message};
-use kameo_child_process::{KameoChildProcessMessage, RuntimeAware, ChildProcessBuilder, SubprocessActor, ChildCallbackMessage, CallbackHandler};
+use std::panic::AssertUnwindSafe;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use opentelemetry::global;
-use opentelemetry::Context as OTelContext;
+use either::Either;
+use futures::FutureExt;
+use kameo::actor::{Actor, ActorRef, WeakActorRef};
+use kameo::error::{ActorStopReason, PanicError};
+use kameo::message::{Context, Message};
+use kameo_child_process::{
+    CallbackHandle, CallbackHandler, ChildCallbackMessage, ChildProcessBuilder, KameoChildProcessMessage, RuntimeAware, SubprocessActor
+};
 use pyo3::exceptions::{
     PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
     PyValueError,
 };
 use pyo3::prelude::*;
+use pyo3::pyclass;
+use pyo3::pymethods;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, instrument, info, Level};
+use tracing::{error, info, instrument, Level};
 
 pub mod serde_py;
-pub use serde_py::{FromPyAny, to_pyobject, from_pyobject};
+pub use serde_py::{from_pyobject, to_pyobject, FromPyAny};
 
 /// Trait for creating a reply from a Python execution error
 pub trait ErrorReply: Sized {
@@ -178,13 +182,37 @@ impl ChildCallbackMessage for DefaultCallbackMessage {
     type Reply = ();
 }
 
+#[pyclass(unsendable)]
+struct KameoCallbackHandle {
+    handle: CallbackHandle<DefaultCallbackMessage>,
+}
+
+#[pymethods]
+impl KameoCallbackHandle {
+    #[pyo3(name = "ask")]
+    fn ask_py<'py>(&self, py: Python<'py>, message: PyObject) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.handle.clone();
+        let bound_message = message.bind(py);
+        let callback_message: DefaultCallbackMessage = from_pyobject(bound_message)
+            .map_err(|e| PyValueError::new_err(format!("Failed to deserialize callback message: {}", e)))?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match handle.ask(callback_message).await {
+                Ok(reply) => Python::with_gil(|py| {
+                    to_pyobject(py, &reply).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                }),
+                Err(e) => Err(PyRuntimeError::new_err(format!("Callback failed: {}", e))),
+            }
+        })
+    }
+}
+
 /// Configuration for Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct PythonConfig {
     pub python_path: Vec<String>,
     pub module_name: String,
     pub function_name: String,
-    pub is_async: bool,
     pub env_vars: Vec<(String, String)>,
 }
 
@@ -192,7 +220,8 @@ pub struct PythonConfig {
 #[derive(Debug)]
 pub struct PythonActor<M> {
     config: PythonConfig,
-    py_function: Option<Result<PyObject, PythonExecutionError>>,
+    py_function: Option<PyObject>,
+    callback_handle: Option<CallbackHandle<DefaultCallbackMessage>>,
     _phantom: PhantomData<M>,
 }
 
@@ -214,6 +243,7 @@ impl<M> Default for PythonActor<M> {
         Self {
             config,
             py_function: None,
+            callback_handle: None,
             _phantom: PhantomData,
         }
     }
@@ -223,10 +253,8 @@ impl<M> Clone for PythonActor<M> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            py_function: self.py_function.as_ref().map(|res| match res {
-                Ok(obj) => Ok(Python::with_gil(|py| obj.clone_ref(py))),
-                Err(e) => Err(e.clone()),
-            }),
+            py_function: self.py_function.as_ref().map(|obj| Python::with_gil(|py| obj.clone_ref(py))),
+            callback_handle: self.callback_handle.clone(),
             _phantom: PhantomData,
         }
     }
@@ -245,7 +273,6 @@ impl<M> PythonSubprocessBuilder<M> {
                 python_path: vec![],
                 module_name: String::new(),
                 function_name: String::new(),
-                is_async: false,
                 env_vars: vec![],
             },
             _phantom: PhantomData,
@@ -261,6 +288,7 @@ impl<M> PythonSubprocessBuilder<M> {
         Ok(PythonActor {
             config: self.config,
             py_function: None,
+            callback_handle: None,
             _phantom: PhantomData,
         })
     }
@@ -293,7 +321,7 @@ impl PythonChildProcessBuilder {
     #[instrument(skip(self), fields(config = ?self.python_config, log_level = ?self.log_level))]
     pub async fn spawn<M>(self) -> Result<ActorRef<SubprocessActor<M>>>
     where
-        M: KameoChildProcessMessage + Send + Sync + 'static,
+        M: KameoChildProcessMessage + Send + Sync + 'static + std::panic::UnwindSafe,
         <M as KameoChildProcessMessage>::Reply: ErrorReply,
     {
         info!("Spawning Python child process");
@@ -383,26 +411,18 @@ where
     }
 
     /// Convert a Python object back to our Reply type
-    fn deserialize_py_to_reply(&self, py_obj: PyObject, py: Python) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError> {
-        from_pyobject(&py_obj.bind(py).as_borrowed())
+    fn deserialize_py_to_reply(&self, py_obj: &Bound<PyAny>) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError> {
+        from_pyobject(py_obj)
             .map_err(|e| PythonExecutionError::DeserializationError {
                 message: e.to_string(),
             })
-    }
-
-    /// Handle sync Python function call
-    fn handle_sync(&self, message: &M, py: Python, func: &Bound<PyAny>) -> Result<PyObject, PythonExecutionError> {
-        let py_dict = self.serialize_message_to_py(message, py)?;
-        let result = func.call1((py_dict,))
-            .map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
-        Ok(result.into())
     }
 }
 
 #[async_trait]
 impl<M> Message<M> for PythonActor<M>
 where
-    M: KameoChildProcessMessage + Send + 'static,
+    M: KameoChildProcessMessage + Send + 'static + std::panic::UnwindSafe,
     <M as KameoChildProcessMessage>::Reply: ErrorReply,
 {
     type Reply = <M as KameoChildProcessMessage>::Reply;
@@ -415,42 +435,52 @@ where
     ) -> impl std::future::Future<Output = Self::Reply> + Send {
         let actor = self.clone();
 
-        async move {
-            let py_function_res = actor.py_function.as_ref();
+        AssertUnwindSafe(async move {
+            let result: Result<Self::Reply, PythonExecutionError> = match actor.py_function.as_ref() {
+                Some(py_function) => {
+                    let py_result_or_coro: Result<Either<PyObject, PyObject>, PyErr> = Python::with_gil(|py| {
+                        let func = py_function.bind(py);
+                        let py_dict = actor.serialize_message_to_py(&message, py)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        let result_bound = func.call1((py_dict,))?;
 
-            let result = match py_function_res {
-                Some(Ok(py_function)) => {
-                    if actor.config.is_async {
-                        let mut trace_context_map = std::collections::HashMap::new();
-                        global::get_text_map_propagator(|propagator| {
-                            propagator.inject_context(&OTelContext::current(), &mut trace_context_map);
-                        });
-                        let future_res = Python::with_gil(|py| {
-                            let func = py_function.bind(py);
-                            
-                            let py_dict = actor.serialize_message_to_py(&message, py)
-                                .map_err(|e| PyErr::new::<PyRuntimeError, _>(e.to_string()))?;
-                            let coro = func.call1((py_dict,))?;
-
-                            pyo3_async_runtimes::tokio::into_future(coro.into())
-                        });
-
-                        match future_res {
-                            Ok(future) => match future.await {
-                                Ok(result_obj) => Python::with_gil(|py| actor.deserialize_py_to_reply(result_obj, py)),
-                                Err(py_err) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(py_err, py))),
-                            },
-                            Err(py_err) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(py_err, py))),
+                        let asyncio = py.import("asyncio")?;
+                        if asyncio.call_method1("iscoroutine", (result_bound.clone(),))?.extract::<bool>()? {
+                            Ok(Either::Left(result_bound.unbind()))
+                        } else {
+                            Ok(Either::Right(result_bound.unbind()))
                         }
-                    } else {
-                        Python::with_gil(|py| {
-                            let func = py_function.bind(py);
-                            let result_obj = actor.handle_sync(&message, py, func)?;
-                            actor.deserialize_py_to_reply(result_obj, py)
-                        })
+                    });
+
+                    match py_result_or_coro {
+                        Ok(Either::Left(coro)) => {
+                            let future_res = Python::with_gil(|py| {
+                                // The `.clone()` here is crucial. It creates a new reference-counted handle
+                                // to the Python coroutine object. This allows us to move the handle into
+                                // the Rust future, ensuring the Python object remains alive even after
+                                // the current GIL-bound scope is exited. Without this, we'd face
+                                // lifetime errors as the object would be dropped too soon.
+                                pyo3_async_runtimes::tokio::into_future(coro.bind(py).clone().into_any())
+                            });
+
+                            let awaited_res = match future_res {
+                                Ok(future) => future.await,
+                                Err(e) => Err(e),
+                            };
+
+                            match awaited_res {
+                                Ok(final_py_obj) => Python::with_gil(|py| {
+                                    actor.deserialize_py_to_reply(&final_py_obj.bind(py))
+                                }),
+                                Err(e) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(e, py))),
+                            }
+                        }
+                        Ok(Either::Right(sync_result)) => {
+                            Python::with_gil(|py| actor.deserialize_py_to_reply(&sync_result.bind(py)))
+                        }
+                        Err(e) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(e, py))),
                     }
-                },
-                Some(Err(e)) => Err(e.clone()),
+                }
                 None => Err(PythonExecutionError::RuntimeError {
                     message: "Python function not initialized. This is a bug.".to_string(),
                 }),
@@ -458,9 +488,31 @@ where
 
             match result {
                 Ok(reply) => reply,
-                Err(e) => <Self as Message<M>>::Reply::from_error(e),
+                Err(e) => {
+                    error!(event = "error", error = ?e, "Python error in handler, sending error reply (not panicking or hanging)");
+                    <Self::Reply>::from_error(e)
+                }
             }
-        }
+        })
+        .catch_unwind()
+        .map(|res| {
+            match res {
+                Ok(reply) => reply,
+                Err(panic) => {
+                    let message = if let Some(s) = panic.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Undescribable panic".to_string()
+                    };
+                    error!(event = "error", error = %message, "Panic caught in PythonActor handle");
+                    <Self::Reply>::from_error(PythonExecutionError::RuntimeError {
+                        message: format!("Actor panicked: {}", message),
+                    })
+                }
+            }
+        })
     }
 }
 
@@ -469,30 +521,35 @@ impl<M> RuntimeAware for PythonActor<M>
 where
     M: KameoChildProcessMessage + Send + 'static,
 {
-    #[instrument(skip(self, runtime), fields(python_paths = ?self.config.python_path, module_name = ?self.config.module_name, is_async = ?self.config.is_async))]
+    #[instrument(skip(self, runtime), fields(python_paths = ?self.config.python_path, module_name = ?self.config.module_name))]
     fn init_with_runtime<'a>(&'a mut self, runtime: &'static tokio::runtime::Runtime) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
         let config = self.config.clone();
+        let callback_handle = self.callback_handle.clone();
 
         Box::pin(async move {
-            pyo3::prepare_freethreaded_python();
-
             if let Err(e) = pyo3_async_runtimes::tokio::init_with_runtime(runtime) {
                 error!("Failed to initialize pyo3-async-runtimes: {:?}", e);
-                let err = PythonExecutionError::RuntimeError {
+                return Err(PythonExecutionError::RuntimeError {
                     message: format!("Failed to initialize pyo3-async-runtimes: {:?}", e),
-                };
-                self.py_function = Some(Err(err));
-                return Ok(());
+                });
             }
 
             let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
-                let sys = py.import("sys").map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
-                let path = sys.getattr("path").map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+                let sys = py.import("sys")?;
+                let path = sys.getattr("path")?;
                 for p in &config.python_path {
-                    path.call_method1("append", (p,)).map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+                    path.call_method1("append", (p,))?;
                 }
 
-                let module = py.import(&config.module_name).map_err(|e| PythonExecutionError::from_pyerr(e, py))?;
+                if let Some(handle) = callback_handle.clone() {
+                    let kameo_module = PyModule::new(py, "kameo")?;
+                    let py_callback_handle = KameoCallbackHandle { handle };
+                    let handle_obj = Py::new(py, py_callback_handle)?;
+                    kameo_module.add("callback_handle", handle_obj)?;
+                    sys.getattr("modules")?.set_item("kameo", kameo_module)?;
+                }
+
+                let module = py.import(&config.module_name)?;
                 let function = module.getattr(&config.function_name).map_err(|e| {
                     PythonExecutionError::FunctionNotFound {
                         module: config.module_name.clone(),
@@ -504,9 +561,19 @@ where
                 Ok(function.into())
             });
 
-            self.py_function = Some(module_result);
-            tracing::info!("Python runtime initialization complete");
-            Ok(())
+            match module_result {
+                Ok(py_function) => {
+                    self.py_function = Some(py_function);
+                    tracing::info!("Python runtime initialization complete");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to initialize Python function: {:?}", e);
+                    tracing::error!(error = ?e, "Non-resumable error: shutting down child process");
+                    // Exit the process with error code 101 (conventional for fatal error)
+                    std::process::exit(101);
+                }
+            }
         })
     }
 }
@@ -517,9 +584,8 @@ impl<M> CallbackSender<DefaultCallbackMessage> for PythonActor<M>
 where
     M: KameoChildProcessMessage + Send + 'static,
 {
-    fn set_callback_handle(&mut self, _handle: kameo_child_process::CallbackHandle<DefaultCallbackMessage>) {
-        // In this example, the PythonActor does not need to send callbacks.
-        // If it did, we would store the handle here.
+    fn set_callback_handle(&mut self, handle: kameo_child_process::CallbackHandle<DefaultCallbackMessage>) {
+        self.callback_handle = Some(handle);
     }
 }
 

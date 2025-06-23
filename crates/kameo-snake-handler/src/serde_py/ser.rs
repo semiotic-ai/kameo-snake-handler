@@ -176,9 +176,9 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
         _name: &'static str,
         _variant_index: u32,
         variant: &'static str,
-        len: usize,
+        _len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
-        let mut seq = PythonSeqSerializer::new(self.py, Some(len))?;
+        let mut seq = PythonSeqSerializer::new(self.py)?;
         seq.next_key = Some(variant.to_string());
         Ok(seq)
     }
@@ -220,9 +220,9 @@ pub struct PythonSeqSerializer<'py> {
 }
 
 impl<'py> PythonSeqSerializer<'py> {
-    fn new(py: Python<'py>, _len: Option<usize>) -> Result<Self> {
-        Ok(Self {
-            py,
+    fn new(py: Python<'py>) -> Result<Self> {
+        Ok(Self { 
+            py, 
             list: PyList::empty(py).into(),
             next_key: None,
         })

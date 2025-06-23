@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bincode = { workspace = true }
+either = "1.13.0"
 futures = { workspace = true }
 kameo = { workspace = true }
 kameo-child-process = { path = "../kameo-child-process" }

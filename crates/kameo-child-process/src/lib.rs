@@ -27,6 +27,7 @@ use tracing::{debug, error, instrument, warn, Instrument, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 use once_cell::sync::OnceCell;
+use pyo3;
 
 pub use callback::{CallbackHandle, ChildCallbackMessage, CallbackSender, CallbackReceiver, CallbackHandler};
 
@@ -128,6 +129,22 @@ pub enum SubprocessActorError {
 
     #[error("Unknown actor type: {actor_name}")]
     UnknownActorType { actor_name: String },
+}
+
+impl bincode::Encode for SubprocessActorError {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> core::result::Result<(), bincode::error::EncodeError> {
+        match self {
+            SubprocessActorError::Protocol(s) => s.encode(encoder),
+            _ => panic!("Tried to encode non-Protocol variant of SubprocessActorError!"),
+        }
+    }
+}
+
+impl bincode::Decode<()> for SubprocessActorError {
+    fn decode<D: bincode::de::Decoder<Context = ()>>(decoder: &mut D) -> core::result::Result<Self, bincode::error::DecodeError> {
+        let s = String::decode(decoder)?;
+        Ok(SubprocessActorError::Protocol(s))
+    }
 }
 
 /// Handle unknown actor type errors with proper tracing
@@ -486,6 +503,7 @@ where
 
         // Spawn child process with clean environment
         let mut cmd = tokio::process::Command::new(current_exe);
+        cmd.env_remove("PYTHONPATH");
         cmd.env("KAMEO_CHILD_ACTOR", &self.config.name);
         cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());
         cmd.env("KAMEO_CALLBACK_SOCKET", callback_socket_path.to_string_lossy().as_ref());
@@ -570,12 +588,12 @@ where
         let mut buf = vec![0u8; 4096];
         let n = match conn.read(&mut buf).await {
             Ok(0) => {
-                debug!(
+                error!(
                     event = "lifecycle",
                     status = "shutdown",
-                    "Parent connection closed"
+                    "Child process closed connection, shutting down parent handler"
                 );
-                break;
+                return Err(io::Error::new(io::ErrorKind::Other, "Child process closed connection"));
             }
             Ok(n) => n,
             Err(e) => {
@@ -616,40 +634,36 @@ where
         let span = tracing::info_span!("child_message_handler");
         span.set_parent(parent_cx);
 
-        let reply = async {
+        let reply_fut = async {
             debug!(event = "message", status = "handling", "Handling message");
-            let reply = match actor_ref.ask(msg).await {
-                Ok(reply) => reply,
-                Err(e) => {
-                    error!(event = "error", error = ?e, "Failed to handle message");
-                    // This is tricky. We need to construct a reply of the correct type,
-                    // but we don't have enough type information here.
-                    // For now, we'll just drop the connection.
-                    // A more robust implementation would require more complex error handling.
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("Failed to handle message: {:?}", e),
-                    ));
-                }
-            };
-            let reply_bytes =
-                bincode::encode_to_vec(Control::Real(reply, TracingContext::default()), bincode::config::standard())
-                    .expect("Failed to encode reply");
-            conn.write_all(&reply_bytes).await?;
-            debug!(
-                event = "message",
-                status = "complete",
-                "Message handled successfully"
-            );
-            Ok(())
-        }
-        .instrument(span)
-        .await;
+            actor_ref.ask(msg).await
+        };
 
-        if let Err(e) = reply {
-            error!(event = "message", error = ?e, "Failed to send reply");
+        let result = reply_fut.instrument(span).await;
+
+        let reply_to_send: Result<_, SubprocessActorError> = match result {
+            Ok(reply) => Ok(reply),
+            Err(e) => Err(SubprocessActorError::Protocol(format!("{e}"))),
+        };
+        // Only Protocol(String) is ever sent, so it's always serializable
+        let reply_to_send = reply_to_send.map_err(|e| {
+            match e {
+                SubprocessActorError::Protocol(s) => SubprocessActorError::Protocol(s),
+                _ => SubprocessActorError::Protocol(format!("Non-serializable error: {e}")),
+            }
+        });
+        let reply_bytes =
+            bincode::encode_to_vec(&Control::Real(reply_to_send, TracingContext::default()), bincode::config::standard())
+                .expect("Failed to encode reply");
+        if let Err(e) = conn.write_all(&reply_bytes).await {
+            error!(event = "message", error = ?e, "Failed to send reply to parent");
             break;
         }
+        debug!(
+            event = "message",
+            status = "complete",
+            "Message handled successfully"
+        );
     }
 
     Ok(())
@@ -738,14 +752,14 @@ where
             }
 
             // Decode response
-            let (control, _): (Control<<M as KameoChildProcessMessage>::Reply>, _) =
+            let (control, _): (Control<Self::Reply>, _) =
                 bincode::decode_from_slice(&resp_buf[..n], bincode::config::standard())?;
 
             match control {
                 Control::Handshake => Err(SubprocessActorError::Protocol(
                     "Unexpected handshake response".into(),
                 )),
-                Control::Real(reply, _trace_context) => Ok(reply),
+                Control::Real(reply, _trace_context) => reply,
             }
         }
     }
@@ -811,6 +825,7 @@ where
     <A as Actor>::Error: std::error::Error + Send + Sync + 'static,
     C: ChildCallbackMessage,
 {
+    pyo3::prepare_freethreaded_python();
     // Store the runtime in a static Box to ensure it lives for the entire program
     static RUNTIME: OnceCell<Box<tokio::runtime::Runtime>> = OnceCell::new();
     let runtime_ref = RUNTIME.get_or_init(|| Box::new(runtime));
@@ -834,3 +849,4 @@ where
 
     Ok(())
 }
+
