@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Level;
 use tracing::{error, info};
+use pyo3::types::PyAnyMethods;
 
 /// Custom error type for Ork operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -116,6 +117,7 @@ setup_subprocess_system! {
             .with_thread_ids(true)
             .with_thread_names(true)
             .init();
+        // Only build and return the runtime by value
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -161,6 +163,7 @@ async fn run_sync_tests(python_path: std::path::PathBuf) -> Result<(), Box<dyn s
         module_name: "ork_logic".to_string(),
         function_name: "handle_message".to_string(),
         env_vars: vec![],
+        is_async: false,
     };
     let sync_ref = PythonChildProcessBuilder::new(sync_config).spawn().await?;
     
@@ -216,6 +219,7 @@ async fn run_async_tests(python_path: std::path::PathBuf) -> Result<(), Box<dyn 
         module_name: "ork_logic_async".to_string(),
         function_name: "handle_message_async".to_string(),
         env_vars: vec![],
+        is_async: true,
     };
     let async_ref = PythonChildProcessBuilder::new(async_config).spawn().await?;
     
@@ -288,6 +292,7 @@ async fn run_invalid_config_tests(python_path: std::path::PathBuf) -> Result<(),
         module_name: "non_existent_module".to_string(),
         function_name: "handle_message".to_string(),
         env_vars: vec![],
+        is_async: false,
     };
     
     let spawn_result = PythonChildProcessBuilder::new(invalid_module_config).spawn::<OrkMessage>().await;
@@ -303,6 +308,7 @@ async fn run_invalid_config_tests(python_path: std::path::PathBuf) -> Result<(),
         module_name: "ork_logic".to_string(),
         function_name: "non_existent_function".to_string(),
         env_vars: vec![],
+        is_async: false,
     };
     let spawn_result = PythonChildProcessBuilder::new(invalid_function_config).spawn::<OrkMessage>().await;
     match spawn_result {
@@ -318,6 +324,7 @@ async fn run_invalid_config_tests(python_path: std::path::PathBuf) -> Result<(),
         module_name: "ork_logic".to_string(),
         function_name: "handle_message".to_string(),
         env_vars: vec![],
+        is_async: false,
     };
     let spawn_result = PythonChildProcessBuilder::new(invalid_path_config).spawn::<OrkMessage>().await;
     match spawn_result {
