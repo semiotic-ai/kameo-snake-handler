@@ -6,6 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use futures::StreamExt;
+use futures::FutureExt;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
@@ -526,7 +527,7 @@ where
         );
 
         // Spawn the child process
-        let child = cmd.spawn()?;
+        let mut child = cmd.spawn()?;
 
         debug!(
             event = "lifecycle",
@@ -535,18 +536,54 @@ where
             "Child process spawned"
         );
 
-        // Wait for child to connect to both sockets
-        let (request_conn_res, callback_conn_res) = tokio::join!(
-            request_incoming.next(),
-            callback_incoming.next()
-        );
-
-        let request_conn = request_conn_res.transpose()?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "No child request connection received")
-        })?;
-        let callback_conn = callback_conn_res.transpose()?.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "No child callback connection received")
-        })?;
+        // Wait for child to connect to both sockets, with timeout and liveness check
+        use tokio::time::{timeout, Duration, sleep};
+        let timeout_duration = Duration::from_secs(3);
+        let poll_interval = Duration::from_millis(50);
+        let mut request_conn = None;
+        let mut callback_conn = None;
+        let start = std::time::Instant::now();
+        loop {
+            // Try to get connections
+            if request_conn.is_none() {
+                match request_incoming.next().now_or_never() {
+                    Some(Some(Ok(conn))) => request_conn = Some(conn),
+                    Some(Some(Err(e))) => warn!("Error accepting request connection: {:?}", e),
+                    Some(None) => {},
+                    None => {},
+                }
+            }
+            if callback_conn.is_none() {
+                match callback_incoming.next().now_or_never() {
+                    Some(Some(Ok(conn))) => callback_conn = Some(conn),
+                    Some(Some(Err(e))) => warn!("Error accepting callback connection: {:?}", e),
+                    Some(None) => {},
+                    None => {},
+                }
+            }
+            if request_conn.is_some() && callback_conn.is_some() {
+                break;
+            }
+            // Check if child exited
+            if let Some(status) = child.try_wait()? {
+                warn!("Child exited early with status: {:?}", status);
+                // Clean up sockets
+                let _ = tokio::fs::remove_file(&request_socket_path).await;
+                let _ = tokio::fs::remove_file(&callback_socket_path).await;
+                return Err(io::Error::new(io::ErrorKind::Other, format!("Child exited early: {:?}", status)));
+            }
+            // Timeout
+            if start.elapsed() > timeout_duration {
+                warn!("Timeout waiting for child handshake, killing child process");
+                let _ = child.kill().await;
+                let _ = tokio::fs::remove_file(&request_socket_path).await;
+                let _ = tokio::fs::remove_file(&callback_socket_path).await;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout waiting for child handshake"));
+            }
+            sleep(poll_interval).await;
+        }
+        let request_conn = request_conn.unwrap();
+        let callback_conn = callback_conn.unwrap();
 
         let actor = SubprocessActor::new(Box::new(request_conn), child, request_socket_path);
         let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), handler);

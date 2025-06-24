@@ -440,6 +440,7 @@ dependencies = [
  "kameo-child-process",
  "kameo-snake-testing",
  "kameo_macros",
+ "once_cell",
  "opentelemetry 0.21.0",
  "proptest",
  "pyo3",

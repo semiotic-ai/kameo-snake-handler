@@ -24,6 +24,9 @@ use pyo3::pymethods;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, info, instrument, Level};
+use once_cell::sync::OnceCell;
+use pyo3::BoundObject;
+use pyo3::IntoPyObjectExt;
 
 pub mod serde_py;
 pub use serde_py::{from_pyobject, to_pyobject, FromPyAny};
@@ -240,6 +243,25 @@ impl<M> Default for PythonActor<M> {
             }
         };
 
+        // --- CHILD PROCESS RUNTIME INIT ---
+        // Only run this in the child process (where KAMEO_PYTHON_CONFIG is set)
+        static CHILD_RUNTIME_INIT: std::sync::Once = std::sync::Once::new();
+        CHILD_RUNTIME_INIT.call_once(|| {
+            let runtime = Box::leak(Box::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to build single-threaded Tokio runtime"),
+            ));
+            // Only call if not already initialized, ignore error if already set
+            if let Err(e) = pyo3_async_runtimes::tokio::init_with_runtime(runtime) {
+                tracing::warn!("[Orkimedes] pyo3_async_runtimes::tokio::init_with_runtime already initialized or failed: {:?}", e);
+            } else {
+                tracing::info!("[Orkimedes] Child Tokio runtime and Python bridge initialized");
+            }
+        });
+        // --- END CHILD PROCESS RUNTIME INIT ---
+
         Self {
             config,
             py_function: None,
@@ -434,85 +456,65 @@ where
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> impl std::future::Future<Output = Self::Reply> + Send {
         let actor = self.clone();
-
-        AssertUnwindSafe(async move {
-            let result: Result<Self::Reply, PythonExecutionError> = match actor.py_function.as_ref() {
-                Some(py_function) => {
-                    let py_result_or_coro: Result<Either<PyObject, PyObject>, PyErr> = Python::with_gil(|py| {
-                        let func = py_function.bind(py);
-                        let py_dict = actor.serialize_message_to_py(&message, py)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        let result_bound = func.call1((py_dict,))?;
-
-                        let asyncio = py.import("asyncio")?;
-                        if asyncio.call_method1("iscoroutine", (result_bound.clone(),))?.extract::<bool>()? {
-                            Ok(Either::Left(result_bound.unbind()))
-                        } else {
-                            Ok(Either::Right(result_bound.unbind()))
-                        }
-                    });
-
-                    match py_result_or_coro {
-                        Ok(Either::Left(coro)) => {
-                            let future_res = Python::with_gil(|py| {
-                                // The `.clone()` here is crucial. It creates a new reference-counted handle
-                                // to the Python coroutine object. This allows us to move the handle into
-                                // the Rust future, ensuring the Python object remains alive even after
-                                // the current GIL-bound scope is exited. Without this, we'd face
-                                // lifetime errors as the object would be dropped too soon.
-                                pyo3_async_runtimes::tokio::into_future(coro.bind(py).clone().into_any())
-                            });
-
-                            let awaited_res = match future_res {
-                                Ok(future) => future.await,
-                                Err(e) => Err(e),
-                            };
-
-                            match awaited_res {
-                                Ok(final_py_obj) => Python::with_gil(|py| {
-                                    actor.deserialize_py_to_reply(&final_py_obj.bind(py))
-                                }),
-                                Err(e) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(e, py))),
-                            }
-                        }
-                        Ok(Either::Right(sync_result)) => {
-                            Python::with_gil(|py| actor.deserialize_py_to_reply(&sync_result.bind(py)))
-                        }
-                        Err(e) => Err(Python::with_gil(|py| PythonExecutionError::from_pyerr(e, py))),
-                    }
+        async move {
+            // Ensure we are inside a Tokio runtime and the runtime is bridged to Python (already done at process init)
+            // Call the Python function and handle sync/async result in the same context
+            let (py_result, is_coro) = Python::with_gil(|py| {
+                let py_function = match actor.py_function.as_ref() {
+                    Some(f) => f.bind(py),
+                    None => return (Err(PythonExecutionError::RuntimeError {
+                        message: "Python function not initialized. This is a bug.".to_string(),
+                    }), false),
+                };
+                let py_dict = match actor.serialize_message_to_py(&message, py) {
+                    Ok(d) => d,
+                    Err(e) => return (Err(PythonExecutionError::from(e)), false),
+                };
+                let result = match py_function.call1((py_dict,)) {
+                    Ok(r) => r,
+                    Err(e) => return (Err(PythonExecutionError::from(e)), false),
+                };
+                let asyncio = py.import("asyncio").expect("Failed to import asyncio");
+                let is_coro = asyncio.call_method1("iscoroutine", (&result,)).expect("iscoroutine failed").extract::<bool>().unwrap_or(false);
+                (Ok(result.unbind()), is_coro)
+            });
+            let py_result = match py_result {
+                Ok(obj) => obj,
+                Err(e @ PythonExecutionError::ModuleNotFound { .. }) | Err(e @ PythonExecutionError::FunctionNotFound { .. }) => {
+                    error!("Fatal Python import/function error: {:?}. Shutting down actor.", e);
+                    std::process::exit(101);
                 }
-                None => Err(PythonExecutionError::RuntimeError {
-                    message: "Python function not initialized. This is a bug.".to_string(),
-                }),
+                Err(e) => return <Self::Reply>::from_error(e),
             };
-
-            match result {
-                Ok(reply) => reply,
-                Err(e) => {
-                    error!(event = "error", error = ?e, "Python error in handler, sending error reply (not panicking or hanging)");
-                    <Self::Reply>::from_error(e)
+            if is_coro {
+                // Await coroutine immediately in this context, using the runtime bridge
+                let awaited_py: Py<PyAny> = match Python::with_gil(|py| {
+                    let bound = py_result.into_bound(py);
+                    pyo3_async_runtimes::tokio::into_future(bound)
+                }) {
+                    Ok(fut) => match fut.await {
+                        Ok(obj) => obj,
+                        Err(e) => return <Self::Reply>::from_error(PythonExecutionError::from(e)),
+                    },
+                    Err(e) => return <Self::Reply>::from_error(PythonExecutionError::from(e)),
+                };
+                match Python::with_gil(|py| {
+                    let awaited_bound = awaited_py.into_bound(py);
+                    actor.deserialize_py_to_reply(&awaited_bound)
+                }) {
+                    Ok(reply) => reply,
+                    Err(e) => <Self::Reply>::from_error(e),
+                }
+            } else {
+                match Python::with_gil(|py| {
+                    let bound = py_result.into_bound(py);
+                    actor.deserialize_py_to_reply(&bound)
+                }) {
+                    Ok(reply) => reply,
+                    Err(e) => <Self::Reply>::from_error(e),
                 }
             }
-        })
-        .catch_unwind()
-        .map(|res| {
-            match res {
-                Ok(reply) => reply,
-                Err(panic) => {
-                    let message = if let Some(s) = panic.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "Undescribable panic".to_string()
-                    };
-                    error!(event = "error", error = %message, "Panic caught in PythonActor handle");
-                    <Self::Reply>::from_error(PythonExecutionError::RuntimeError {
-                        message: format!("Actor panicked: {}", message),
-                    })
-                }
-            }
-        })
+        }
     }
 }
 
@@ -526,53 +528,63 @@ where
         let config = self.config.clone();
         let callback_handle = self.callback_handle.clone();
 
-        Box::pin(async move {
-            if let Err(e) = pyo3_async_runtimes::tokio::init_with_runtime(runtime) {
-                error!("Failed to initialize pyo3-async-runtimes: {:?}", e);
-                return Err(PythonExecutionError::RuntimeError {
-                    message: format!("Failed to initialize pyo3-async-runtimes: {:?}", e),
-                });
+        // --- MACRO PATTERN START ---
+        // 1. Prepare Python for multi-threaded use
+        tracing::info!("[Orkimedes] prepare_freethreaded_python()");
+        pyo3::prepare_freethreaded_python();
+
+        // 2. Store the runtime in a static/global
+        static RUNTIME: OnceCell<&'static tokio::runtime::Runtime> = OnceCell::new();
+        let _ = RUNTIME.set(runtime);
+        tracing::info!("[Orkimedes] Stored Tokio runtime in static");
+
+        // 3. Bridge is already initialized in static child process init, do not call again
+        tracing::info!("[Orkimedes] Python async bridge already initialized in child process");
+        // --- MACRO PATTERN END ---
+
+        // Synchronously try to import module/function
+        let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
+            let sys = py.import("sys")?;
+            let path = sys.getattr("path")?;
+            for p in &config.python_path {
+                path.call_method1("append", (p,))?;
             }
 
-            let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
-                let sys = py.import("sys")?;
-                let path = sys.getattr("path")?;
-                for p in &config.python_path {
-                    path.call_method1("append", (p,))?;
+            if let Some(handle) = callback_handle.clone() {
+                let kameo_module = PyModule::new(py, "kameo")?;
+                let py_callback_handle = KameoCallbackHandle { handle };
+                let handle_obj = Py::new(py, py_callback_handle)?;
+                kameo_module.add("callback_handle", handle_obj)?;
+                sys.getattr("modules")?.set_item("kameo", kameo_module)?;
+            }
+
+            let module = py.import(&config.module_name)?;
+            let function = module.getattr(&config.function_name).map_err(|e| {
+                PythonExecutionError::FunctionNotFound {
+                    module: config.module_name.clone(),
+                    function: config.function_name.clone(),
+                    message: e.to_string(),
                 }
+            })?;
 
-                if let Some(handle) = callback_handle.clone() {
-                    let kameo_module = PyModule::new(py, "kameo")?;
-                    let py_callback_handle = KameoCallbackHandle { handle };
-                    let handle_obj = Py::new(py, py_callback_handle)?;
-                    kameo_module.add("callback_handle", handle_obj)?;
-                    sys.getattr("modules")?.set_item("kameo", kameo_module)?;
-                }
+            Ok(function.into())
+        });
 
-                let module = py.import(&config.module_name)?;
-                let function = module.getattr(&config.function_name).map_err(|e| {
-                    PythonExecutionError::FunctionNotFound {
-                        module: config.module_name.clone(),
-                        function: config.function_name.clone(),
-                        message: e.to_string(),
-                    }
-                })?;
+        // Synchronous fatal error check
+        if let Err(e) = &module_result {
+            error!("Failed to initialize Python function: {:?}", e);
+            tracing::error!(error = ?e, "Non-resumable error: shutting down child process");
+            std::process::exit(101);
+        }
 
-                Ok(function.into())
-            });
-
+        Box::pin(async move {
             match module_result {
                 Ok(py_function) => {
                     self.py_function = Some(py_function);
                     tracing::info!("Python runtime initialization complete");
                     Ok(())
                 }
-                Err(e) => {
-                    error!("Failed to initialize Python function: {:?}", e);
-                    tracing::error!(error = ?e, "Non-resumable error: shutting down child process");
-                    // Exit the process with error code 101 (conventional for fatal error)
-                    std::process::exit(101);
-                }
+                Err(_) => unreachable!(), // Already handled above
             }
         })
     }

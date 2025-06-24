@@ -94,26 +94,32 @@ impl KameoChildProcessMessage for OrkMessage {
     type Reply = OrkResponse;
 }
 
+fn init_child_runtime() -> &'static tokio::runtime::Runtime {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build single-threaded Tokio runtime");
+    let static_runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+    pyo3_async_runtimes::tokio::init_with_runtime(static_runtime);
+    static_runtime
+}
+
 setup_subprocess_system! {
     actors = {
         (PythonActor<OrkMessage>, OrkMessage, DefaultCallbackMessage),
     },
     child_init = {
-        // Initialize tracing first
         tracing_subscriber::fmt()
-                .with_max_level(Level::TRACE)
-                .with_file(true)
-                .with_line_number(true)
-                .with_thread_ids(true)
-                .with_thread_names(true)
-                .init();
-
-        // Create and return a multi-threaded runtime for better Python async support
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("python-worker")
+            .with_max_level(Level::TRACE)
+            .with_file(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .init();
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?
+            .build()
+            .expect("Failed to build single-threaded Tokio runtime")
     },
     parent_init = {
         // Initialize tracing first
