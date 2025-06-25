@@ -26,11 +26,11 @@ where
     let deserializer = PythonDeserializer { input: obj.clone() };
     match T::deserialize(deserializer) {
         Ok(value) => {
-            trace!(target: "serde_py", "Successfully deserialized Python object");
+            trace!(event = "serde_py", status = "success");
             Ok(value)
         }
         Err(e) => {
-            error!(target: "serde_py", error = %e, "Failed to deserialize Python object");
+            error!(event = "serde_py", status = "failure", error = %e);
             Err(e)
         }
     }

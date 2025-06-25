@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "pyo3_async_minimal_test"]
 resolver = "2"
 
 [workspace.package]
@@ -23,7 +23,6 @@ async-trait = "0.1"
 base64 = "0.21"
 uuid = { version = "1.4", features = ["v4", "serde"] }
 futures = "0.3"
-interprocess = "1.0"
 nix = { version = "0.27", features = ["process"] }
 rand = "0.8"
 parity-tokio-ipc = "0.9"
@@ -31,14 +30,15 @@ opentelemetry = { version = "0.22" }
 opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.23"
 
-
 # Python integration
 pyo3 = { version = "0.25", features = ["auto-initialize"] }
-pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
+pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime", "attributes"] }
 serde_json = "1.0"
 
 # Development dependencies
 proptest = "1.4"
+
+console-subscriber = "0.2"
 
 [workspace.metadata.maturin]
 python-source = "python"

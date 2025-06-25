@@ -15,6 +15,7 @@ use opentelemetry::global;
 use opentelemetry::Context as OTelContext;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tracing::trace;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -22,13 +23,15 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 use tracing::{debug, error, instrument, warn, Instrument, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
-use once_cell::sync::OnceCell;
-use pyo3;
+use tokio::time::{Duration, sleep};
+use tokio::process::Command;
+use parity_tokio_ipc::Endpoint;
+use std::process::Stdio;
 
 pub use callback::{CallbackHandle, ChildCallbackMessage, CallbackSender, CallbackReceiver, CallbackHandler};
 
@@ -51,7 +54,9 @@ where
     Self::Error: std::error::Error + Send + Sync + 'static
 {
     /// Called when the runtime is available, before on_start
-    fn init_with_runtime<'a>(&'a mut self, runtime: &'static tokio::runtime::Runtime) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>>;
+    async fn init_with_runtime(self) -> Result<Self, Self::Error>
+    where
+        Self: Sized;
 }
 
 /// Trait object for async read/write operations
@@ -155,7 +160,7 @@ pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessActorError {
         event = "lifecycle",
         status = "error",
         actor_type = actor_name,
-        "Unknown actor type encountered"
+        message = "Unknown actor type encountered"
     );
     SubprocessActorError::UnknownActorType {
         actor_name: actor_name.to_string(),
@@ -186,7 +191,7 @@ where
         debug!(
             event = "lifecycle",
             status = "starting",
-            "Starting subprocess actor"
+            actor_type = "SubprocessActor"
         );
 
         async move {
@@ -216,7 +221,7 @@ where
             debug!(
                 event = "lifecycle",
                 status = "started",
-                "Subprocess actor started successfully"
+                actor_type = "SubprocessActor"
             );
             Ok(())
         }
@@ -231,8 +236,8 @@ where
         debug!(
             event = "lifecycle",
             status = "stopping",
-            ?reason,
-            "Stopping subprocess actor"
+            actor_type = "SubprocessActor",
+            reason = ?reason
         );
 
         async move {
@@ -251,7 +256,7 @@ where
             debug!(
                 event = "lifecycle",
                 status = "stopped",
-                "Subprocess actor stopped"
+                actor_type = "SubprocessActor"
             );
             Ok(())
         }
@@ -264,7 +269,7 @@ where
         err: PanicError,
     ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
     {
-        error!(event = "lifecycle", status = "panicked", error = ?err, "Subprocess actor panicked");
+        error!(event = "lifecycle", status = "panicked", actor_type = "SubprocessActor", error = ?err);
         async move { Ok(ControlFlow::Break(ActorStopReason::Panicked(err))) }
     }
 }
@@ -287,7 +292,6 @@ impl<M> SubprocessActor<M> {
 pub mod handshake {
     use super::*;
     use futures::StreamExt;
-    use parity_tokio_ipc::Endpoint;
     use tokio::process::Command;
 
     pub fn unique_socket_path(actor_name: &str) -> PathBuf {
@@ -313,7 +317,7 @@ pub mod handshake {
         let socket_path = unique_socket_path(actor_name);
         let socket_path_str = socket_path.to_string_lossy().into_owned();
 
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path_str, "Starting host handshake");
+        debug!(event = "handshake", status = "starting", socket_path = %socket_path_str, actor_type = actor_name);
 
         let mut cmd = Command::new(exe);
         cmd.env("KAMEO_CHILD_ACTOR", actor_name);
@@ -328,60 +332,67 @@ pub mod handshake {
         debug!(
             event = "handshake",
             status = "spawning",
-            "Spawning child process"
+            actor_type = actor_name
         );
         let child = cmd.spawn()?;
 
         debug!(
             event = "handshake",
             status = "waiting",
-            "Waiting for child connection"
+            actor_type = actor_name
         );
         let conn = incoming.next().await.transpose()?.ok_or_else(|| {
-            error!(event = "handshake", "No child connection received");
+            error!(event = "handshake", actor_type = actor_name, "No child connection received");
             io::Error::new(io::ErrorKind::Other, "No child connection")
         })?;
 
         debug!(
             event = "handshake",
             status = "completed",
-            "Host handshake completed successfully"
+            actor_type = actor_name
         );
         Ok((Box::new(conn), child, socket_path))
     }
 
-    #[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
+    #[instrument(fields(pid= std::process::id(), actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
     pub async fn child_request() -> std::io::Result<Box<dyn AsyncReadWrite>> {
-        let socket_path = std::env::var("KAMEO_REQUEST_SOCKET")
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_REQUEST_SOCKET not set"))?;
-
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child request handshake");
-
-        let conn = tokio::net::UnixStream::connect(&socket_path).await?;
-
-        debug!(
-            event = "handshake",
-            status = "completed",
-            "Child request handshake completed successfully"
-        );
-        Ok(Box::new(conn))
+        let req_env = std::env::var("KAMEO_REQUEST_SOCKET");
+        let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");
+        let actor_env = std::env::var("KAMEO_CHILD_ACTOR");
+        tracing::info!(event = "handshake_env", KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Child handshake env vars");
+        if req_env.is_err() || cb_env.is_err() || actor_env.is_err() {
+            tracing::error!(event = "handshake_env_missing", KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Missing required handshake env var(s), aborting child early");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!(
+                "Missing required handshake env var(s): KAMEO_REQUEST_SOCKET={:?}, KAMEO_CALLBACK_SOCKET={:?}, KAMEO_CHILD_ACTOR={:?}",
+                req_env, cb_env, actor_env
+            )));
+        }
+        let socket_path = req_env.unwrap();
+        tracing::debug!(event = "handshake_child", which = "request", socket_path = %socket_path, "Child got KAMEO_REQUEST_SOCKET env var");
+        tracing::debug!(event = "handshake_child", which = "request", socket_path = %socket_path, "Child attempting to connect to request socket");
+        let stream = Endpoint::connect(&socket_path).await?;
+        Ok(Box::new(stream) as Box<dyn AsyncReadWrite>)
     }
 
     #[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
     pub async fn child_callback() -> std::io::Result<Box<dyn AsyncReadWrite>> {
-        let socket_path = std::env::var("KAMEO_CALLBACK_SOCKET")
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "KAMEO_CALLBACK_SOCKET not set"))?;
-
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path, "Starting child callback handshake");
-
-        let conn = tokio::net::UnixStream::connect(&socket_path).await?;
-
-        debug!(
-            event = "handshake",
-            status = "completed",
-            "Child callback handshake completed successfully"
-        );
-        Ok(Box::new(conn))
+        let pid = std::process::id();
+        let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");
+        let req_env = std::env::var("KAMEO_REQUEST_SOCKET");
+        let actor_env = std::env::var("KAMEO_CHILD_ACTOR");
+        tracing::info!(event = "handshake_env", pid = pid, KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Child handshake env vars");
+        if cb_env.is_err() || req_env.is_err() || actor_env.is_err() {
+            tracing::error!(event = "handshake_env_missing", pid = pid, KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Missing required handshake env var(s), aborting child early");
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!(
+                "Missing required handshake env var(s): KAMEO_REQUEST_SOCKET={:?}, KAMEO_CALLBACK_SOCKET={:?}, KAMEO_CHILD_ACTOR={:?}",
+                req_env, cb_env, actor_env
+            )));
+        }
+        let socket_path = cb_env.unwrap();
+        tracing::debug!(event = "handshake_child", pid = pid, which = "callback", socket_path = %socket_path, "Child got KAMEO_CALLBACK_SOCKET env var");
+        tracing::debug!(event = "handshake_child", pid = pid, which = "callback", socket_path = %socket_path, "Child attempting to connect to callback socket");
+        let stream = Endpoint::connect(&socket_path).await?;
+        Ok(Box::new(stream) as Box<dyn AsyncReadWrite>)
     }
 }
 
@@ -398,7 +409,7 @@ macro_rules! register_subprocess_actors {
                 Some(match actor_name.as_str() {
                     $(
                         stringify!($actor) => {
-                            ::kameo_child_process::child_process_main::<$actor, $msg, $callback>()
+                            ::kameo_child_process::child_process_main_with_runtime::<$actor, $msg, $callback>()
                         }
                     )*
                     _ => {
@@ -481,11 +492,29 @@ where
     }
 
     pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.config.env_vars.push((key.into(), value.into()));
+        let key = key.into();
+        if matches!(key.as_str(), "KAMEO_REQUEST_SOCKET" | "KAMEO_CALLBACK_SOCKET" | "KAMEO_CHILD_ACTOR") {
+            tracing::warn!(event = "env_var_blocked", key = %key, "Attempted to set protocol-critical env var in with_env_var; ignored");
+        } else {
+            self.config.env_vars.push((key, value.into()));
+        }
+        self
+    }
+
+    pub fn with_env_vars(mut self, vars: Vec<(String, String)>) -> Self {
+        for (k, v) in vars {
+            if matches!(k.as_str(), "KAMEO_REQUEST_SOCKET" | "KAMEO_CALLBACK_SOCKET" | "KAMEO_CHILD_ACTOR") {
+                tracing::warn!(event = "env_var_blocked", key = %k, "Attempted to set protocol-critical env var in with_env_vars; ignored");
+            } else {
+                self.config.env_vars.push((k, v));
+            }
+        }
         self
     }
 
     /// Spawn the child process actor and return a reference to it
+    ///
+    /// This is the ONLY supported way to spawn a child process. It sets all protocol-critical env vars (KAMEO_REQUEST_SOCKET, KAMEO_CALLBACK_SOCKET, KAMEO_CHILD_ACTOR) and must be used by all wrappers and consumers.
     pub async fn spawn<H>(self, handler: H) -> io::Result<(ActorRef<SubprocessActor<M>>, CallbackReceiver<C, H>)>
     where
         H: CallbackHandler<C>,
@@ -493,101 +522,122 @@ where
         let request_socket_path = handshake::unique_socket_path(&format!("{}-req", self.config.name));
         let callback_socket_path = handshake::unique_socket_path(&format!("{}-cb", self.config.name));
 
+        tracing::debug!(event = "handshake_setup", request_socket = %request_socket_path.to_string_lossy(), callback_socket = %callback_socket_path.to_string_lossy(), "Parent binding sockets and setting env vars");
         // Set up the Unix domain sockets
-        let request_endpoint = parity_tokio_ipc::Endpoint::new(request_socket_path.to_string_lossy().to_string());
+        let request_endpoint = Endpoint::new(request_socket_path.to_string_lossy().to_string());
         let mut request_incoming = request_endpoint.incoming()?;
-        let callback_endpoint = parity_tokio_ipc::Endpoint::new(callback_socket_path.to_string_lossy().to_string());
+        tracing::debug!(event = "handshake_setup", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent bound request socket");
+        let callback_endpoint = Endpoint::new(callback_socket_path.to_string_lossy().to_string());
         let mut callback_incoming = callback_endpoint.incoming()?;
-
+        tracing::debug!(event = "handshake_setup", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent bound callback socket");
         // Get current executable path
         let current_exe = std::env::current_exe()?;
-
-        // Spawn child process with clean environment
+        // Spawn child process with parent environment, then override/remove as needed
         let mut cmd = tokio::process::Command::new(current_exe);
+        cmd.envs(std::env::vars()); // Inherit all parent env vars
         cmd.env_remove("PYTHONPATH");
-        cmd.env("KAMEO_CHILD_ACTOR", &self.config.name);
-        cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());
-        cmd.env("KAMEO_CALLBACK_SOCKET", callback_socket_path.to_string_lossy().as_ref());
-
-        // Add custom environment variables
-        for (key, value) in self.config.env_vars {
+        // Add custom environment variables FIRST
+        let mut env_snapshot = Vec::new();
+        for (key, value) in self.config.env_vars.iter() {
             cmd.env(key, value);
+            env_snapshot.push((key.clone(), value.clone()));
         }
-
+        // Always set the socket env vars LAST so they cannot be overwritten
+        cmd.env("KAMEO_CHILD_ACTOR", &self.config.name);
+        env_snapshot.push(("KAMEO_CHILD_ACTOR".to_string(), self.config.name.clone()));
+        cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());
+        env_snapshot.push(("KAMEO_REQUEST_SOCKET".to_string(), request_socket_path.to_string_lossy().to_string()));
+        cmd.env("KAMEO_CALLBACK_SOCKET", callback_socket_path.to_string_lossy().as_ref());
+        env_snapshot.push(("KAMEO_CALLBACK_SOCKET".to_string(), callback_socket_path.to_string_lossy().to_string()));
+        tracing::debug!(event = "handshake_setup", child_env_request = %request_socket_path.to_string_lossy(), child_env_callback = %callback_socket_path.to_string_lossy(), "Parent set child env vars (final override)");
+        tracing::debug!(event = "child_env_snapshot", env = ?env_snapshot, "Child process environment snapshot before spawn");
         // Inherit RUST_LOG for consistent logging
         if let Ok(rust_log) = std::env::var("RUST_LOG") {
             cmd.env("RUST_LOG", rust_log);
         }
 
-        debug!(
-            event = "lifecycle",
-            status = "spawning",
-            actor = ?self.config.name,
-            "Spawning child process"
-        );
-
         // Spawn the child process
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
         let mut child = cmd.spawn()?;
 
-        debug!(
-            event = "lifecycle",
-            status = "spawned",
-            child_pid = child.id(),
-            "Child process spawned"
-        );
+        // Capture and forward child stdout
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout).lines();
+            tokio::spawn(async move {
+                while let Ok(Some(line)) = reader.next_line().await {
+                    tracing::info!(target: "child_stdout", "[PYTHON STDOUT] {}", line);
+                }
+            });
+        }
+        // Capture and forward child stderr
+        if let Some(stderr) = child.stderr.take() {
+            let mut reader = BufReader::new(stderr).lines();
+            tokio::spawn(async move {
+                while let Ok(Some(line)) = reader.next_line().await {
+                    tracing::error!(target: "child_stderr", "[PYTHON STDERR] {}", line);
+                }
+            });
+        }
 
-        // Wait for child to connect to both sockets, with timeout and liveness check
-        use tokio::time::{timeout, Duration, sleep};
-        let timeout_duration = Duration::from_secs(3);
-        let poll_interval = Duration::from_millis(50);
-        let mut request_conn = None;
-        let mut callback_conn = None;
-        let start = std::time::Instant::now();
-        loop {
-            // Try to get connections
-            if request_conn.is_none() {
-                match request_incoming.next().now_or_never() {
-                    Some(Some(Ok(conn))) => request_conn = Some(conn),
-                    Some(Some(Err(e))) => warn!("Error accepting request connection: {:?}", e),
-                    Some(None) => {},
-                    None => {},
-                }
-            }
-            if callback_conn.is_none() {
-                match callback_incoming.next().now_or_never() {
-                    Some(Some(Ok(conn))) => callback_conn = Some(conn),
-                    Some(Some(Err(e))) => warn!("Error accepting callback connection: {:?}", e),
-                    Some(None) => {},
-                    None => {},
-                }
-            }
-            if request_conn.is_some() && callback_conn.is_some() {
-                break;
-            }
-            // Check if child exited
-            if let Some(status) = child.try_wait()? {
-                warn!("Child exited early with status: {:?}", status);
-                // Clean up sockets
-                let _ = tokio::fs::remove_file(&request_socket_path).await;
-                let _ = tokio::fs::remove_file(&callback_socket_path).await;
-                return Err(io::Error::new(io::ErrorKind::Other, format!("Child exited early: {:?}", status)));
-            }
-            // Timeout
-            if start.elapsed() > timeout_duration {
-                warn!("Timeout waiting for child handshake, killing child process");
+        tracing::info!(event = "lifecycle", status = "spawned", child_pid = child.id(), "Child process spawned");
+
+        // Strictly ordered handshake: accept request, then callback
+        tracing::debug!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent waiting for request connection");
+        let mut request_conn = match tokio::time::timeout(Duration::from_secs(3), request_incoming.next()).await {
+            Ok(Some(Ok(conn))) => {
+                tracing::info!(event = "handshake_accept",  which = "request", socket = %request_socket_path.to_string_lossy(), "Parent accepted request connection");
+                conn
+            },
+            Ok(Some(Err(e))) => {
+                tracing::error!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), error = ?e, "Parent saw error accepting request connection");
+                return Err(e);
+            },
+            Ok(None) => {
+                tracing::error!(event = "handshake_accept",  which = "request", socket = %request_socket_path.to_string_lossy(), "Parent saw end of request incoming stream");
+                return Err(io::Error::new(io::ErrorKind::Other, "No request connection received"));
+            },
+            Err(_) => {
+                tracing::error!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Timeout waiting for request connection");
                 let _ = child.kill().await;
                 let _ = tokio::fs::remove_file(&request_socket_path).await;
                 let _ = tokio::fs::remove_file(&callback_socket_path).await;
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout waiting for child handshake"));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout waiting for request connection"));
             }
-            sleep(poll_interval).await;
-        }
-        let request_conn = request_conn.unwrap();
-        let callback_conn = callback_conn.unwrap();
-
+        };
+        // Send bincode-encoded Control::Handshake to child
+        tracing::debug!(event = "handshake_protocol", "Parent sending Control::Handshake to child");
+        let handshake_msg = Control::<()>::Handshake;
+        let handshake_bytes = bincode::encode_to_vec(&handshake_msg, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to encode handshake: {e}")))?;
+        request_conn.write_all(&handshake_bytes).await?;
+        tracing::debug!(event = "handshake_protocol",  "Parent sent Control::Handshake to child");
+        // After accepting request connection, proceed directly
+        tracing::debug!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent waiting for callback connection");
+        let callback_conn = match tokio::time::timeout(Duration::from_secs(10), callback_incoming.next()).await {
+            Ok(Some(Ok(conn))) => {
+                tracing::info!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent accepted callback connection");
+                conn
+            },
+            Ok(Some(Err(e))) => {
+                tracing::error!(event = "handshake_accept",  which = "callback", socket = %callback_socket_path.to_string_lossy(), error = ?e, "Parent saw error accepting callback connection");
+                return Err(e);
+            },
+            Ok(None) => {
+                tracing::error!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent saw end of callback incoming stream");
+                return Err(io::Error::new(io::ErrorKind::Other, "No callback connection received"));
+            },
+            Err(_) => {
+                tracing::error!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Timeout waiting for callback connection");
+                let _ = child.kill().await;
+                let _ = tokio::fs::remove_file(&request_socket_path).await;
+                let _ = tokio::fs::remove_file(&callback_socket_path).await;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout waiting for callback connection"));
+            }
+        };
+        // After accepting callback connection, proceed directly
         let actor = SubprocessActor::new(Box::new(request_conn), child, request_socket_path);
         let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), handler);
-
         Ok((kameo::spawn(actor), callback_receiver))
     }
 }
@@ -657,8 +707,13 @@ where
                         "Responding to handshake"
                     );
                     let resp = Control::<()>::Handshake;
-                    let resp_bytes = bincode::encode_to_vec(&resp, bincode::config::standard())
-                        .expect("Failed to encode handshake response");
+                    let resp_bytes = match bincode::encode_to_vec(&resp, bincode::config::standard()) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            error!(event = "handshake", error = ?e, "Failed to encode handshake response");
+                            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to encode handshake response: {e}")));
+                        }
+                    };
                     conn.write_all(&resp_bytes).await?;
                     continue;
                 }
@@ -668,11 +723,11 @@ where
 
         let parent_cx =
             global::get_text_map_propagator(|propagator| propagator.extract(&trace_context.0));
-        let span = tracing::info_span!("child_message_handler");
+        let span = tracing::info_span!("child_message_handler", event = "message", handler = "child");
         span.set_parent(parent_cx);
 
         let reply_fut = async {
-            debug!(event = "message", status = "handling", "Handling message");
+            trace!(event = "message", status = "handling", handler = "child");
             actor_ref.ask(msg).await
         };
 
@@ -689,17 +744,21 @@ where
                 _ => SubprocessActorError::Protocol(format!("Non-serializable error: {e}")),
             }
         });
-        let reply_bytes =
-            bincode::encode_to_vec(&Control::Real(reply_to_send, TracingContext::default()), bincode::config::standard())
-                .expect("Failed to encode reply");
+        let reply_bytes = match bincode::encode_to_vec(&Control::Real(reply_to_send, TracingContext::default()), bincode::config::standard()) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(event = "message", error = ?e, handler = "child", message = "Failed to encode reply");
+                break;
+            }
+        };
         if let Err(e) = conn.write_all(&reply_bytes).await {
-            error!(event = "message", error = ?e, "Failed to send reply to parent");
+            error!(event = "message", error = ?e, handler = "child", message = "Failed to send reply to parent");
             break;
         }
-        debug!(
+        trace!(
             event = "message",
             status = "complete",
-            "Message handled successfully"
+            handler = "child"
         );
     }
 
@@ -721,18 +780,35 @@ macro_rules! setup_subprocess_system {
                 $(
                     (
                         std::any::type_name::<$actor>(),
-                        || ::kameo_child_process::child_process_main_with_config::<$actor, $msg, $callback>($child_init),
+                        || {
+                            let config = $child_init;
+                            let runtime = match config.flavor {
+                                $crate::RuntimeFlavor::CurrentThread => tokio::runtime::Builder::new_current_thread()
+                                    .enable_all()
+                                    .build()
+                                    .expect("Failed to build runtime"),
+                                $crate::RuntimeFlavor::MultiThread => {
+                                    let mut b = tokio::runtime::Builder::new_multi_thread();
+                                    b.enable_all();
+                                    if let Some(threads) = config.worker_threads {
+                                        b.worker_threads(threads);
+                                    }
+                                    b.build().expect("Failed to build runtime")
+                                }
+                            };
+                            let _guard = runtime.enter();
+                            $crate::child_process_main_with_runtime::<$actor, $msg, $callback>()
+                        },
                     ),
                 )*
             ];
-            eprintln!("!!!!!!MAIN {:?}", std::env::var("KAMEO_CHILD_ACTOR"));
             if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
                 for (name, handler) in handlers {
                     if actor_name == *name {
                         return handler();
                     }
                 }
-                Err(Box::new(::kameo_child_process::handle_unknown_actor_error(&actor_name)))
+                Err(Box::new($crate::handle_unknown_actor_error(&actor_name)))
             } else {
                 // Parent process branch - call user-provided initialization
                 $parent_init
@@ -743,8 +819,8 @@ macro_rules! setup_subprocess_system {
 
 /// Prelude module for commonly used items
 pub mod prelude {
-    pub use crate::child_process_main;
-    pub use crate::child_process_main_with_config;
+    // pub use crate::child_process_main; // REMOVED: no longer exists
+    pub use crate::child_process_main_with_runtime;
     pub use crate::handshake;
     pub use crate::setup_subprocess_system;
     pub use crate::ChildProcessBuilder;
@@ -802,49 +878,9 @@ where
     }
 }
 
-/// Run a child process actor with the default single-threaded runtime configuration.
-/// This is the default implementation used by the register_subprocess_actors macro.
-pub fn child_process_main<A, M, C>() -> Result<(), Box<dyn std::error::Error>>
-where
-    A: Default + Message<M> + Clone + Send + CallbackSender<C> + 'static,
-    M: KameoChildProcessMessage + Send + 'static,
-    <A as Message<M>>::Reply: Reply
-        + Send
-        + Serialize
-        + DeserializeOwned
-        + Encode
-        + Decode<()>
-        + std::fmt::Debug
-        + 'static,
-    <<A as Message<M>>::Reply as Reply>::Error:
-        std::fmt::Display + std::error::Error + Send + Sync + Encode + Decode<()> + 'static,
-    <<A as Message<M>>::Reply as Reply>::Ok: Encode + Decode<()> + Send + 'static,
-    C: ChildCallbackMessage,
-{
-    let config = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    config.block_on(async {
-        let mut actor = A::default();
-
-        // Setup callback channel
-        let callback_conn = handshake::child_callback().await?;
-        let handle = CallbackHandle::new(callback_conn);
-        actor.set_callback_handle(handle);
-
-        let conn = handshake::child_request().await?;
-        run_child_actor_loop(&mut actor, conn).await
-    })?;
-
-    Ok(())
-}
-
-/// Run a child process actor with a custom runtime configuration.
-#[instrument(skip(runtime), fields(pid=std::process::id()))]
-pub fn child_process_main_with_config<A, M, C>(
-    runtime: tokio::runtime::Runtime,
-) -> Result<(), Box<dyn std::error::Error>>
+/// Run a child process actor with a provided runtime. The runtime must be built and entered by the caller before calling this function.
+#[instrument(fields(pid=std::process::id()))]
+pub async fn child_process_main_with_runtime<A, M, C>() -> Result<(), Box<dyn std::error::Error>>
 where
     A: Default + Message<M> + Clone + Send + RuntimeAware + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + 'static,
@@ -853,7 +889,7 @@ where
         + Serialize
         + DeserializeOwned
         + Encode
-        + Decode<()>
+        + Decode<()> 
         + std::fmt::Debug
         + 'static,
     <<A as Message<M>>::Reply as Reply>::Error:
@@ -862,28 +898,71 @@ where
     <A as Actor>::Error: std::error::Error + Send + Sync + 'static,
     C: ChildCallbackMessage,
 {
-    pyo3::prepare_freethreaded_python();
-    // Store the runtime in a static Box to ensure it lives for the entire program
-    static RUNTIME: OnceCell<Box<tokio::runtime::Runtime>> = OnceCell::new();
-    let runtime_ref = RUNTIME.get_or_init(|| Box::new(runtime));
+    std::panic::set_hook(Box::new(|panic_info| {
+        let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "<unknown panic payload>"
+        };
+        let location = panic_info.location().map(|l| l.to_string()).unwrap_or_else(|| "<unknown location>".to_string());
+        tracing::error!(event = "panic", message = %msg, location = %location, "Child process panicked!");
+    }));
 
-    let mut actor = A::default();
-
-    runtime_ref.block_on(async {
-        // Setup callback channel
-        let callback_conn = handshake::child_callback().await?;
-        let handle = CallbackHandle::new(callback_conn);
-        actor.set_callback_handle(handle);
-
-        // Init actor with runtime
-        actor.init_with_runtime(&**runtime_ref).await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        
-        // Run main request loop
-        let request_conn = handshake::child_request().await?;
-        run_child_actor_loop(&mut actor, request_conn).await
-    })?;
-
-    Ok(())
+    let actor = A::default();
+    tracing::debug!(event = "start_handshake");
+    tracing::info!(event = "handshake_child", which = "request", "Child about to connect request socket");
+    let request_conn = handshake::child_request().await;
+    match &request_conn {
+        Ok(_) => tracing::info!(event = "handshake_child", which = "request", "Child finished connecting request socket"),
+        Err(e) => tracing::error!(event = "handshake_child", which = "request", error = ?e, "Child failed to connect request socket"),
+    }
+    let request_conn = match request_conn {
+        Ok(conn) => conn,
+        Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+    };
+    tracing::debug!(event = "handshake_child", which = "request", "Child ALIVE after request connect, about to connect callback socket");
+    let callback_conn = handshake::child_callback().await;
+    match &callback_conn {
+        Ok(_) => tracing::info!(event = "handshake_child", which = "callback", "Child finished connecting callback socket"),
+        Err(e) => tracing::error!(event = "handshake_child", which = "callback", error = ?e, "Child failed to connect callback socket"),
+    }
+    let callback_conn = match callback_conn {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!(event = "handshake_child", which = "callback", error = ?e, "Child returning early after callback handshake failure");
+            return Err(Box::new(e) as Box<dyn std::error::Error>);
+        }
+    };
+    tracing::info!(event = "handshake_child", which = "callback", "Child about to set callback handle");
+    let handle = CallbackHandle::new(callback_conn);
+    let mut actor = actor;
+    actor.set_callback_handle(handle);
+    tracing::info!(event = "handshake_child", which = "callback", "Child finished set_callback_handle, about to init_with_runtime");
+    let mut actor = actor.init_with_runtime().await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    tracing::info!(event = "handshake_child", which = "callback", "Child finished init_with_runtime, about to run_child_actor_loop");
+    let result = run_child_actor_loop(&mut actor, request_conn).await;
+    if let Err(e) = result {
+        tracing::warn!(event = "child_exit", error = ?e, "Child actor loop exited with error");
+        return Err(format!("{e}").into());
+    } else {
+        tracing::info!(event = "child_exit", "Child actor loop exited cleanly");
+        Ok(())
+    }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub enum RuntimeFlavor {
+    CurrentThread,
+    MultiThread,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub flavor: RuntimeFlavor,
+    pub worker_threads: Option<usize>,
+}
+
 

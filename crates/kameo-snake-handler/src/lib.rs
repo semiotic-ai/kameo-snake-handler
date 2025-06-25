@@ -1,20 +1,19 @@
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
-use std::panic::AssertUnwindSafe;
 use std::thread;
 use std::process;
+use std::fs;
+use std::ffi::CString;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use either::Either;
-use futures::FutureExt;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
 use kameo_child_process::{
-    CallbackHandle, CallbackHandler, ChildCallbackMessage, ChildProcessBuilder, KameoChildProcessMessage, RuntimeAware, SubprocessActor
+    CallbackHandle, CallbackHandler, ChildCallbackMessage, ChildProcessBuilder, KameoChildProcessMessage, SubprocessActor, RuntimeConfig, RuntimeFlavor, RuntimeAware
 };
 use pyo3::exceptions::{
     PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
@@ -26,9 +25,7 @@ use pyo3::pymethods;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{error, info, instrument, Level};
-use once_cell::sync::OnceCell;
-use pyo3::BoundObject;
-use pyo3::IntoPyObjectExt;
+use pyo3::Python;
 
 pub mod serde_py;
 pub use serde_py::{from_pyobject, to_pyobject, FromPyAny};
@@ -220,13 +217,13 @@ pub struct PythonConfig {
     pub function_name: String,
     pub env_vars: Vec<(String, String)>,
     pub is_async: bool,
+    pub module_path: String,
 }
 
 /// Python subprocess actor
 #[derive(Debug)]
 pub struct PythonActor<M> {
     config: PythonConfig,
-    py_function: Option<PyObject>,
     callback_handle: Option<CallbackHandle<DefaultCallbackMessage>>,
     _phantom: PhantomData<M>,
 }
@@ -238,7 +235,13 @@ impl<M> Default for PythonActor<M> {
         let config = match std::env::var("KAMEO_PYTHON_CONFIG") {
             Ok(config_json) => {
                 info!(config_json, "Found KAMEO_PYTHON_CONFIG");
-                serde_json::from_str(&config_json).expect("Failed to deserialize python config from env")
+                match serde_json::from_str(&config_json) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        // This is a fatal error: process cannot continue without config
+                        panic!("Failed to deserialize python config from env: {e}");
+                    }
+                }
             }
             Err(e) => {
                 error!(error = ?e, "KAMEO_PYTHON_CONFIG not set");
@@ -246,24 +249,8 @@ impl<M> Default for PythonActor<M> {
             }
         };
 
-        // --- CHILD PROCESS RUNTIME INIT ---
-        // Only run this in the child process (where KAMEO_PYTHON_CONFIG is set)
-        static CHILD_RUNTIME_INIT: std::sync::Once = std::sync::Once::new();
-        CHILD_RUNTIME_INIT.call_once(|| {
-            let runtime = Box::leak(Box::new(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to build single-threaded Tokio runtime"),
-            ));
-            // Only call if not already initialized, ignore error if already set
-            let _ = pyo3_async_runtimes::tokio::init_with_runtime(runtime);
-        });
-        // --- END CHILD PROCESS RUNTIME INIT ---
-
         Self {
             config,
-            py_function: None,
             callback_handle: None,
             _phantom: PhantomData,
         }
@@ -274,45 +261,9 @@ impl<M> Clone for PythonActor<M> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            py_function: self.py_function.as_ref().map(|obj| Python::with_gil(|py| obj.clone_ref(py))),
             callback_handle: self.callback_handle.clone(),
             _phantom: PhantomData,
         }
-    }
-}
-
-/// Builder for Python subprocess
-pub struct PythonSubprocessBuilder<M> {
-    config: PythonConfig,
-    _phantom: PhantomData<M>,
-}
-
-impl<M> PythonSubprocessBuilder<M> {
-    pub fn new() -> Self {
-        Self {
-            config: PythonConfig {
-                python_path: vec![],
-                module_name: String::new(),
-                function_name: String::new(),
-                env_vars: vec![],
-                is_async: false,
-            },
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn with_config(mut self, config: PythonConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    pub async fn spawn(self) -> Result<PythonActor<M>> {
-        Ok(PythonActor {
-            config: self.config,
-            py_function: None,
-            callback_handle: None,
-            _phantom: PhantomData,
-        })
     }
 }
 
@@ -326,7 +277,13 @@ pub struct PythonChildProcessBuilder {
 impl PythonChildProcessBuilder {
     /// Creates a new builder with the given Python configuration.
     #[instrument]
-    pub fn new(python_config: PythonConfig) -> Self {
+    pub fn new(mut python_config: PythonConfig) -> Self {
+        // Always set PYTHONPATH from python_path
+        let joined_path = python_config.python_path.join(":");
+        // Only add if not already present in env_vars
+        if !python_config.env_vars.iter().any(|(k, _)| k == "PYTHONPATH") {
+            python_config.env_vars.push(("PYTHONPATH".to_string(), joined_path));
+        }
         Self {
             python_config,
             log_level: Level::INFO,
@@ -359,9 +316,11 @@ impl PythonChildProcessBuilder {
             }
         }
 
-        let (actor_ref, callback_receiver) = ChildProcessBuilder::<PythonActor<M>, M, DefaultCallbackMessage>::new()
+        let actor_builder = ChildProcessBuilder::<PythonActor<M>, M, DefaultCallbackMessage>::new()
             .log_level(self.log_level)
-            .with_env_var("KAMEO_PYTHON_CONFIG", config_json)
+            .with_env_var("KAMEO_PYTHON_CONFIG", config_json);
+
+        let (actor_ref, callback_receiver) = actor_builder
             .spawn(NoOpCallbackHandler)
             .await
             .map_err(|e: std::io::Error| anyhow::anyhow!(e))?;
@@ -389,7 +348,7 @@ where
         _actor_ref: ActorRef<Self>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            tracing::info!("PythonActor started");
+            tracing::info!(event = "lifecycle", status = "started", actor_type = "PythonActor");
             Ok(())
         }
     }
@@ -401,7 +360,7 @@ where
         reason: ActorStopReason,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            error!("Python actor stopped: {:?}", reason);
+            tracing::error!(event = "lifecycle", status = "stopped", actor_type = "PythonActor", reason = ?reason);
             Ok(())
         }
     }
@@ -414,35 +373,11 @@ where
     ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
     {
         async move {
-            error!("Python actor panicked: {:?}", err);
+            tracing::error!(event = "lifecycle", status = "panicked", actor_type = "PythonActor", error = ?err);
             Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
         }
     }
 }
-
-impl<M> PythonActor<M>
-where
-    M: KameoChildProcessMessage + Send + 'static,
-{
-    /// Convert a Rust message to a Python dictionary
-    fn serialize_message_to_py(&self, message: &M, py: Python) -> Result<PyObject, PythonExecutionError> {
-        to_pyobject(py, message)
-            .map_err(|e| PythonExecutionError::SerializationError {
-                message: e.to_string(),
-            })
-    }
-
-    /// Convert a Python object back to our Reply type
-    fn deserialize_py_to_reply(&self, py_obj: &Bound<PyAny>) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError> {
-        from_pyobject(py_obj)
-            .map_err(|e| PythonExecutionError::DeserializationError {
-                message: e.to_string(),
-            })
-    }
-}
-
-// File-global static for the child Tokio runtime
-static CHILD_RUNTIME: once_cell::sync::OnceCell<&'static tokio::runtime::Runtime> = once_cell::sync::OnceCell::new();
 
 #[async_trait]
 impl<M> Message<M> for PythonActor<M>
@@ -455,151 +390,76 @@ where
     fn handle(&mut self, message: M, _ctx: &mut Context<Self, Self::Reply>) -> impl std::future::Future<Output = Self::Reply> + Send {
         let config = self.config.clone();
         async move {
-            tracing::info!(
-                "[ORKIMEDES] Entering async handler: pid={}, tid={:?}",
-                process::id(),
-                thread::current().id()
-            );
             if config.is_async {
-                // Step 1: Create the future inside the GIL.
-                let future = Python::with_gil(|py| {
-                    let asyncio = py.import("asyncio").map_err(|e| PythonExecutionError::ImportError { module: "asyncio".to_string(), message: e.to_string() })?;
-                    let event_loop = asyncio.call_method0("get_event_loop").map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
-                    let event_loop_id = event_loop.getattr("_thread_id").ok().and_then(|id| id.extract::<u64>().ok());
-                    tracing::info!("[ORKIMEDES] Creating coroutine: pid={}, tid={:?}, event_loop_id={:?}", process::id(), thread::current().id(), event_loop_id);
-                    let message_json = serde_json::to_value(&message)
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
-                    let message_str = serde_json::to_string(&message_json)
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
-                    let kwargs = pyo3::types::PyDict::new(py);
-                    kwargs.set_item("message", message_str)
-                        .map_err(|e| PythonExecutionError::ValueError { message: e.to_string() })?;
-                    let module = py.import(&config.module_name)
-                        .map_err(|e| PythonExecutionError::ImportError { module: config.module_name.clone(), message: e.to_string() })?;
-                    let func = module.getattr(&config.function_name)
-                        .map_err(|e| PythonExecutionError::AttributeError { message: e.to_string() })?;
-                    let py_coro = func.call((), Some(&kwargs))
-                        .map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
+                // Step 1: GIL - setup, import, call, get coroutine, get Rust future
+                let fut = Python::with_gil(|py| {
+                    let sys = py.import("sys")?;
+                    let sys_path_binding = sys.getattr("path")?;
+                    let sys_path = sys_path_binding.downcast::<pyo3::types::PyList>().map_err(pyo3::PyErr::from)?;
+                    for path in &config.python_path {
+                        sys_path.call_method1("append", (path,))?;
+                    }
+                    let os = py.import("os")?;
+                    let cwd: String = os.call_method0("getcwd")?.extract()?;
+                    let sys_path_vec: Vec<String> = sys_path.extract()?;
+                    let executable: String = sys.getattr("executable")?.extract()?;
+                    tracing::info!(cwd, sys_path=?sys_path_vec, executable, "ORKY DEBUG: Python import context");
+                    let module = py.import(&config.module_name)?;
+                    let func = module.getattr(&config.function_name)?;
+                    let py_message = match crate::serde_py::to_pyobject(py, &message) {
+                        Ok(obj) => obj,
+                        Err(e) => return Err(PythonExecutionError::SerializationError { message: e.to_string() }),
+                    };
+                    let py_coro = func.call1((py_message,))?;
+                    let type_name = py_coro.get_type().name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|_| "<unknown>".to_string());
+                    tracing::info!(function = ?config.function_name, type_name = ?type_name, "ORKY DEBUG: Python function return type");
                     pyo3_async_runtimes::tokio::into_future(py_coro)
                         .map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })
-                })?;
-                tracing::info!("[ORKIMEDES] Awaiting coroutine: pid={}, tid={:?}", process::id(), thread::current().id());
-                // Step 2: Await the future outside the GIL.
-                let py_result = future.await
-                    .map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
-                tracing::info!("[ORKIMEDES] Coroutine complete: pid={}, tid={:?}", process::id(), thread::current().id());
-                // Step 3: Process the result inside the GIL.
-                Python::with_gil(|py| {
-                    let asyncio = py.import("asyncio").map_err(|e| PythonExecutionError::ImportError { module: "asyncio".to_string(), message: e.to_string() })?;
-                    let event_loop = asyncio.call_method0("get_event_loop").map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
-                    let event_loop_id = event_loop.getattr("_thread_id").ok().and_then(|id| id.extract::<u64>().ok());
-                    tracing::info!("[ORKIMEDES] Processing result in GIL: pid={}, tid={:?}, event_loop_id={:?}", process::id(), thread::current().id(), event_loop_id);
-                    let json = py.import("json").map_err(|e| PythonExecutionError::ImportError { module: "json".to_string(), message: e.to_string() })?;
-                    let json_str = json.call_method1("dumps", (py_result.bind(py),))
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?
-                        .extract::<String>()
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
-                    serde_json::from_str(&json_str)
-                        .map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })
-                })
+                }).map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
+
+                // Step 2: Await the Rust future
+                let py_result = fut.await.map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
+
+                // Step 3: GIL - convert result
+                let py_obj = Python::with_gil(|py| {
+                    let bound = py_result.bind(py);
+                    let ref_bound = &bound;
+                    crate::serde_py::from_pyobject(ref_bound)
+                });
+                py_obj.map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })
             } else {
-                // Handle synchronous Python function
-                pyo3::Python::with_gil(|py| {
-                    let message_json = serde_json::to_value(&message)
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
-                    let message_str = serde_json::to_string(&message_json)
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
-                    let kwargs = pyo3::types::PyDict::new(py);
-                    kwargs.set_item("message", message_str)
-                        .map_err(|e| PythonExecutionError::ValueError { message: e.to_string() })?;
-                    let module = py.import(&config.module_name)
-                        .map_err(|e| PythonExecutionError::ImportError { module: config.module_name.clone(), message: e.to_string() })?;
-                    let func = module.getattr(&config.function_name)
-                        .map_err(|e| PythonExecutionError::AttributeError { message: e.to_string() })?;
-                    let result = func.call((), Some(&kwargs))
-                        .map_err(|e| PythonExecutionError::ExecutionError { message: e.to_string() })?;
-                    let json = py.import("json").map_err(|e| PythonExecutionError::ImportError { module: "json".to_string(), message: e.to_string() })?;
-                    let json_str = json.call_method1("dumps", (result,))
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?
-                        .extract::<String>()
-                        .map_err(|e| PythonExecutionError::SerializationError { message: e.to_string() })?;
-                    serde_json::from_str(&json_str)
-                        .map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })
-                })
+                // Sync path
+                let py_obj = Python::with_gil(|py| {
+                    let sys = py.import("sys")?;
+                    let sys_path_binding = sys.getattr("path")?;
+                    let sys_path = sys_path_binding.downcast::<pyo3::types::PyList>().map_err(pyo3::PyErr::from)?;
+                    for path in &config.python_path {
+                        sys_path.call_method1("append", (path,))?;
+                    }
+                    let os = py.import("os")?;
+                    let cwd: String = os.call_method0("getcwd")?.extract()?;
+                    let sys_path_vec: Vec<String> = sys_path.extract()?;
+                    let executable: String = sys.getattr("executable")?.extract()?;
+                    tracing::info!(cwd, sys_path=?sys_path_vec, executable, "ORKY DEBUG: Python import context");
+                    let module = py.import(&config.module_name)?;
+                    let func = module.getattr(&config.function_name)?;
+                    let py_message = match crate::serde_py::to_pyobject(py, &message) {
+                        Ok(obj) => obj,
+                        Err(e) => return Err(PythonExecutionError::SerializationError { message: e.to_string() }),
+                    };
+                    let result = func.call1((py_message,))?;
+                    let type_name = result.get_type().name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|_| "<unknown>".to_string());
+                    tracing::info!(function = ?config.function_name, type_name = ?type_name, "ORKY DEBUG: Python function return type (sync)");
+                    let py_obj = result.unbind();
+                    Ok(py_obj)
+                }).map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })?;
+                let value = Python::with_gil(|py| {
+                    let bound = py_obj.bind(py);
+                    crate::serde_py::from_pyobject(&bound)
+                });
+                value.map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })
             }
         }
-    }
-}
-
-#[async_trait]
-impl<M> RuntimeAware for PythonActor<M>
-where
-    M: KameoChildProcessMessage + Send + 'static,
-{
-    #[instrument(skip(self, runtime), fields(python_paths = ?self.config.python_path, module_name = ?self.config.module_name))]
-    fn init_with_runtime<'a>(&'a mut self, runtime: &'static tokio::runtime::Runtime) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'a>> {
-        let config = self.config.clone();
-        let callback_handle = self.callback_handle.clone();
-
-        // --- MACRO PATTERN START ---
-        // 1. Prepare Python for multi-threaded use
-        tracing::info!("[Orkimedes] prepare_freethreaded_python()");
-        pyo3::prepare_freethreaded_python();
-        // (No explicit event loop setup needed)
-
-        // 2. Store the runtime in the global static
-        let _ = CHILD_RUNTIME.set(runtime);
-        tracing::info!("[Orkimedes] Stored Tokio runtime in CHILD_RUNTIME static");
-
-        // 3. Bridge is already initialized in static child process init, do not call again
-        tracing::info!("[Orkimedes] Python async bridge already initialized in child process");
-        // --- MACRO PATTERN END ---
-
-        // Synchronously try to import module/function
-        let module_result: Result<PyObject, PythonExecutionError> = Python::with_gil(|py| {
-            let sys = py.import("sys")?;
-            let path = sys.getattr("path")?;
-            for p in &config.python_path {
-                path.call_method1("append", (p,))?;
-            }
-
-            if let Some(handle) = callback_handle.clone() {
-                let kameo_module = PyModule::new(py, "kameo")?;
-                let py_callback_handle = KameoCallbackHandle { handle };
-                let handle_obj = Py::new(py, py_callback_handle)?;
-                kameo_module.add("callback_handle", handle_obj)?;
-                sys.getattr("modules")?.set_item("kameo", kameo_module)?;
-            }
-
-            let module = py.import(&config.module_name)?;
-            let function = module.getattr(&config.function_name).map_err(|e| {
-                PythonExecutionError::FunctionNotFound {
-                    module: config.module_name.clone(),
-                    function: config.function_name.clone(),
-                    message: e.to_string(),
-                }
-            })?;
-
-            Ok(function.into())
-        });
-
-        // Synchronous fatal error check
-        if let Err(e) = &module_result {
-            error!("Failed to initialize Python function: {:?}", e);
-            tracing::error!(error = ?e, "Non-resumable error: shutting down child process");
-            std::process::exit(101);
-        }
-
-        Box::pin(async move {
-            match module_result {
-                Ok(py_function) => {
-                    self.py_function = Some(py_function);
-                    tracing::info!("Python runtime initialization complete");
-                    Ok(())
-                }
-                Err(_) => unreachable!(), // Already handled above
-            }
-        })
     }
 }
 
@@ -614,8 +474,146 @@ where
     }
 }
 
-pub mod prelude {
-    pub use super::{
-        PythonActor, PythonChildProcessBuilder, PythonConfig, PythonExecutionError,
+/// Import the Python module and function on the main thread, after entering the runtime and acquiring the GIL.
+#[tracing::instrument(
+    name = "import_python_function_on_main_thread",
+    skip(config),
+    fields(
+        module = %config.module_name,
+        python_path = ?std::env::var("PYTHONPATH").ok(),
+        cwd = ?std::env::current_dir().ok(),
+    )
+)]
+pub fn import_python_function_on_main_thread(config: &PythonConfig) -> Result<PyObject, PythonExecutionError> {
+    Python::with_gil(|py| {
+        tracing::info!(event = "python_import", step = "with_gil", thread_id = ?std::thread::current().id(), "Importing Python module on main thread (import)");
+        let sys = py.import("sys").map_err(|e| PythonExecutionError::ImportError { module: "sys".to_string(), message: e.to_string() })?;
+        let sys_path_binding = sys.getattr("path")?;
+        let sys_path = sys_path_binding.downcast::<pyo3::types::PyList>().map_err(|e| PythonExecutionError::ImportError { module: "sys".to_string(), message: format!("failed to downcast sys.path: {e}") })?;
+        for path in &config.python_path {
+            sys_path.call_method1("append", (path,)).map_err(|e| PythonExecutionError::ImportError { module: "sys".to_string(), message: format!("failed to append path: {e}") })?;
+        }
+        let os = py.import("os").map_err(|e| PythonExecutionError::ImportError { module: "os".to_string(), message: e.to_string() })?;
+        let cwd = os.call_method0("getcwd").map_err(|e| PythonExecutionError::ImportError { module: "os".to_string(), message: e.to_string() })?.extract::<String>().map_err(|e| PythonExecutionError::ImportError { module: "os".to_string(), message: e.to_string() })?;
+        let sys_path_vec: Vec<String> = sys_path.extract().map_err(|e| PythonExecutionError::ImportError { module: "sys".to_string(), message: e.to_string() })?;
+        let executable: String = sys.getattr("executable").map_err(|e| PythonExecutionError::ImportError { module: "sys".to_string(), message: e.to_string() })?.extract().map_err(|e| PythonExecutionError::ImportError { module: "sys".to_string(), message: e.to_string() })?;
+        let files: Vec<String> = os.call_method1("listdir", ("/Users/ryan/code/kameo-snake-handler/crates/kameo-snake-testing/python",)).map_err(|e| PythonExecutionError::ImportError { module: "os".to_string(), message: e.to_string() })?.extract().map_err(|e| PythonExecutionError::ImportError { module: "os".to_string(), message: e.to_string() })?;
+        tracing::error!(cwd, sys_path=?sys_path_vec, executable, files=?files, "ORKY DEBUG: Python import context");
+        let module = py.import(&config.module_name)
+            .map_err(|e| PythonExecutionError::ImportError { module: config.module_name.clone(), message: e.to_string() })?;
+        let function = module.getattr(&config.function_name).map_err(|e| {
+            PythonExecutionError::FunctionNotFound {
+                module: config.module_name.clone(),
+                function: config.function_name.clone(),
+                message: e.to_string(),
+            }
+        })?;
+        let function_type_name = function.get_type().name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|_| "<unknown>".to_string());
+        tracing::info!(event = "python_import", step = "getattr", function_type = function_type_name.as_str(), "Loaded function from module");
+        Ok(function.into())
+    })
+}
+
+// Re-export for macro hygiene
+pub use kameo_child_process;
+
+#[macro_export]
+macro_rules! setup_python_subprocess_system {
+    (
+        actors = { $(($actor:ty, $msg:ty, $callback:ty)),* $(,)? },
+        child_init = $child_init:block,
+        parent_init = $parent_init:block $(,)?
+    ) => {
+        fn main() -> Result<(), Box<dyn std::error::Error>> {
+            let handlers: &[(&'static str, fn() -> Result<(), Box<dyn std::error::Error>>)] = &[
+                $(
+                    (
+                        std::any::type_name::<$actor>(),
+                        || {
+                            let config = $child_init;
+                            tracing::info!(event = "python_subprocess", step = "child_init", config = ?config);
+                            let flavor = config.flavor;
+                            match flavor {
+                                kameo_child_process::RuntimeFlavor::CurrentThread => {
+                                    let mut builder = tokio::runtime::Builder::new_current_thread();
+                                    builder.enable_all();
+                                    kameo_snake_handler::setup_python_runtime(builder);
+                                    Python::with_gil(|py| {
+                                        pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                                            tracing::info!(event = "orky_async_entry", flavor = "CurrentThread", thread_id = ?std::thread::current().id(), "ORKY: Entered async block (CurrentThread)");
+                                            let rust_thread_id = std::thread::current().id();
+                                            let py_thread_id = Python::with_gil(|py| {
+                                                let threading = py.import("threading").unwrap();
+                                                threading.call_method0("get_ident").unwrap().extract::<u64>().unwrap()
+                                            });
+                                            tracing::info!(event = "thread_check", where_ = "tokio::run block", rust_thread_id = ?rust_thread_id, py_thread_id, "ORKY DEBUG: Thread IDs at start of async block");
+                                            kameo_child_process::child_process_main_with_runtime::<$actor, $msg, $callback>().await
+                                                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+                                        })
+                                    })
+                                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                                },
+                                kameo_child_process::RuntimeFlavor::MultiThread => {
+                                    let mut builder = tokio::runtime::Builder::new_multi_thread();
+                                    if let Some(threads) = config.worker_threads {
+                                        builder.worker_threads(threads);
+                                    }
+                                    builder.enable_all();
+                                    kameo_snake_handler::setup_python_runtime(builder);
+                                    Python::with_gil(|py| {
+                                        pyo3_async_runtimes::tokio::run(py, async {
+                                            tracing::info!(event = "orky_async_entry", flavor = "MultiThread", thread_id = ?std::thread::current().id(), "ORKY: Entered async block (MultiThread)");
+                                            let rust_thread_id = std::thread::current().id();
+                                            let py_thread_id = Python::with_gil(|py| {
+                                                let threading = py.import("threading").unwrap();
+                                                threading.call_method0("get_ident").unwrap().extract::<u64>().unwrap()
+                                            });
+                                            tracing::info!(event = "thread_check", where_ = "tokio::run block", rust_thread_id = ?rust_thread_id, py_thread_id, "ORKY DEBUG: Thread IDs at start of async block");
+                                            kameo_child_process::child_process_main_with_runtime::<$actor, $msg, $callback>().await
+                                                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+                                        })
+                                    })
+                                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                                },
+                            }
+                        }
+                    ),
+                )*
+            ];
+            if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
+                for (name, handler) in handlers {
+                    if actor_name == *name {
+                        return handler();
+                    }
+                }
+                return Err(format!("Unknown actor type: {}", actor_name).into());
+            }
+            $parent_init
+        }
     };
 }
+
+#[async_trait]
+impl<M> RuntimeAware for PythonActor<M>
+where
+    M: KameoChildProcessMessage + Send + 'static,
+{
+    async fn init_with_runtime(self) -> Result<Self, Self::Error> {
+        // Any actor-specific setup can go here
+        Ok(self)
+    }
+}
+
+pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
+    tracing::info!(event = "python_subprocess", step = "init_pyo3_async_runtime");
+    pyo3::prepare_freethreaded_python();
+    pyo3_async_runtimes::tokio::init(builder);
+    tracing::info!(event = "python_subprocess", step = "init_done");
+}
+
+pub mod prelude {
+    pub use super::{
+        PythonActor, PythonChildProcessBuilder, PythonConfig, PythonExecutionError, setup_python_runtime
+    };
+}
+

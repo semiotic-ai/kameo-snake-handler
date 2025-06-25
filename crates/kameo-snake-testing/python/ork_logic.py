@@ -6,14 +6,8 @@ It handles things like WAAAGH! power, klan bonuses, and fightin' results.
 """
 
 import random
-import json
-import sys
-import traceback
-from typing import Dict, Any, Union
+from typing import Dict, Any
 
-def log_debug(msg: str) -> None:
-    """Log debug messages to stderr."""
-    print(msg, file=sys.stderr, flush=True)
 
 class OrkError(Exception):
     """Base class for Ork-related errors."""
@@ -108,8 +102,7 @@ def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dictionary containing response data
     """
-    log_debug(f"PROCESSING MESSAGE: {json.dumps(message, indent=2)}")
-    
+
     # Extract message fields
     if not isinstance(message, dict):
         raise OrkError("INVALID MESSAGE FORMAT, YA GIT!")
@@ -150,32 +143,3 @@ def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
         
     else:
         raise OrkError("INVALID MESSAGE TYPE, YA GIT!")
-
-if __name__ == "__main__":
-    # Set up logging
-    import logging
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        stream=sys.stderr
-    )
-    logger = logging.getLogger(__name__)
-    
-    # Main loop
-    for line in sys.stdin:
-        try:
-            message = line.strip()
-            if not message:
-                continue
-                
-            if isinstance(message, str):
-                message = json.loads(message)
-                
-            response = handle_message(message)
-            print(json.dumps(response))
-            sys.stdout.flush()
-            
-        except Exception as e:
-            logger.exception("Error in main loop")
-            print(json.dumps({"Error": {"error": f"FATAL ERROR: {str(e)}"}}))
-            sys.stdout.flush()

@@ -1,3 +1,4 @@
-numpy==1.26.4
-pandas==2.2.1
-maturin==1.4.0 
+mlflow==3.0.1
+maturin==1.9.0
+uvloop==0.21.0 
+dspy @ git+https://github.com/stanfordnlp/dspy.git
