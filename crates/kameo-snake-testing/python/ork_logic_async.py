@@ -66,6 +66,12 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
             logging.info(f"Returning: {resp}")
             return resp
         
+        elif "CallbackRoundtrip" in message:
+            value = message["CallbackRoundtrip"]["value"]
+            import kameo
+            result = await kameo.callback_handle({"value": value})
+            return {"CallbackRoundtripResult": {"value": result}}
+        
         else:
             raise OrkError(f"Unknown message type: {message}")
     except Exception as e:

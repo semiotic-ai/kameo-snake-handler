@@ -200,34 +200,9 @@ where
         &mut self,
         _actor_ref: ActorRef<Self>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        debug!(status = "starting", actor_type = "SubprocessActor");
-
         async move {
-            // Perform handshake
-            let mut conn = self.connection.lock().await;
-            let handshake = Control::<M>::Handshake;
-            let handshake_bytes = bincode::encode_to_vec(&handshake, bincode::config::standard())
-                .map_err(|e| E::Protocol(format!("Failed to encode handshake: {e}")))?;
-
-            conn.write_all(&handshake_bytes).await
-                .map_err(|e| E::Protocol(format!("Failed to write handshake: {e}")))?;
-
-            let mut resp_buf = vec![0u8; 1024];
-            let n = conn.read(&mut resp_buf).await
-                .map_err(|e| E::Protocol(format!("Failed to read handshake response: {e}")))?;
-
-            if n == 0 {
-                return Err(E::HandshakeFailed("Connection closed during handshake".into()));
-            }
-
-            let (resp, _): (Control<()>, _) =
-                bincode::decode_from_slice(&resp_buf[..n], bincode::config::standard())
-                    .map_err(|e| E::Protocol(format!("Failed to decode handshake response: {e}")))?;
-            if !resp.is_handshake() {
-                return Err(E::HandshakeFailed("Invalid handshake response".into()));
-            }
-
-            debug!(status = "started", actor_type = "SubprocessActor");
+            // No handshake here! Connection is already handshaked by builder.
+            tracing::debug!(status = "started", actor_type = "SubprocessActor");
             Ok(())
         }
     }
@@ -531,8 +506,6 @@ where
     }
 
     /// Spawn the child process actor and return a reference to it
-    ///
-    /// This is the ONLY supported way to spawn a child process. It sets all protocol-critical env vars (KAMEO_REQUEST_SOCKET, KAMEO_CALLBACK_SOCKET, KAMEO_CHILD_ACTOR) and must be used by all wrappers and consumers.
     pub async fn spawn<H>(self, handler: H) -> io::Result<(ActorRef<SubprocessActor<M, C, E>>, CallbackReceiver<C, H>)>
     where
         H: CallbackHandler<C>,
@@ -575,28 +548,9 @@ where
         }
 
         // Spawn the child process
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
         let mut child = cmd.spawn()?;
-
-        // Capture and forward child stdout
-        if let Some(stdout) = child.stdout.take() {
-            let mut reader = BufReader::new(stdout).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = reader.next_line().await {
-                    tracing::debug!(target: "child_stdout", "[PYTHON STDOUT] {}", line);
-                }
-            });
-        }
-        // Capture and forward child stderr
-        if let Some(stderr) = child.stderr.take() {
-            let mut reader = BufReader::new(stderr).lines();
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = reader.next_line().await {
-                    tracing::error!(target: "child_stderr", "[PYTHON STDERR] {}", line);
-                }
-            });
-        }
 
         tracing::info!(event = "lifecycle", status = "spawned", child_pid = child.id(), "Child process spawned");
 
@@ -612,7 +566,7 @@ where
                 return Err(e);
             },
             Ok(None) => {
-                tracing::error!(event = "handshake_accept",  which = "request", socket = %request_socket_path.to_string_lossy(), "Parent saw end of request incoming stream");
+                tracing::error!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent saw end of request incoming stream");
                 return Err(io::Error::new(io::ErrorKind::Other, "No request connection received"));
             },
             Err(_) => {
@@ -623,14 +577,9 @@ where
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout waiting for request connection"));
             }
         };
-        // Send bincode-encoded Control::Handshake to child
-        tracing::debug!(event = "handshake_protocol", "Parent sending Control::Handshake to child");
-        let handshake_msg = Control::<()>::Handshake;
-        let handshake_bytes = bincode::encode_to_vec(&handshake_msg, bincode::config::standard())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to encode handshake: {e}")))?;
-        request_conn.write_all(&handshake_bytes).await?;
-        tracing::debug!(event = "handshake_protocol",  "Parent sent Control::Handshake to child");
-        // After accepting request connection, proceed directly
+        // Parent performs handshake using perform_handshake
+        perform_handshake::<M, E>(&mut request_conn, true).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Handshake failed: {e:?}")))?;
+        // After accepting request connection and handshake, proceed directly
         tracing::debug!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent waiting for callback connection");
         let callback_conn = match tokio::time::timeout(Duration::from_secs(10), callback_incoming.next()).await {
             Ok(Some(Ok(conn))) => {
@@ -653,7 +602,7 @@ where
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "Timeout waiting for callback connection"));
             }
         };
-        // After accepting callback connection, proceed directly
+        tracing::trace!(event = "parent_spawn", step = "after_callback_accept", "Parent accepted callback connection, about to return actor ref");
         let actor = SubprocessActor::new(Box::new(request_conn), child, request_socket_path);
         let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), handler);
         Ok((kameo::spawn(actor), callback_receiver))
@@ -678,7 +627,7 @@ where
     A::Reply: serde::Serialize + bincode::Encode + std::fmt::Debug + 'static,
 {
     use tracing::{debug, error, trace};
-    debug!(event = "lifecycle", status = "running", "Child IPC handler loop (no_clone) started");
+    debug!(event = "lifecycle", status = "running", "Child IPC handler loop started");
     loop {
         let mut buf = vec![0u8; 4096];
         let n = match conn.read(&mut buf).await {
@@ -775,26 +724,50 @@ where
 
             // Encode and send the message
             let control = Control::Real(msg, trace_context);
-            let msg_bytes = bincode::encode_to_vec(&control, bincode::config::standard())
-                .map_err(|e| E::Protocol(format!("Failed to encode message: {e}")))?;
-            conn.write_all(&msg_bytes).await
-                .map_err(|e| E::Protocol(format!("Failed to write message: {e}")))?;
-            conn.flush().await
-                .map_err(|e| E::Protocol(format!("Failed to flush message: {e}")))?;
+            let msg_bytes = match bincode::encode_to_vec(&control, bincode::config::standard()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::trace!(event = "parent_ipc", step = "encode_failed", error = ?e, "Failed to encode message");
+                    return Err(E::Protocol(format!("Failed to encode message: {e}")));
+                }
+            };
+            tracing::trace!(event = "parent_ipc", step = "before_write", ?control, raw_bytes = ?msg_bytes, "About to write message to child");
+            if let Err(e) = conn.write_all(&msg_bytes).await {
+                tracing::trace!(event = "parent_ipc", step = "write_failed", error = ?e, "Failed to write message to child");
+                return Err(E::Protocol(format!("Failed to write message: {e}")));
+            }
+            if let Err(e) = conn.flush().await {
+                tracing::trace!(event = "parent_ipc", step = "flush_failed", error = ?e, "Failed to flush message to child");
+                return Err(E::Protocol(format!("Failed to flush message: {e}")));
+            }
+            tracing::trace!(event = "parent_ipc", step = "after_write", "Wrote message to child, about to read response");
 
             // Read response
             let mut resp_buf = vec![0u8; 1024 * 64]; // 64KB buffer for responses
-            let n = conn.read(&mut resp_buf).await
-                .map_err(|e| E::Protocol(format!("Failed to read response: {e}")))?;
+            tracing::trace!(event = "parent_ipc", step = "before_read", "About to read response from child");
+            let n = match conn.read(&mut resp_buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::trace!(event = "parent_ipc", step = "read_failed", error = ?e, "Failed to read response from child");
+                    return Err(E::Protocol(format!("Failed to read response: {e}")));
+                }
+            };
 
             if n == 0 {
+                tracing::trace!(event = "parent_ipc", step = "connection_closed", "Child closed connection while waiting for response");
                 return Err(E::ConnectionClosed());
             }
 
+            tracing::trace!(event = "parent_ipc", step = "after_read", raw_bytes = ?&resp_buf[..n], "Read response from child, about to decode");
             // Decode response
-            let (control, _): (Control<Self::Reply>, _) =
-                bincode::decode_from_slice(&resp_buf[..n], bincode::config::standard())
-                    .map_err(|e| E::Protocol(format!("Failed to decode response: {e}")))?;
+            let (control, _) = match bincode::decode_from_slice(&resp_buf[..n], bincode::config::standard()) {
+                Ok((ctrl, len)) => (ctrl, len),
+                Err(e) => {
+                    tracing::trace!(event = "parent_ipc", step = "decode_failed", error = ?e, "Failed to decode response from child");
+                    return Err(E::Protocol(format!("Failed to decode response: {e}")));
+                }
+            };
+            tracing::trace!(event = "parent_ipc", step = "after_decode", ?control, "Decoded response from child");
 
             match control {
                 Control::Handshake => Err(E::Protocol(
@@ -816,5 +789,56 @@ pub enum RuntimeFlavor {
 pub struct RuntimeConfig {
     pub flavor: RuntimeFlavor,
     pub worker_threads: Option<usize>,
+}
+
+// 1. Add perform_handshake function for parent/child handshake
+pub async fn perform_handshake<M, E>(conn: &mut (impl AsyncRead + AsyncWrite + Unpin), is_parent: bool) -> Result<(), E>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use bincode::{encode_to_vec, decode_from_slice};
+    use crate::Control;
+    if is_parent {
+        // Parent sends handshake
+        let handshake_msg = Control::<M>::Handshake;
+        let handshake_bytes = encode_to_vec(&handshake_msg, bincode::config::standard())
+            .map_err(|e| E::Protocol(format!("Failed to encode handshake: {e}")))?;
+        conn.write_all(&handshake_bytes).await
+            .map_err(|e| E::Protocol(format!("Failed to write handshake: {e}")))?;
+        // Parent reads handshake response
+        let mut resp_buf = vec![0u8; 1024];
+        let n = conn.read(&mut resp_buf).await
+            .map_err(|e| E::Protocol(format!("Failed to read handshake response: {e}")))?;
+        if n == 0 {
+            return Err(E::HandshakeFailed("Connection closed during handshake".into()));
+        }
+        let (resp, _): (Control<M>, _) = decode_from_slice(&resp_buf[..n], bincode::config::standard())
+            .map_err(|e| E::Protocol(format!("Failed to decode handshake response: {e}")))?;
+        if !resp.is_handshake() {
+            return Err(E::HandshakeFailed("Invalid handshake response".into()));
+        }
+    } else {
+        // Child reads handshake
+        let mut buf = vec![0u8; 1024];
+        let n = conn.read(&mut buf).await
+            .map_err(|e| E::Protocol(format!("Failed to read handshake: {e}")))?;
+        if n == 0 {
+            return Err(E::HandshakeFailed("Connection closed during handshake".into()));
+        }
+        let (handshake, _): (Control<M>, _) = decode_from_slice(&buf[..n], bincode::config::standard())
+            .map_err(|e| E::Protocol(format!("Failed to decode handshake: {e}")))?;
+        if !handshake.is_handshake() {
+            return Err(E::HandshakeFailed("Invalid handshake message".into()));
+        }
+        // Child sends handshake response
+        let resp = Control::<M>::Handshake;
+        let resp_bytes = encode_to_vec(&resp, bincode::config::standard())
+            .map_err(|e| E::Protocol(format!("Failed to encode handshake response: {e}")))?;
+        conn.write_all(&resp_bytes).await
+            .map_err(|e| E::Protocol(format!("Failed to write handshake response: {e}")))?;
+    }
+    Ok(())
 }
 

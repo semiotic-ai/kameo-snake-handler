@@ -142,6 +142,7 @@ where
     pub async fn run(mut self) -> Result<(), CallbackError> {
         loop {
             let mut buf = vec![0u8; 4096];
+            tracing::trace!(event = "callback_receiver", step = "before_read", "Callback receiver about to read from connection");
             let n = match self.connection.read(&mut buf).await {
                 Ok(0) => {
                     tracing::debug!(status = "connection_closed", message_type = std::any::type_name::<M>());
@@ -153,12 +154,12 @@ where
                     return Err(e.into());
                 }
             };
-
+            tracing::trace!(event = "callback_receiver", step = "after_read", n = n, "Callback receiver read from connection");
             if n == 0 {
                 tracing::debug!(status = "connection_closed_no_data", message_type = std::any::type_name::<M>());
                 break;
             }
-
+            tracing::trace!(event = "callback_receiver", step = "before_decode", "Callback receiver about to decode message");
             let (wrapped_msg, _): (WithTracingContext<M>, _) =
                 match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
                     Ok(decoded) => decoded,
@@ -173,9 +174,7 @@ where
             });
             let span = tracing::info_span!("callback_handler");
             span.set_parent(parent_cx);
-
             let reply = self.handler.handle(wrapped_msg.inner).instrument(span).await;
-
             let mut trace_context_map = std::collections::HashMap::new();
             global::get_text_map_propagator(|propagator| {
                 propagator.inject_context(&OTelContext::current(), &mut trace_context_map);

@@ -14,6 +14,8 @@ use kameo_child_process::RuntimeAware;
 use pyo3::Python;
 use pyo3::exceptions::PyRuntimeError;
 use kameo_child_process::ChildCallbackMessage;
+use kameo_snake_handler::NoopCallbackHandler;
+use kameo_snake_handler::declare_callback_glue;
 
 /// Custom error type for Ork operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -46,6 +48,10 @@ pub enum TestMessage {
         teef: u32,
         victory_points: u32,
     },
+    CallbackRoundtrip { value: u32 },
+    CalculateWaaaghPower {
+        boyz_count: u32,
+    },
 }
 
 impl Default for TestMessage {
@@ -62,6 +68,7 @@ pub enum TestResponse {
     ScrapResult { victory: bool },
     LootResult { total_teef: u32, bonus_teef: u32 },
     Error { error: String },
+    CallbackRoundtripResult { value: u32 },
 }
 
 impl ErrorReply for TestResponse {
@@ -100,13 +107,26 @@ impl KameoChildProcessMessage for TestMessage {
     type Reply = TestResponse;
 }
 
-// Add a dummy callback type for tests
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-pub struct TestCallbackMessage;
+pub struct TestCallbackMessage {
+    pub value: u32,
+}
 
 impl ChildCallbackMessage for TestCallbackMessage {
-    type Reply = ();
+    type Reply = u32;
 }
+ 
+// Define a real callback handler for the test
+pub struct TestCallbackHandler;
+
+#[async_trait::async_trait]
+impl kameo_child_process::CallbackHandler<TestCallbackMessage> for TestCallbackHandler {
+    async fn handle(&mut self, callback: TestCallbackMessage) -> u32 {
+        tracing::info!(event = "callback_roundtrip", value = callback.value, "Received callback in Rust");
+        callback.value + 1
+    }
+}
+
 
 kameo_snake_handler::setup_python_subprocess_system! {
     actors = {
@@ -157,10 +177,11 @@ kameo_snake_handler::setup_python_subprocess_system! {
             run_async_tests(python_path_vec.clone()).await?;
             run_invalid_config_tests(python_path_vec.clone()).await?;
             Ok::<(), Box<dyn std::error::Error>>(())
-        })
+        })?
     }
 }
 
+#[tracing::instrument]
 async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let sync_config = PythonConfig {
         python_path: python_path.clone(),
@@ -170,49 +191,33 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         is_async: false,
         module_path: "crates/kameo-snake-testing/python/ork_logic.py".to_string(),
     };
+    tracing::trace!(event = "test_spawn", step = "before_spawn", "About to spawn Python child process");
     let sync_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(sync_config).spawn::<TestMessage>().await?;
-    
-    // Test 1: Valid message
-    info!("Test 1: Valid message (sync)");
-    match sync_ref.ask(TestMessage::CalculatePower { boyz_count: 100 }).await {
-        Ok(response) => info!("SYNC OK: {:?}", response),
-        Err(e) => error!("SYNC ERR: {:?}", e),
-    }
+    tracing::trace!(event = "test_spawn", step = "after_spawn", "Returned from spawn, about to send first .ask()");
+    tracing::trace!(event = "test_send", step = "before_ask", "About to send first sync .ask() to child actor");
+    let resp = sync_ref.ask(TestMessage::CalculateWaaaghPower { boyz_count: 100 }).await;
+    tracing::trace!(event = "test_send", step = "after_ask", ?resp, "Received response from first sync .ask() to child actor");
+    assert!(matches!(resp, Ok(TestResponse::Power { .. })), "SYNC Test 1 failed: got {:?}", resp);
 
     // Test 2: Invalid message (unknown klan)
-    info!("Test 2: Invalid message - unknown klan (sync)");
-    match sync_ref.ask(TestMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
-        Ok(response) => error!("SYNC FAILED (should error): {:?}", response),
-        Err(e) => info!("SYNC ERR (expected): {:?}", e),
-    }
+    let resp = sync_ref.ask(TestMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await;
+    assert!(resp.is_err(), "SYNC Test 2 should error, got {:?}", resp);
 
     // Test 3: Edge case - zero boyz
-    info!("Test 3: Edge case - zero boyz (sync)");
-    match sync_ref.ask(TestMessage::CalculatePower { boyz_count: 0 }).await {
-        Ok(response) => info!("SYNC OK (zero boyz): {:?}", response),
-        Err(e) => error!("SYNC ERR: {:?}", e),
-    }
+    let resp = sync_ref.ask(TestMessage::CalculatePower { boyz_count: 0 }).await;
+    assert!(resp.is_err(), "SYNC Test 3 should error, got {:?}", resp);
 
     // Test 4: Edge case - massive number
-    info!("Test 4: Edge case - massive number (sync)");
-    match sync_ref.ask(TestMessage::CalculatePower { boyz_count: u32::MAX }).await {
-        Ok(response) => error!("SYNC FAILED (should error): {:?}", response),
-        Err(e) => info!("SYNC ERR (expected): {:?}", e),
-    }
+    let resp = sync_ref.ask(TestMessage::CalculatePower { boyz_count: u32::MAX }).await;
+    assert!(resp.is_err(), "SYNC Test 4 should error, got {:?}", resp);
 
     // Test 5: Scrap result test
-    info!("Test 5: Scrap result test (sync)");
-    match sync_ref.ask(TestMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await {
-        Ok(response) => info!("SYNC OK (scrap result): {:?}", response),
-        Err(e) => error!("SYNC ERR: {:?}", e),
-    }
+    let resp = sync_ref.ask(TestMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await;
+    assert!(matches!(resp, Ok(TestResponse::ScrapResult { .. })), "SYNC Test 5 failed: got {:?}", resp);
 
     // Test 6: Loot calculation
-    info!("Test 6: Loot calculation (sync)");
-    match sync_ref.ask(TestMessage::CalculateLoot { teef: 100, victory_points: 5 }).await {
-        Ok(response) => info!("SYNC OK (loot calc): {:?}", response),
-        Err(e) => error!("SYNC ERR: {:?}", e),
-    }
+    let resp = sync_ref.ask(TestMessage::CalculateLoot { teef: 100, victory_points: 5 }).await;
+    assert!(matches!(resp, Ok(TestResponse::LootResult { .. })), "SYNC Test 6 failed: got {:?}", resp);
     
     Ok(())
 }
@@ -227,64 +232,56 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/ork_logic_async.py".to_string(),
     };
-    let async_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(async_config).spawn::<TestMessage>().await?;
+    let async_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(async_config)
+        .with_callback_handler(TestCallbackHandler)
+        .spawn::<TestMessage>().await?;
     
     // Test 1: Valid message
-    info!("Test 1: Valid message (async)");
-    match async_ref.ask(TestMessage::CalculatePower { boyz_count: 100 }).await {
-        Ok(response) => info!("ASYNC OK: {:?}", response),
-        Err(e) => error!("ASYNC ERR: {:?}", e),
-    }
+    let resp = async_ref.ask(TestMessage::CalculatePower { boyz_count: 100 }).await;
+    assert!(matches!(resp, Ok(TestResponse::Power { .. })), "ASYNC Test 1 failed: got {:?}", resp);
 
     // Test 2: Invalid message (unknown klan)
-    info!("Test 2: Invalid message - unknown klan (async)");
-    match async_ref.ask(TestMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await {
-        Ok(response) => error!("ASYNC FAILED (should error): {:?}", response),
-        Err(e) => info!("ASYNC ERR (expected): {:?}", e),
-    }
+    let resp = async_ref.ask(TestMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await;
+    assert!(resp.is_err(), "ASYNC Test 2 should error, got {:?}", resp);
 
     // Test 3: Edge case - zero boyz
-    info!("Test 3: Edge case - zero boyz (async)");
-    match async_ref.ask(TestMessage::CalculatePower { boyz_count: 0 }).await {
-        Ok(response) => info!("ASYNC OK (zero boyz): {:?}", response),
-        Err(e) => error!("ASYNC ERR: {:?}", e),
-    }
+    let resp = async_ref.ask(TestMessage::CalculatePower { boyz_count: 0 }).await;
+    assert!(matches!(resp, Ok(TestResponse::Power { .. })), "ASYNC Test 3 failed: got {:?}", resp);
 
     // Test 4: Edge case - massive number
-    info!("Test 4: Edge case - massive number (async)");
-    match async_ref.ask(TestMessage::CalculatePower { boyz_count: u32::MAX }).await {
-        Ok(response) => error!("ASYNC FAILED (should error): {:?}", response),
-        Err(e) => info!("ASYNC ERR (expected): {:?}", e),
-    }
+    let resp = async_ref.ask(TestMessage::CalculatePower { boyz_count: u32::MAX }).await;
+    assert!(resp.is_err(), "ASYNC Test 4 should error, got {:?}", resp);
 
     // Test 5: Scrap result test
-    info!("Test 5: Scrap result test (async)");
-    match async_ref.ask(TestMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await {
-        Ok(response) => info!("ASYNC OK (scrap result): {:?}", response),
-        Err(e) => error!("ASYNC ERR: {:?}", e),
-    }
+    let resp = async_ref.ask(TestMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await;
+    assert!(matches!(resp, Ok(TestResponse::ScrapResult { .. })), "ASYNC Test 5 failed: got {:?}", resp);
 
     // Test 6: Loot calculation
-    info!("Test 6: Loot calculation (async)");
-    match async_ref.ask(TestMessage::CalculateLoot { teef: 100, victory_points: 5 }).await {
-        Ok(response) => info!("ASYNC OK (loot calc): {:?}", response),
-        Err(e) => error!("ASYNC ERR: {:?}", e),
+    let resp = async_ref.ask(TestMessage::CalculateLoot { teef: 100, victory_points: 5 }).await;
+    assert!(matches!(resp, Ok(TestResponse::LootResult { .. })), "ASYNC Test 6 failed: got {:?}", resp);
+
+    // Test: Callback roundtrip
+    let resp = async_ref.ask(TestMessage::CallbackRoundtrip { value: 42 }).await;
+    match resp {
+        Ok(TestResponse::CallbackRoundtripResult { value }) => {
+            assert_eq!(value, 43, "Callback roundtrip value should be incremented");
+        }
+        Ok(other) => panic!("ASYNC callback roundtrip: Unexpected response: {:?}", other),
+        Err(e) => panic!("ASYNC callback roundtrip failed: {:?}", e),
     }
 
     // Test 7: Rapid fire messages (stress test)
-    info!("Test 7: Rapid fire messages (async)");
     let mut handles = Vec::new();
     for i in 0..10 {
         let ref_clone = async_ref.clone();
         handles.push(tokio::spawn(async move {
-            match ref_clone.ask(TestMessage::CalculatePower { boyz_count: i * 100 }).await {
-                Ok(response) => info!("ASYNC OK (rapid fire {}): {:?}", i, response),
-                Err(e) => error!("ASYNC ERR (rapid fire {}): {:?}", i, e),
-            }
+            ref_clone.ask(TestMessage::CalculatePower { boyz_count: i * 100 }).await
         }));
     }
-    for handle in handles {
-        handle.await?;
+    let results = futures::future::join_all(handles).await;
+    for (i, res) in results.into_iter().enumerate() {
+        let resp = res.expect("Task panicked");
+        assert!(matches!(resp, Ok(TestResponse::Power { .. })), "Rapid fire {} failed: {:?}", i, resp);
     }
 
     Ok(())
@@ -304,7 +301,7 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
     
     let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_module_config).spawn::<TestMessage>().await;
     match spawn_result {
-        Ok(_) => panic!("Spawning with invalid module should fail"),
+        Ok(_actor_ref) => panic!("Spawning with invalid module should fail"),
         Err(e) => info!("Received expected error on spawn: {}", e),
     }
 
@@ -320,7 +317,7 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
     };
     let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_function_config).spawn::<TestMessage>().await;
     match spawn_result {
-        Ok(_) => panic!("Spawning with invalid function should fail"),
+        Ok(_actor_ref) => panic!("Spawning with invalid function should fail"),
         Err(e) => info!("Received expected error on spawn: {}", e),
     }
 
@@ -337,7 +334,7 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
     };
     let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_path_config).spawn::<TestMessage>().await;
     match spawn_result {
-        Ok(_) => panic!("Spawning with invalid path should fail"),
+        Ok(_actor_ref) => panic!("Spawning with invalid path should fail"),
         Err(e) => info!("Received expected error on spawn: {}", e),
     }
 
