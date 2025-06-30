@@ -144,18 +144,18 @@ where
             let mut buf = vec![0u8; 4096];
             let n = match self.connection.read(&mut buf).await {
                 Ok(0) => {
-                    tracing::debug!(event = "callback", status = "connection_closed", message_type = std::any::type_name::<M>());
+                    tracing::debug!(status = "connection_closed", message_type = std::any::type_name::<M>());
                     break;
                 }
                 Ok(n) => n,
                 Err(e) => {
-                    error!(event = "callback", error = ?e, message_type = std::any::type_name::<M>(), message = "Callback read error");
+                    tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Callback read error");
                     return Err(e.into());
                 }
             };
 
             if n == 0 {
-                tracing::debug!(event = "callback", status = "connection_closed_no_data", message_type = std::any::type_name::<M>());
+                tracing::debug!(status = "connection_closed_no_data", message_type = std::any::type_name::<M>());
                 break;
             }
 
@@ -163,7 +163,7 @@ where
                 match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
                     Ok(decoded) => decoded,
                     Err(e) => {
-                        error!(event = "callback", error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to decode callback message");
+                        tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to decode callback message");
                         continue;
                     }
                 };
@@ -190,13 +190,13 @@ where
             let reply_bytes = match bincode::encode_to_vec(&wrapped_reply, bincode::config::standard()) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    error!(event = "callback", error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to encode callback reply");
+                    tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to encode callback reply");
                     continue;
                 }
             };
 
             if let Err(e) = self.connection.write_all(&reply_bytes).await {
-                error!(event = "callback", error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to write callback reply");
+                tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to write callback reply");
                 break;
             }
         }

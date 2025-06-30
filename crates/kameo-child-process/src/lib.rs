@@ -153,12 +153,7 @@ impl From<SubprocessActorError> for SubprocessActorIpcError {
 /// Handle unknown actor type errors with proper tracing
 #[instrument(level = "error", fields(actor_name))]
 pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessActorError {
-    error!(
-        event = "lifecycle",
-        status = "error",
-        actor_type = actor_name,
-        message = "Unknown actor type encountered"
-    );
+    error!(status = "error", actor_type = actor_name, message = "Unknown actor type encountered");
     SubprocessActorError::UnknownActorType {
         actor_name: actor_name.to_string(),
     }
@@ -205,11 +200,7 @@ where
         &mut self,
         _actor_ref: ActorRef<Self>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        debug!(
-            event = "lifecycle",
-            status = "starting",
-            actor_type = "SubprocessActor"
-        );
+        debug!(status = "starting", actor_type = "SubprocessActor");
 
         async move {
             // Perform handshake
@@ -236,11 +227,7 @@ where
                 return Err(E::HandshakeFailed("Invalid handshake response".into()));
             }
 
-            debug!(
-                event = "lifecycle",
-                status = "started",
-                actor_type = "SubprocessActor"
-            );
+            debug!(status = "started", actor_type = "SubprocessActor");
             Ok(())
         }
     }
@@ -251,12 +238,7 @@ where
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        debug!(
-            event = "lifecycle",
-            status = "stopping",
-            actor_type = "SubprocessActor",
-            reason = ?reason
-        );
+        debug!(status = "stopping", actor_type = "SubprocessActor", ?reason);
 
         async move {
             // Kill child process if it exists
@@ -271,11 +253,7 @@ where
                 warn!(event = "lifecycle", error = ?e, "Failed to remove socket file");
             }
 
-            debug!(
-                event = "lifecycle",
-                status = "stopped",
-                actor_type = "SubprocessActor"
-            );
+            debug!(status = "stopped", actor_type = "SubprocessActor");
             Ok(())
         }
     }
@@ -287,7 +265,7 @@ where
         err: PanicError,
     ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
     {
-        error!(event = "lifecycle", status = "panicked", actor_type = "SubprocessActor", error = ?err);
+        error!(status = "panicked", actor_type = "SubprocessActor", ?err);
         async move { Ok(ControlFlow::Break(ActorStopReason::Panicked(err))) }
     }
 }
@@ -361,7 +339,7 @@ pub mod handshake {
         let socket_path = unique_socket_path(actor_name);
         let socket_path_str = socket_path.to_string_lossy().into_owned();
 
-        debug!(event = "handshake", status = "starting", socket_path = %socket_path_str, actor_type = actor_name);
+        debug!(status = "starting", socket_path = %socket_path_str, actor_type = actor_name);
 
         let mut cmd = Command::new(exe);
         cmd.env("KAMEO_CHILD_ACTOR", actor_name);
@@ -373,28 +351,16 @@ pub mod handshake {
         let endpoint = Endpoint::new(socket_path_str.clone());
         let mut incoming = endpoint.incoming()?;
 
-        debug!(
-            event = "handshake",
-            status = "spawning",
-            actor_type = actor_name
-        );
+        debug!(status = "spawning", actor_type = actor_name);
         let child = cmd.spawn()?;
 
-        debug!(
-            event = "handshake",
-            status = "waiting",
-            actor_type = actor_name
-        );
+        debug!(status = "waiting", actor_type = actor_name);
         let conn = incoming.next().await.transpose()?.ok_or_else(|| {
-            error!(event = "handshake", actor_type = actor_name, "No child connection received");
+            error!(actor_type = actor_name, message = "No child connection received");
             io::Error::new(io::ErrorKind::Other, "No child connection")
         })?;
 
-        debug!(
-            event = "handshake",
-            status = "completed",
-            actor_type = actor_name
-        );
+        debug!(status = "completed", actor_type = actor_name);
         Ok((Box::new(conn), child, socket_path))
     }
 
@@ -403,17 +369,17 @@ pub mod handshake {
         let req_env = std::env::var("KAMEO_REQUEST_SOCKET");
         let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");
         let actor_env = std::env::var("KAMEO_CHILD_ACTOR");
-        tracing::debug!(event = "handshake_env", KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Child handshake env vars");
+        debug!(pid = std::process::id(), request_socket = ?req_env, callback_socket = ?cb_env, actor_name = ?actor_env, "Child handshake env vars");
         if req_env.is_err() || cb_env.is_err() || actor_env.is_err() {
-            tracing::error!(event = "handshake_env_missing", KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Missing required handshake env var(s), aborting child early");
+            error!(pid = std::process::id(), request_socket = ?req_env, callback_socket = ?cb_env, actor_name = ?actor_env, "Missing required handshake env var(s), aborting child early");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, format!(
                 "Missing required handshake env var(s): KAMEO_REQUEST_SOCKET={:?}, KAMEO_CALLBACK_SOCKET={:?}, KAMEO_CHILD_ACTOR={:?}",
                 req_env, cb_env, actor_env
             )));
         }
         let socket_path = req_env.unwrap();
-        tracing::debug!(event = "handshake_child", which = "request", socket_path = %socket_path, "Child got KAMEO_REQUEST_SOCKET env var");
-        tracing::debug!(event = "handshake_child", which = "request", socket_path = %socket_path, "Child attempting to connect to request socket");
+        debug!(which = "request", socket_path = %socket_path, "Child got KAMEO_REQUEST_SOCKET env var");
+        debug!(which = "request", socket_path = %socket_path, "Child attempting to connect to request socket");
         let stream = Endpoint::connect(&socket_path).await?;
         Ok(Box::new(stream) as Box<dyn AsyncReadWrite>)
     }
@@ -424,17 +390,17 @@ pub mod handshake {
         let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");
         let req_env = std::env::var("KAMEO_REQUEST_SOCKET");
         let actor_env = std::env::var("KAMEO_CHILD_ACTOR");
-        tracing::debug!(event = "handshake_env", pid = pid, KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Child handshake env vars");
+        debug!(pid = pid, request_socket = ?req_env, callback_socket = ?cb_env, actor_name = ?actor_env, "Child handshake env vars");
         if cb_env.is_err() || req_env.is_err() || actor_env.is_err() {
-            tracing::error!(event = "handshake_env_missing", pid = pid, KAMEO_REQUEST_SOCKET = ?req_env, KAMEO_CALLBACK_SOCKET = ?cb_env, KAMEO_CHILD_ACTOR = ?actor_env, "Missing required handshake env var(s), aborting child early");
+            error!(pid = pid, request_socket = ?req_env, callback_socket = ?cb_env, actor_name = ?actor_env, "Missing required handshake env var(s), aborting child early");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, format!(
                 "Missing required handshake env var(s): KAMEO_REQUEST_SOCKET={:?}, KAMEO_CALLBACK_SOCKET={:?}, KAMEO_CHILD_ACTOR={:?}",
                 req_env, cb_env, actor_env
             )));
         }
         let socket_path = cb_env.unwrap();
-        tracing::debug!(event = "handshake_child", pid = pid, which = "callback", socket_path = %socket_path, "Child got KAMEO_CALLBACK_SOCKET env var");
-        tracing::debug!(event = "handshake_child", pid = pid, which = "callback", socket_path = %socket_path, "Child attempting to connect to callback socket");
+        debug!(pid = pid, which = "callback", socket_path = %socket_path, "Child got KAMEO_CALLBACK_SOCKET env var");
+        debug!(pid = pid, which = "callback", socket_path = %socket_path, "Child attempting to connect to callback socket");
         let stream = Endpoint::connect(&socket_path).await?;
         Ok(Box::new(stream) as Box<dyn AsyncReadWrite>)
     }

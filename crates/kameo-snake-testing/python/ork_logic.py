@@ -112,7 +112,7 @@ def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
         # CalculateWaaaghPower
         boyz_count = message["CalculateWaaaghPower"]["boyz_count"]
         power = calculate_waaagh_power(int(boyz_count))
-        return {"WaaaghPower": {"power": power}}
+        return {"Power": {"power": power}}
         
     elif "CalculateKlanBonus" in message:
         # CalculateKlanBonus

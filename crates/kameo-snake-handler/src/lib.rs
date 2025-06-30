@@ -273,7 +273,7 @@ where
         _actor_ref: ActorRef<Self>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            tracing::info!(event = "lifecycle", status = "started", actor_type = "PythonActor");
+            tracing::info!(status = "started", actor_type = "PythonActor");
             Ok(())
         }
     }
@@ -285,7 +285,7 @@ where
         reason: ActorStopReason,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
-            tracing::error!(event = "lifecycle", status = "stopped", actor_type = "PythonActor", reason = ?reason);
+            tracing::error!(status = "stopped", actor_type = "PythonActor", ?reason);
             Ok(())
         }
     }
@@ -298,7 +298,7 @@ where
     ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
     {
         async move {
-            tracing::error!(event = "lifecycle", status = "panicked", actor_type = "PythonActor", error = ?err);
+            tracing::error!(status = "panicked", actor_type = "PythonActor", ?err);
             Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
         }
     }
@@ -347,54 +347,66 @@ macro_rules! setup_python_subprocess_system {
                     (
                         std::any::type_name::<$actor>(),
                         || {
-                            let (config, py_function) = {
-                                use pyo3::prelude::*;
+                            use tracing::{info, debug, error, instrument};
+                            #[instrument(name = "python_subprocess_entry", skip_all)]
+                            fn python_entry() -> (kameo_snake_handler::PythonConfig, pyo3::PyObject) {
                                 Python::with_gil(|py| {
-                                    let config_json = std::env::var("KAMEO_PYTHON_CONFIG")
-                                        .expect("KAMEO_PYTHON_CONFIG must be set in child");
-                                    let config: kameo_snake_handler::PythonConfig = serde_json::from_str(&config_json)
-                                        .expect("Failed to parse KAMEO_PYTHON_CONFIG");
-                                    let sys = py.import("sys").expect("import sys");
-                                    let sys_path_binding = sys.getattr("path").expect("sys.path");
-                                    let sys_path = sys_path_binding.downcast::<pyo3::types::PyList>().expect("downcast sys.path");
+                                    let config_json = std::env::var("KAMEO_PYTHON_CONFIG").expect("KAMEO_PYTHON_CONFIG must be set in child");
+                                    let config: kameo_snake_handler::PythonConfig = serde_json::from_str(&config_json).expect("Failed to parse KAMEO_PYTHON_CONFIG");
+                                    debug!(module_name = %config.module_name, function_name = %config.function_name, python_path = ?config.python_path, "Deserialized PythonConfig");
+                                    let sys_path = py.import("sys").expect("import sys").getattr("path").expect("get sys.path");
                                     for path in &config.python_path {
                                         sys_path.call_method1("append", (path,)).expect("append python_path");
+                                        debug!(added_path = %path, "Appended to sys.path");
                                     }
                                     let module = py.import(&config.module_name).expect("import module");
+                                    debug!(module = %config.module_name, "Imported Python module");
                                     let function = module.getattr(&config.function_name).expect("getattr function");
+                                    debug!(function = %config.function_name, "Located Python function");
                                     (config, function.into())
                                 })
-                            };
-                            let runtime_config = { $child_init };
-                            let mut builder = match runtime_config.flavor {
-                                kameo_child_process::RuntimeFlavor::CurrentThread => {
-                                    let mut b = tokio::runtime::Builder::new_current_thread();
-                                    b.enable_all();
-                                    b
+                            }
+                            let gil_result = std::panic::catch_unwind(|| python_entry());
+                            match gil_result {
+                                Ok((config, py_function)) => {
+                                    let runtime_config = { $child_init };
+                                    let mut builder = match runtime_config.flavor {
+                                        kameo_child_process::RuntimeFlavor::CurrentThread => {
+                                            let mut b = tokio::runtime::Builder::new_current_thread();
+                                            b.enable_all();
+                                            b
+                                        }
+                                        kameo_child_process::RuntimeFlavor::MultiThread => {
+                                            let mut b = tokio::runtime::Builder::new_multi_thread();
+                                            b.enable_all();
+                                            if let Some(threads) = runtime_config.worker_threads {
+                                                b.worker_threads(threads);
+                                            }
+                                            b
+                                        }
+                                    };
+                                    kameo_snake_handler::setup_python_runtime(builder);
+                                    pyo3::Python::with_gil(|py| {
+                                        pyo3_async_runtimes::tokio::run(py, async move {
+                                            info!("Entered async block: Tokio runtime should be alive");
+                                            let rust_thread_id = std::thread::current().id();
+                                            let py_thread_id = Python::with_gil(|py| {
+                                                let threading = py.import("threading").unwrap();
+                                                threading.call_method0("get_ident").unwrap().extract::<u64>().unwrap()
+                                            });
+                                            debug!(?rust_thread_id, py_thread_id, "Thread IDs at start of async block");
+                                            let actor = <$actor>::new(config, py_function);
+                                            $crate::child_process_main_with_python_actor::<$msg, $callback>(actor).await
+                                                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+                                        })
+                                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                                    })
                                 }
-                                kameo_child_process::RuntimeFlavor::MultiThread => {
-                                    let mut b = tokio::runtime::Builder::new_multi_thread();
-                                    b.enable_all();
-                                    if let Some(threads) = runtime_config.worker_threads {
-                                        b.worker_threads(threads);
-                                    }
-                                    b
+                                Err(e) => {
+                                    error!(?e, "Panic after GIL closure");
+                                    std::process::exit(1);
                                 }
-                            };
-                            kameo_snake_handler::setup_python_runtime(builder);
-                            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                                tracing::info!(event = "orky_async_entry", flavor = ?runtime_config.flavor, thread_id = ?std::thread::current().id(), "Entered async block");
-                                let rust_thread_id = std::thread::current().id();
-                                let py_thread_id = Python::with_gil(|py| {
-                                    let threading = py.import("threading").unwrap();
-                                    threading.call_method0("get_ident").unwrap().extract::<u64>().unwrap()
-                                });
-                                tracing::trace!(event = "thread_check", where_ = "tokio::run block", rust_thread_id = ?rust_thread_id, py_thread_id, "Thread IDs at start of async block");
-                                let actor = <$actor>::new(config, py_function);
-                                $crate::child_process_main_with_python_actor::<$msg, $callback>(actor).await
-                                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
-                            })
-                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                            }
                         }
                     ),
                 )*
@@ -438,6 +450,7 @@ pub mod prelude {
 
 /// Python-specific child process main entrypoint. Does handshake, sets callback, calls init_with_runtime, and runs the actor loop.
 // NOTE: We do NOT bound Reply here, as it's private and PythonExecutionError is already fully serializable and debuggable.
+#[instrument(skip(actor), name = "child_process_main_with_python_actor")]
 pub async fn child_process_main_with_python_actor<M, C>(mut actor: PythonActor<M, C>) -> Result<(), Box<dyn std::error::Error>>
 where
     M: KameoChildProcessMessage + Send + 'static,
@@ -452,14 +465,14 @@ where
         + 'static,
 {
     use kameo_child_process::{handshake, CallbackHandle, run_child_actor_loop};
-    tracing::info!(event = "child_main", "child_process_main_with_python_actor starting");
+    tracing::info!("child_process_main_with_python_actor: about to handshake");
     let request_conn = handshake::child_request().await?;
-    tracing::info!(event = "handshake_child", which = "request", "Child about to connect callback socket");
+    tracing::info!("Child about to connect callback socket");
     let callback_conn = handshake::child_callback().await?;
     let handle = CallbackHandle::new(callback_conn);
     actor.set_callback_handle(handle);
     let mut actor = actor.init_with_runtime().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    tracing::info!(event = "child_main", "running child actor loop");
+    tracing::info!("running child actor loop");
     run_child_actor_loop::<PythonActor<M, C>, M>(&mut actor, request_conn).await?;
     Ok(())
 }

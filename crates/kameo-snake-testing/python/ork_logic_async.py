@@ -13,6 +13,8 @@ from ork_logic import (
     OrkError
 )
 
+logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='[PYTHON ASYNC] %(levelname)s %(message)s')
+
 async def process_async_calculation(func, *args):
     """
     Process a calculation asynchronously with a small delay to simulate work.
@@ -30,33 +32,44 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary containing response data
     """
     try:
-        # Handle message types directly
-        if "CalculateWaaaghPower" in message:
-            boyz_count = message["CalculateWaaaghPower"]["boyz_count"]
+        logging.info(f"Received message: {message}")
+        # Accept both CalculatePower and CalculateWaaaghPower for power calc
+        if "CalculatePower" in message or "CalculateWaaaghPower" in message:
+            key = "CalculatePower" if "CalculatePower" in message else "CalculateWaaaghPower"
+            boyz_count = message[key]["boyz_count"]
             result = await process_async_calculation(calculate_waaagh_power, int(boyz_count))
-            return {"WaaaghPower": {"power": result}}
+            resp = {"Power": {"power": result}}
+            logging.info(f"Returning: {resp}")
+            return resp
         
         elif "CalculateKlanBonus" in message:
             klan_name = message["CalculateKlanBonus"]["klan_name"]
             base_power = message["CalculateKlanBonus"]["base_power"]
             result = await process_async_calculation(calculate_klan_bonus, klan_name, int(base_power))
-            return {"KlanBonus": {"bonus": result}}
+            resp = {"KlanBonus": {"bonus": result}}
+            logging.info(f"Returning: {resp}")
+            return resp
         
         elif "CalculateScrapResult" in message:
             attacker = message["CalculateScrapResult"]["attacker_power"]
             defender = message["CalculateScrapResult"]["defender_power"]
             result = await process_async_calculation(calculate_scrap_result, int(attacker), int(defender))
-            return {"ScrapResult": {"victory": result}}
+            resp = {"ScrapResult": {"victory": result}}
+            logging.info(f"Returning: {resp}")
+            return resp
         
         elif "CalculateLoot" in message:
             teef = message["CalculateLoot"]["teef"]
             victory_points = message["CalculateLoot"]["victory_points"]
             result = await process_async_calculation(calculate_loot, int(teef), int(victory_points))
-            return {"LootResult": {"total_teef": int(result["total_teef"]), "bonus_teef": int(result["bonus_teef"])}}
+            resp = {"LootResult": {"total_teef": int(result["total_teef"]), "bonus_teef": int(result["bonus_teef"])}}
+            logging.info(f"Returning: {resp}")
+            return resp
         
         else:
             raise OrkError(f"Unknown message type: {message}")
     except Exception as e:
         import traceback
+        logging.error(f"Exception: {e}")
         traceback.print_exc()
         raise
