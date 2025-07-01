@@ -1,6 +1,23 @@
 # Kameo Snake Handler System
 
-A modular, async, protocol-correct system for orchestrating Python subprocesses from Rust, with deep tracing, strict error handling, and robust IPC. This workspace is designed for building, testing, and extending actor-based process orchestration with seamless Rust/Python interop.
+A modular, async, system for orchestrating Python subprocesses from Rust, with deep tracing, strict error handling, and robust IPC. This workspace is designed for building, testing, and extending actor-based process orchestration with seamless Rust/Python interop.
+
+---
+
+## Quickstart (macOS & Linux)
+
+The included `Makefile` automates all setup and test flows, and works out of the box on both macOS and Linux. It hopefully auto-detects your Python and library paths
+
+**To set up and run all integration tests:**
+
+```sh
+make pyenv      # Create a Python venv using python3 from your PATH
+make install    # Install Python requirements into the venv
+make run        # Run the full Rust+Python integration test suite
+```
+
+- On macOS, the Makefile will automatically find and set the correct DYLD_LIBRARY_PATH for your Python install.
+- On Linux, it uses LD_LIBRARY_PATH as needed.
 
 ---
 
