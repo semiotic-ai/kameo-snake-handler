@@ -68,7 +68,7 @@ kameo_snake_handler::setup_python_subprocess_system! {
             .build()?;
 
         runtime.block_on(async {
-            // Custom parent logic, e.g. running test suites
+            // Main application loop, this stuff is usually boilerplated in with tokio::main
             Ok::<(), Box<dyn std::error::Error>>(())
         })?
     }
@@ -85,9 +85,8 @@ kameo_snake_handler::setup_python_subprocess_system! {
 
 - All types must implement the required traits.
 - The macro must be used at the root of your binary crate (not inside a function).
-- The macro handles all the tricky details of runtime, GIL, and protocol setup for you.
+- The macro handles all the tricky details of runtime, GIL, and protocol setup.
 
-**If you forget to use this macro, or use the wrong types, your Python subprocess will not work!**
 
 ---
 
@@ -123,7 +122,7 @@ sequenceDiagram
 - **GIL management**: All Python calls are made inside the GIL, with careful handoff between Rust and Python async contexts.
 - **Module/function loading**: Python modules and functions are loaded at startup, with errors surfaced as typed Rust errors.
 - **Environment**: `PYTHONPATH` and other env vars are set from config; subprocesses inherit only what is needed.
-- **Error propagation**: All Python exceptions are mapped to rich Rust error types, preserving context and traceability.
+- **Error propagation**:  Python exceptions are mapped to Rust error types, preserving context and traceability.
 
 ---
 

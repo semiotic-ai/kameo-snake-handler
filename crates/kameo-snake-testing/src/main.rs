@@ -9,13 +9,13 @@ use tracing::{error, info};
 use kameo_child_process::ChildCallbackMessage;
 use kameo_snake_handler::declare_callback_glue;
 
-/// Custom error type for Ork operations
+/// Custom error type for logic operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
 pub enum TestError {
-    #[error("Not enough boyz for WAAAGH! (need {needed}, got {got})")]
-    NotEnoughBoyz { needed: i32, got: i32 },
-    #[error("Unknown klan: {0}")]
-    UnknownKlan(String),
+    #[error("Not enough entities for operation (need {needed}, got {got})")]
+    NotEnoughEntities { needed: i32, got: i32 },
+    #[error("Unknown category: {0}")]
+    UnknownCategory(String),
     #[error("Invalid power level: {0}")]
     InvalidPower(String),
     #[error("Python error: {0}")]
@@ -26,29 +26,26 @@ pub enum TestError {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub enum TestMessage {
     CalculatePower {
-        boyz_count: u32,
+        count: u32,
     },
-    CalculateKlanBonus {
-        klan_name: String,
+    CalculateCategoryBonus {
+        category_name: String,
         base_power: u32,
     },
-    CalculateScrapResult {
+    CalculateCompetitionResult {
         attacker_power: u32,
         defender_power: u32,
     },
-    CalculateLoot {
-        teef: u32,
-        victory_points: u32,
+    CalculateReward {
+        currency: u32,
+        points: u32,
     },
     CallbackRoundtrip { value: u32 },
-    CalculateWaaaghPower {
-        boyz_count: u32,
-    },
 }
 
 impl Default for TestMessage {
     fn default() -> Self {
-        Self::CalculatePower { boyz_count: 0 }
+        Self::CalculatePower { count: 0 }
     }
 }
 
@@ -56,9 +53,9 @@ impl Default for TestMessage {
 #[derive(Debug, Serialize, Deserialize, Clone, Decode, Encode)]
 pub enum TestResponse {
     Power { power: u32 },
-    KlanBonus { bonus: u32 },
-    ScrapResult { victory: bool },
-    LootResult { total_teef: u32, bonus_teef: u32 },
+    CategoryBonus { bonus: u32 },
+    CompetitionResult { victory: bool },
+    RewardResult { total_currency: u32, bonus_currency: u32 },
     Error { error: String },
     CallbackRoundtripResult { value: u32 },
 }
@@ -150,7 +147,7 @@ kameo_snake_handler::setup_python_subprocess_system! {
         // Create parent runtime
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("ork-boss")
+            .thread_name("test-main")
             .enable_all()
             .build()?;
 
@@ -177,39 +174,39 @@ kameo_snake_handler::setup_python_subprocess_system! {
 async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let sync_config = PythonConfig {
         python_path: python_path.clone(),
-        module_name: "ork_logic".to_string(),
+        module_name: "logic".to_string(),
         function_name: "handle_message".to_string(),
         env_vars: vec![],
         is_async: false,
-        module_path: "crates/kameo-snake-testing/python/ork_logic.py".to_string(),
+        module_path: "crates/kameo-snake-testing/python/logic.py".to_string(),
     };
     tracing::trace!(event = "test_spawn", step = "before_spawn", "About to spawn Python child process");
     let sync_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(sync_config).spawn::<TestMessage>().await?;
     tracing::trace!(event = "test_spawn", step = "after_spawn", "Returned from spawn, about to send first .ask()");
     tracing::trace!(event = "test_send", step = "before_ask", "About to send first sync .ask() to child actor");
-    let resp = sync_ref.ask(TestMessage::CalculateWaaaghPower { boyz_count: 100 }).await;
+    let resp = sync_ref.ask(TestMessage::CalculatePower { count: 100 }).await;
     tracing::trace!(event = "test_send", step = "after_ask", ?resp, "Received response from first sync .ask() to child actor");
     assert!(matches!(resp, Ok(TestResponse::Power { .. })), "SYNC Test 1 failed: got {:?}", resp);
 
-    // Test 2: Invalid message (unknown klan)
-    let resp = sync_ref.ask(TestMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await;
+    // Test 2: Invalid message (unknown category)
+    let resp = sync_ref.ask(TestMessage::CalculateCategoryBonus { category_name: "UnknownCategory".to_string(), base_power: 0 }).await;
     assert!(resp.is_err(), "SYNC Test 2 should error, got {:?}", resp);
 
-    // Test 3: Edge case - zero boyz
-    let resp = sync_ref.ask(TestMessage::CalculatePower { boyz_count: 0 }).await;
+    // Test 3: Edge case - zero count
+    let resp = sync_ref.ask(TestMessage::CalculatePower { count: 0 }).await;
     assert!(resp.is_err(), "SYNC Test 3 should error, got {:?}", resp);
 
     // Test 4: Edge case - massive number
-    let resp = sync_ref.ask(TestMessage::CalculatePower { boyz_count: u32::MAX }).await;
+    let resp = sync_ref.ask(TestMessage::CalculatePower { count: u32::MAX }).await;
     assert!(resp.is_err(), "SYNC Test 4 should error, got {:?}", resp);
 
-    // Test 5: Scrap result test
-    let resp = sync_ref.ask(TestMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await;
-    assert!(matches!(resp, Ok(TestResponse::ScrapResult { .. })), "SYNC Test 5 failed: got {:?}", resp);
+    // Test 5: Competition result test
+    let resp = sync_ref.ask(TestMessage::CalculateCompetitionResult { attacker_power: 1000, defender_power: 500 }).await;
+    assert!(matches!(resp, Ok(TestResponse::CompetitionResult { .. })), "SYNC Test 5 failed: got {:?}", resp);
 
-    // Test 6: Loot calculation
-    let resp = sync_ref.ask(TestMessage::CalculateLoot { teef: 100, victory_points: 5 }).await;
-    assert!(matches!(resp, Ok(TestResponse::LootResult { .. })), "SYNC Test 6 failed: got {:?}", resp);
+    // Test 6: Reward calculation
+    let resp = sync_ref.ask(TestMessage::CalculateReward { currency: 100, points: 5 }).await;
+    assert!(matches!(resp, Ok(TestResponse::RewardResult { .. })), "SYNC Test 6 failed: got {:?}", resp);
     
     Ok(())
 }
@@ -218,39 +215,39 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
     info!("==== ASYNC FLOW ====");
     let async_config = PythonConfig {
         python_path: python_path.clone(),
-        module_name: "ork_logic_async".to_string(),
+        module_name: "logic_async".to_string(),
         function_name: "handle_message_async".to_string(),
         env_vars: vec![],
         is_async: true,
-        module_path: "crates/kameo-snake-testing/python/ork_logic_async.py".to_string(),
+        module_path: "crates/kameo-snake-testing/python/logic_async.py".to_string(),
     };
     let async_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(async_config)
         .with_callback_handler(TestCallbackHandler)
         .spawn::<TestMessage>().await?;
     
     // Test 1: Valid message
-    let resp = async_ref.ask(TestMessage::CalculatePower { boyz_count: 100 }).await;
+    let resp = async_ref.ask(TestMessage::CalculatePower { count: 100 }).await;
     assert!(matches!(resp, Ok(TestResponse::Power { .. })), "ASYNC Test 1 failed: got {:?}", resp);
 
-    // Test 2: Invalid message (unknown klan)
-    let resp = async_ref.ask(TestMessage::CalculateKlanBonus { klan_name: "UnknownKlan".to_string(), base_power: 0 }).await;
+    // Test 2: Invalid message (unknown category)
+    let resp = async_ref.ask(TestMessage::CalculateCategoryBonus { category_name: "UnknownCategory".to_string(), base_power: 0 }).await;
     assert!(resp.is_err(), "ASYNC Test 2 should error, got {:?}", resp);
 
-    // Test 3: Edge case - zero boyz
-    let resp = async_ref.ask(TestMessage::CalculatePower { boyz_count: 0 }).await;
-    assert!(matches!(resp, Ok(TestResponse::Power { .. })), "ASYNC Test 3 failed: got {:?}", resp);
+    // Test 3: Edge case - zero count
+    let resp = async_ref.ask(TestMessage::CalculatePower { count: 0 }).await;
+    assert!(resp.is_err(), "ASYNC Test 3 should error, got {:?}", resp);
 
     // Test 4: Edge case - massive number
-    let resp = async_ref.ask(TestMessage::CalculatePower { boyz_count: u32::MAX }).await;
+    let resp = async_ref.ask(TestMessage::CalculatePower { count: u32::MAX }).await;
     assert!(resp.is_err(), "ASYNC Test 4 should error, got {:?}", resp);
 
-    // Test 5: Scrap result test
-    let resp = async_ref.ask(TestMessage::CalculateScrapResult { attacker_power: 1000, defender_power: 500 }).await;
-    assert!(matches!(resp, Ok(TestResponse::ScrapResult { .. })), "ASYNC Test 5 failed: got {:?}", resp);
+    // Test 5: Competition result test
+    let resp = async_ref.ask(TestMessage::CalculateCompetitionResult { attacker_power: 1000, defender_power: 500 }).await;
+    assert!(matches!(resp, Ok(TestResponse::CompetitionResult { .. })), "ASYNC Test 5 failed: got {:?}", resp);
 
-    // Test 6: Loot calculation
-    let resp = async_ref.ask(TestMessage::CalculateLoot { teef: 100, victory_points: 5 }).await;
-    assert!(matches!(resp, Ok(TestResponse::LootResult { .. })), "ASYNC Test 6 failed: got {:?}", resp);
+    // Test 6: Reward calculation
+    let resp = async_ref.ask(TestMessage::CalculateReward { currency: 100, points: 5 }).await;
+    assert!(matches!(resp, Ok(TestResponse::RewardResult { .. })), "ASYNC Test 6 failed: got {:?}", resp);
 
     // Test: Callback roundtrip
     let resp = async_ref.ask(TestMessage::CallbackRoundtrip { value: 42 }).await;
@@ -265,15 +262,16 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
     // Test 7: Rapid fire messages (stress test)
     let mut handles = Vec::new();
     for i in 0..10 {
+        if i == 0 { continue; } // skip count=0, which is always an error
         let ref_clone = async_ref.clone();
         handles.push(tokio::spawn(async move {
-            ref_clone.ask(TestMessage::CalculatePower { boyz_count: i * 100 }).await
+            ref_clone.ask(TestMessage::CalculatePower { count: i * 100 }).await
         }));
     }
     let results = futures::future::join_all(handles).await;
     for (i, res) in results.into_iter().enumerate() {
         let resp = res.expect("Task panicked");
-        assert!(matches!(resp, Ok(TestResponse::Power { .. })), "Rapid fire {} failed: {:?}", i, resp);
+        assert!(matches!(resp, Ok(TestResponse::Power { .. })), "Rapid fire {} failed: {:?}", i + 1, resp);
     }
 
     Ok(())
@@ -301,11 +299,11 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
     info!("Test 9: Invalid function test");
     let invalid_function_config = PythonConfig {
         python_path: python_path.clone(),
-        module_name: "ork_logic".to_string(),
+        module_name: "logic".to_string(),
         function_name: "non_existent_function".to_string(),
         env_vars: vec![],
         is_async: false,
-        module_path: "crates/kameo-snake-testing/python/ork_logic.py".to_string(),
+        module_path: "crates/kameo-snake-testing/python/logic.py".to_string(),
     };
     let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_function_config).spawn::<TestMessage>().await;
     match spawn_result {
@@ -318,11 +316,11 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
     info!("Test 10: Invalid path test");
     let invalid_path_config = PythonConfig {
         python_path: python_path.clone(),
-        module_name: "ork_logic".to_string(),
+        module_name: "logic".to_string(),
         function_name: "handle_message".to_string(),
         env_vars: vec![],
         is_async: false,
-        module_path: "crates/kameo-snake-testing/python/ork_logic.py".to_string(),
+        module_path: "crates/kameo-snake-testing/python/logic.py".to_string(),
     };
     let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_path_config).spawn::<TestMessage>().await;
     match spawn_result {
