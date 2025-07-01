@@ -8,6 +8,8 @@ use thiserror::Error;
 use tracing::{error, info};
 use kameo_child_process::ChildCallbackMessage;
 use kameo_snake_handler::declare_callback_glue;
+use tokio::time::timeout;
+use std::time::Duration;
 
 /// Custom error type for logic operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -357,7 +359,11 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
         module_path: "crates/kameo-snake-testing/python/non_existent_module.py".to_string(),
     };
     
-    let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_module_config).spawn::<TestMessage>().await;
+    let spawn_result = timeout(Duration::from_secs(3), PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_module_config).spawn::<TestMessage>()).await;
+    let spawn_result = match spawn_result {
+        Ok(res) => res,
+        Err(_) => return Err("Timeout waiting for invalid module spawn to fail".into()),
+    };
     match spawn_result {
         Ok(_actor_ref) => panic!("Spawning with invalid module should fail"),
         Err(e) => info!("Received expected error on spawn: {}", e),
@@ -373,7 +379,11 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
         is_async: false,
         module_path: "crates/kameo-snake-testing/python/logic.py".to_string(),
     };
-    let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_function_config).spawn::<TestMessage>().await;
+    let spawn_result = timeout(Duration::from_secs(3), PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_function_config).spawn::<TestMessage>()).await;
+    let spawn_result = match spawn_result {
+        Ok(res) => res,
+        Err(_) => return Err("Timeout waiting for invalid function spawn to fail".into()),
+    };
     match spawn_result {
         Ok(_actor_ref) => panic!("Spawning with invalid function should fail"),
         Err(e) => info!("Received expected error on spawn: {}", e),
@@ -390,7 +400,11 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
         is_async: false,
         module_path: "crates/kameo-snake-testing/python/logic.py".to_string(),
     };
-    let spawn_result = PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_path_config).spawn::<TestMessage>().await;
+    let spawn_result = timeout(Duration::from_secs(3), PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_path_config).spawn::<TestMessage>()).await;
+    let spawn_result = match spawn_result {
+        Ok(res) => res,
+        Err(_) => return Err("Timeout waiting for invalid path spawn to fail".into()),
+    };
     match spawn_result {
         Ok(_actor_ref) => panic!("Spawning with invalid path should fail"),
         Err(e) => info!("Received expected error on spawn: {}", e),
