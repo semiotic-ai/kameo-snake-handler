@@ -115,6 +115,21 @@ where
     async fn handle(&mut self, callback: M) -> M::Reply;
 }
 
+/// Add a NoopCallbackHandler for callback IPC (crashes if called)
+pub struct NoopCallbackHandler;
+
+#[async_trait]
+impl<C: ChildCallbackMessage + Sync + 'static> CallbackHandler<C> for NoopCallbackHandler
+where
+    C::Reply: Send,
+{
+    async fn handle(&mut self, callback: C) -> C::Reply {
+        tracing::trace!(event = "callback_handler", ?callback, "NoopCallbackHandler received callback");
+        tracing::info!(event = "noop_callback", ?callback, "NoopCallbackHandler received callback");
+        panic!("NoopCallbackHandler called but no Default for callback reply; implement your own handler if you need a real reply");
+    }
+}
+
 pub struct CallbackReceiver<M, H>
 where
     M: ChildCallbackMessage,
@@ -201,5 +216,15 @@ where
         }
 
         Ok(())
+    }
+}
+
+impl<M, C, E> crate::callback::CallbackSender<C> for crate::SubprocessActor<M, C, E>
+where
+    C: crate::callback::ChildCallbackMessage,
+    E: crate::ProtocolError + std::fmt::Debug + Send + Sync + 'static,
+{
+    fn set_callback_handle(&mut self, handle: crate::callback::CallbackHandle<C>) {
+        self.callback_handle = Some(handle);
     }
 } 

@@ -1,5 +1,3 @@
-
-
 pub mod serde_py;
 pub use serde_py::{from_pyobject, to_pyobject, FromPyAny};
 
@@ -9,8 +7,7 @@ pub use error::{PythonExecutionError, ErrorReply};
 mod builder;
 pub use builder::PythonChildProcessBuilder;
 
-mod callback;
-pub use callback::NoopCallbackHandler;
+pub use kameo_child_process::NoopCallbackHandler;
 
 mod actor;
 pub use actor::{PythonActor, PythonConfig, child_process_main_with_python_actor};

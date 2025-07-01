@@ -1,110 +1,117 @@
 # kameo-child-process
 
-We can run Handler logic for a kameo actor in a subprocess, 1:1 with the actor instance in the parent process.
+A Rust crate for robust, async, protocol-correct child process management and IPC.
+
+This crate provides the generic process/IPC/actor/callback engine for the Kameo system.
+---
+
+## Features
+
+- **SubprocessActor**: Actor for managing a child process and async IPC.
+- **ChildProcessBuilder**: Builder for configuring and spawning child process actors.
+- **Callback system**: Typed, async callback IPC between parent and child.
+- **Handshake protocol**: Strict, traceable handshake for process startup.
+- **Error types**: Rich, typed error handling for all protocol and IPC failures.
+- **Tracing**: Deep, async-aware tracing for all message flows and errors.
 
 ---
 
-## Why kameo-child-process?
+## Protocol & Message Flow
 
-This crate exists to let you run the important parts of a kameo actor's handler logic in a separate subprocess, fully isolated from the parent process. This isolation provides:
-- **Safety:** Bugs, panics, or resource leaks in the handler can't take down the parent.
-- **Language/runtime agnosticism:** The handler can be implemented in any language or runtime that speaks the message protocol.
+### 1. Process Startup & Handshake
 
+```mermaid
+sequenceDiagram
+    participant Parent as Parent Process
+    participant Child as Child Process
 
-## Macros for Actor Registration and Main Setup
-
-### `register_subprocess_actors!`
-
-Registers one or more actor types for subprocess use. When the process is launched as a child, this macro dispatches to the correct actor handler loop based on the environment.
-
-**Example:**
-```rust
-register_subprocess_actors! {
-    actors = {
-        (MyActor, MyMessage, MyCallback),
-        (OtherActor, OtherMessage, OtherCallback),
-    }
-}
-
-fn main() {
-    if let Some(result) = maybe_run_subprocess_registry() {
-        // This is a child process: run the actor loop
-        result.unwrap();
-        return;
-    }
-    // Parent process logic continues here
-}
+    Parent->>Child: Spawn child process (with env vars)
+    Parent->>Child: [Handshake] Send Control::Handshake
+    Child->>Parent: [Handshake] Respond Control::Handshake
 ```
 
-### `setup_subprocess_system!`
+- Parent spawns the child process, setting up two Unix sockets (request & callback) and passing their paths via environment variables.
+- Child connects to the request socket.
+- Parent sends a handshake message (`Control::Handshake`).
+- Child responds with a handshake ack (`Control::Handshake`).
 
-Sets up the complete subprocess actor system, including custom runtime initialization for both parent and child. This macro ensures the correct main function structure and dispatch for robust, cross-platform actor isolation.
+---
 
-**Example:**
-```rust
-setup_subprocess_system! {
-    actors = {
-        (MyActor, MyMessage, MyCallback),
-    },
-    child_init = {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .init();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build runtime")
-    },
-    parent_init = {
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .init();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            // Spawn and interact with your actor(s) here
-            Ok::<(), Box<dyn std::error::Error>>(())
-        })
-    }
-}
+### 2. Message Exchange
+
+```mermaid
+sequenceDiagram
+    participant Parent as Parent Process
+    participant Child as Child Process
+
+    loop Message Exchange
+        Parent->>Child: Control::Real(Message, TracingContext)
+        Child->>Parent: Control::Real(Reply, TracingContext)
+    end
 ```
 
-## Example Usage
+- All messages are wrapped in a `Control::Real` variant, carrying both the message and a tracing context for distributed tracing.
+- Replies are sent back the same way.
 
-```rust
-use kameo_child_process::prelude::*;
-use tracing::Level;
+---
 
-setup_subprocess_system! {
-    actors = {
-        (MyActor, MyMessage, MyCallback),
-    },
-    child_init = {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::TRACE)
-            .init();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build runtime")
-    },
-    parent_init = {
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .init();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            // Spawn and interact with your actor(s) here
-            Ok::<(), Box<dyn std::error::Error>>(())
-        })
-    }
-}
+### 3. Callback Flow (if used)
+
+```mermaid
+sequenceDiagram
+    participant Child as Child Process
+    participant Callback as Callback Handler
+
+    Child->>Callback: CallbackHandle.ask(callback_msg)
+    Callback->>Child: Callback reply
 ```
 
-// Define your message, reply, and callback types, and implement KameoChildProcessMessage for your message.
+- The child can send callback requests to the parent (or a callback handler) using the callback socket.
+- The callback handler processes the request and replies.
 
+---
+
+### 4. Shutdown
+
+- On shutdown, both parent and child clean up their sockets and terminate the process cleanly.
+
+---
+
+## Key Types & Traits
+
+- **SubprocessActor**: The main actor for a child process.
+- **ChildProcessBuilder**: Fluent builder for configuring and spawning actors.
+- **CallbackHandler / NoopCallbackHandler**: Trait and default impl for handling callback messages.
+- **ChildCallbackMessage**: Trait for callback message types.
+- **ProtocolError, SubprocessActorError**: Rich error types for all protocol and IPC failures.
+
+---
+
+## Example: Spawning a Child Process
+
+```rust
+use kameo_child_process::{ChildProcessBuilder, NoopCallbackHandler, SubprocessActor, KameoChildProcessMessage};
+
+let builder = ChildProcessBuilder::<SubprocessActor<MyMsg, MyCallback, MyError>, MyMsg, MyCallback, MyError>::new()
+    .with_actor_name("my_actor")
+    .log_level(tracing::Level::INFO);
+
+let (actor_ref, callback_receiver) = builder.spawn(NoopCallbackHandler).await?;
+tokio::spawn(callback_receiver.run());
+```
+
+---
+
+## Error Handling
+
+- All errors are strongly typed and instrumented with tracing.
+- Protocol errors, handshake failures, and connection issues are all surfaced as distinct error types.
+
+---
+
+## Tracing & Telemetry
+
+- All message flows, handshakes, and errors are traced with `tracing` and OpenTelemetry.
+- Spans are propagated across process boundaries for full distributed traceability.
+
+---

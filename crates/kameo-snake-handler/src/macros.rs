@@ -110,7 +110,7 @@ macro_rules! setup_python_subprocess_system {
                                     tracing::trace!(event = "child_entry", step = "in_async_block", "Child inside async block, about to connect sockets");
                                     let request_socket_path = std::env::var("KAMEO_REQUEST_SOCKET").unwrap_or_else(|_| "<unset>".to_string());
                                     tracing::info!(event = "child_handshake", step = "before_child_request", socket = %request_socket_path, "Child about to connect to request socket");
-                                    let request_conn = match kameo_child_process::handshake::child_request().await {
+                                    let request_conn = match kameo_child_process::child_request().await {
                                         Ok(conn) => {
                                             tracing::info!(event = "child_handshake", step = "after_child_request", socket = %request_socket_path, "Child connected to request socket");
                                             conn
@@ -120,7 +120,7 @@ macro_rules! setup_python_subprocess_system {
                                             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("child_request handshake failed: {e}")));
                                         }
                                     };
-                                    let callback_conn = kameo_child_process::handshake::child_callback().await.expect("child_callback handshake failed");
+                                    let callback_conn = kameo_child_process::child_callback().await.expect("child_callback handshake failed");
                                     let handle = kameo_child_process::CallbackHandle::new(callback_conn);
                                     set_callback_handle(std::sync::Arc::new(handle));
                                     info!("Child connected to both sockets and set callback handle");
