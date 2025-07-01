@@ -21,20 +21,6 @@ make run        # Run the full Rust+Python integration test suite
 
 ---
 
-## Project Structure
-
-```mermaid
-graph TD
-    A[Workspace Root]
-    A --> B[kameo-child-process]
-    A --> C[kameo-snake-handler]
-    A --> D[kameo-snake-testing]
-    B -- Generic process/IPC/actor/callback engine --> C
-    C -- Python-specific actor, config, error, serde --> D
-    D -- Integration tests, Python test harness --> B
-    D -- Integration tests, Python test harness --> C
-```
-
 - **kameo-child-process**: The generic, protocol-correct process/IPC/actor/callback engine. Use this for any kind of child process management, not just Python. [Read the detailed README](./crates/kameo-child-process/README.md)
 - **kameo-snake-handler**: Python-specific process actor, configuration, error handling, and (de)serialization. Builds on the process crate to provide seamless async Rust/Python orchestration. [Read the detailed README](./crates/kameo-snake-handler/README.md)
 - **kameo-snake-testing**: Integration test harness, including real Python scripts and async test flows. Demonstrates and validates the full protocol, error handling, and callback flows.
