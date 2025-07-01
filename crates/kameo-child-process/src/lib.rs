@@ -263,17 +263,6 @@ where
     }
 }
 
-impl<M, C, E> Default for SubprocessActor<M, C, E>
-where
-    M: Sync,
-    C: crate::callback::ChildCallbackMessage + Sync,
-    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static,
-{
-    fn default() -> Self {
-        panic!("SubprocessActor<M, C, E> should not be constructed with Default in production; use new() with required fields.")
-    }
-}
-
 impl<M, C, E> crate::callback::CallbackSender<C> for SubprocessActor<M, C, E>
 where
     C: crate::callback::ChildCallbackMessage,
@@ -379,33 +368,6 @@ pub mod handshake {
     }
 }
 
-/// Macro to register subprocess actors
-#[macro_export]
-macro_rules! register_subprocess_actors {
-    (
-        actors = { $(($actor:ty, $msg:ty, $callback:ty)),* $(,)? }
-        $(,)?
-    ) => {
-        pub fn maybe_run_subprocess_registry() -> Option<Result<(), Box<dyn std::error::Error>>> {
-            // Check if we're a child process
-            if let Ok(actor_name) = std::env::var("KAMEO_CHILD_ACTOR") {
-                Some(match actor_name.as_str() {
-                    $(
-                        stringify!($actor) => {
-                            ::kameo_child_process::child_process_main_with_runtime::<$actor, $msg, $callback>()
-                        }
-                    )*
-                    _ => {
-                        Err(Box::new(::kameo_child_process::handle_unknown_actor_error(&actor_name)))
-                    }
-                })
-            } else {
-                None
-            }
-        }
-    };
-}
-
 /// Configuration for a child process actor
 #[derive(Debug)]
 pub struct ChildProcessConfig {
@@ -427,7 +389,7 @@ impl Default for ChildProcessConfig {
 /// A builder for creating child process actors
 pub struct ChildProcessBuilder<A, M, C, E>
 where
-    A: Default + Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
+    A: Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + Sync + 'static,
     <A as Message<M>>::Reply:
         Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
@@ -438,23 +400,9 @@ where
     _phantom: PhantomData<(A, M, C, E)>,
 }
 
-impl<A, M, C, E> Default for ChildProcessBuilder<A, M, C, E>
-where
-    A: Default + Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
-    M: KameoChildProcessMessage + Send + Sync + 'static,
-    <A as Message<M>>::Reply:
-        Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
-    C: ChildCallbackMessage + Sync,
-    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static + Encode + Decode<()> + Serialize + for<'de> Deserialize<'de>,
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<A, M, C, E> ChildProcessBuilder<A, M, C, E>
 where
-    A: Default + Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
+    A: Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
     M: KameoChildProcessMessage + Send + Sync + 'static,
     <A as Message<M>>::Reply:
         Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
