@@ -1,7 +1,4 @@
 import sys, os
-print("[TEST DEBUG] PYTHON EXECUTABLE:", sys.executable)
-print("[TEST DEBUG] PYTHONPATH:", os.environ.get("PYTHONPATH"))
-print("[TEST DEBUG] sys.path:", sys.path)
 import dspy
 import mlflow.dspy
 import asyncio
@@ -28,8 +25,7 @@ class TraderResponse:
     OrderResult: str = None
     Error: str = None
 
-
-print(f"[TEST DEBUG] OPENROUTER_API_KEY: {os.environ.get('OPENROUTER_API_KEY')}")
+print(f"[DEBUG] OPENROUTER_API_KEY: {os.environ.get('OPENROUTER_API_KEY')}")
 
 import dspy
 import mlflow.dspy
@@ -41,51 +37,63 @@ try:
         allow_tool_async_sync_conversion=True,
     )
     dspy.configure(lm=lm)
-    print("[TEST DEBUG] DSPy LM initialized successfully!")
+    print("[DEBUG] DSPy LM initialized successfully!")
 except Exception as e:
-    print(f"[TEST DEBUG] DSPy LM initialization failed: {e}")
+    print(f"[DEBUG] DSPy LM initialization failed: {e}")
 
-# Only one tool for now: order_item
-async def order_item(item: str, currency: int):
-    print(f"[TEST DEBUG] order_item called with item={item}, currency={currency}")
+
+# Async order item tool for TraderMessage
+async def order_item_tool(item: str, currency: int) -> str:
     import kameo
-    try:
-        result = await kameo.callback_handle.ask({"OrderDetails": {"item": item, "currency": currency}})
-        print(f"[TEST DEBUG] order_item result: {result}")
-        return f"Order for {item} ({currency} units) complete: {result}"
-    except Exception as e:
-        print(f"[TEST DEBUG] order_item exception: {e}")
-        raise
+    print(f"[DEBUG] order_item TOOL called with item={item}, currency={currency}")
+    # Call the callback with the correct protocol: {"value": currency}
+    callback_result = await kameo.callback_handle({"value": currency})
+    print(f"[DEBUG] order_item TOOL got callback_result={callback_result}")
+    return f"Order for {item} ({currency} units) complete: callback returned {callback_result}"
+
+order_item = dspy.Tool(order_item_tool)
+
+# Async callback roundtrip tool for TraderCallbackMessage
+async def callback_roundtrip_tool(message: dict) -> dict:
+    import kameo
+    value = message["CallbackRoundtrip"]["value"]
+    print(f"[DEBUG] callback_roundtrip TOOL called with value={value}")
+    result = await kameo.callback_handle({"value": value})
+    print(f"[DEBUG] callback_roundtrip TOOL got result={result}")
+    return {"CallbackRoundtripResult": {"value": result}}
+
+callback_roundtrip = dspy.Tool(callback_roundtrip_tool)
+
+class TraderAgent(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.order_item = order_item
+        self.callback_roundtrip = callback_roundtrip
+
+    async def forward(self, message):
+        print(f"[DEBUG] TraderAgent.forward ENTRY: message={{message}}")
+        if "OrderDetails" in message:
+            try:
+                item = message["OrderDetails"]["item"]
+                currency = message["OrderDetails"]["currency"]
+                result = await self.order_item.acall(item=item, currency=currency)
+                print(f"[DEBUG] TraderAgent returning: {{'OrderResult': {{'result': result}}}}")
+                return {"OrderResult": {"result": result}}
+            except Exception as e:
+                print(f"[DEBUG] TraderAgent exception: {e}")
+                return {"Error": {"error": str(e)}}
+        elif "CallbackRoundtrip" in message:
+            return await self.callback_roundtrip.acall(message)
+        else:
+            print(f"[DEBUG] TraderAgent unknown message: {message}")
+            return {"Error": {"error": f"Unknown message: {message}"}}
 
 async def handle_message(message):
-    import asyncio
-    import sys
-    print(f"[TEST DEBUG] handle_message ENTRY: thread={threading.get_ident()} sys.version={sys.version}")
-    try:
-        loop = asyncio.get_running_loop()
-        print(f"[TEST DEBUG] Running loop: {loop} thread={threading.get_ident()} loop.is_running={loop.is_running()} loop.id={id(loop)}")
-    except RuntimeError:
-        print(f"[TEST DEBUG] No running event loop! thread={threading.get_ident()}")
-    try:
-        task = asyncio.current_task()
-        print(f"[TEST DEBUG] Current asyncio task: {task}")
-    except Exception as e:
-        print(f"[TEST DEBUG] No current asyncio task: {e}")
-    print(f"[TEST DEBUG] handle_message called with: {message}")
-    try:
-        if "OrderDetails" in message:
-            args = message["OrderDetails"]
-            result = await order_item(args["item"], args["currency"])
-            print(f"[TEST DEBUG] handle_message returning: {{'OrderResult': result}}")
-            return {"OrderResult": result}
-        else:
-            print(f"[TEST DEBUG] handle_message unknown message: {message}")
-            return {"Error": f"Unknown message: {message}"}
-    except Exception as e:
-        print(f"[TEST DEBUG] handle_message exception: {e}")
-        return {"Error": str(e)}
+    print(f"[DEBUG] handle_message ENTRY: thread={{threading.get_ident()}} message={{message}}")
+    agent = TraderAgent()
+    return await agent.forward(message)
 
 # if __name__ == "__main__":
 #     main()
 
-print("[TEST DEBUG] MODULE LOADED:", __name__, "sys.path:", sys.path) 
+print("[DEBUG] MODULE LOADED:", __name__, "sys.path:", __import__('sys').path) 

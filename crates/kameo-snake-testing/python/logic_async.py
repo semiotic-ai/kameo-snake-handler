@@ -6,8 +6,7 @@ import logging
 import asyncio
 from typing import Dict, Any
 import os
-
-from ork_logic import (
+from logic import (
     calculate_power, calculate_category_bonus, 
     calculate_competition_result, calculate_reward,
     LogicError

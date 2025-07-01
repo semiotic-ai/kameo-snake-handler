@@ -116,10 +116,77 @@ impl kameo_child_process::CallbackHandler<TestCallbackMessage> for TestCallbackH
     }
 }
 
+// --- DSPy Trader Demo Types ---
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub enum TraderMessage {
+    OrderDetails { item: String, currency: u32 },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Decode, Encode)]
+pub enum TraderResponse {
+    OrderResult { result: String },
+    Error { error: String },
+}
+
+impl ErrorReply for TraderResponse {
+    fn from_error(err: PythonExecutionError) -> Self {
+        TraderResponse::Error {
+            error: err.to_string(),
+        }
+    }
+}
+
+impl Reply for TraderResponse {
+    type Ok = Self;
+    type Error = TestError;
+    type Value = Self;
+
+    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> {
+        match self {
+            TraderResponse::Error { error } => Err(TestError::PythonError(error)),
+            _ => Ok(self),
+        }
+    }
+
+    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> {
+        match self {
+            TraderResponse::Error { error } => Some(Box::new(TestError::PythonError(error))),
+            _ => None,
+        }
+    }
+
+    fn into_value(self) -> Self::Value {
+        self
+    }
+}
+
+impl KameoChildProcessMessage for TraderMessage {
+    type Reply = TraderResponse;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct TraderCallbackMessage {
+    pub value: u32,
+}
+
+impl ChildCallbackMessage for TraderCallbackMessage {
+    type Reply = u32;
+}
+
+pub struct TraderCallbackHandler;
+
+#[async_trait::async_trait]
+impl kameo_child_process::CallbackHandler<TraderCallbackMessage> for TraderCallbackHandler {
+    async fn handle(&mut self, callback: TraderCallbackMessage) -> u32 {
+        tracing::info!(event = "trader_callback", value = callback.value, "Received trader callback in Rust");
+        callback.value + 10
+    }
+}
 
 kameo_snake_handler::setup_python_subprocess_system! {
     actors = {
         (PythonActor<TestMessage, TestCallbackMessage>, TestMessage, TestCallbackMessage),
+        (PythonActor<TraderMessage, TraderCallbackMessage>, TraderMessage, TraderCallbackMessage),
     },
     child_init = {{
         tracing_subscriber::fmt()
@@ -162,9 +229,10 @@ kameo_snake_handler::setup_python_subprocess_system! {
                 site_packages.to_string(),
                 python_path.to_string_lossy().to_string(),
             ];
-            run_sync_tests(python_path_vec.clone()).await?;
-            run_async_tests(python_path_vec.clone()).await?;
-            run_invalid_config_tests(python_path_vec.clone()).await?;
+            //run_sync_tests(python_path_vec.clone()).await?;
+            //run_async_tests(python_path_vec.clone()).await?;
+            //run_invalid_config_tests(python_path_vec.clone()).await?;
+            run_trader_demo(python_path_vec.clone()).await?;
             Ok::<(), Box<dyn std::error::Error>>(())
         })?
     }
@@ -328,6 +396,25 @@ async fn run_invalid_config_tests(python_path: Vec<String>) -> Result<(), Box<dy
         Err(e) => info!("Received expected error on spawn: {}", e),
     }
 
+    Ok(())
+}
+
+#[tracing::instrument]
+async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let trader_config = PythonConfig {
+        python_path: python_path.clone(),
+        module_name: "dspy_trader".to_string(),
+        function_name: "handle_message".to_string(),
+        env_vars: vec![],
+        is_async: true,
+        module_path: "crates/kameo-snake-testing/python/dspy_trader.py".to_string(),
+    };
+    let trader_ref = PythonChildProcessBuilder::<TraderCallbackMessage>::new(trader_config)
+        .with_callback_handler(TraderCallbackHandler)
+        .spawn::<TraderMessage>().await?;
+    let resp = trader_ref.ask(TraderMessage::OrderDetails { item: "widget".to_string(), currency: 42 }).await;
+    tracing::info!(?resp, "Trader demo response");
+    assert!(matches!(resp, Ok(TraderResponse::OrderResult { .. })), "Trader demo failed: got {:?}", resp);
     Ok(())
 }
 

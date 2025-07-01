@@ -133,7 +133,7 @@ where
         use pyo3::prelude::*;
         use pyo3_async_runtimes::tokio::into_future;
 
-        tracing::debug!(event = "python_call", step = "serialize", "Serializing Rust message to Python");
+        tracing::debug!(event = "python_call", step = "serialize", m = ?msg, "Serializing Rust message to Python");
         let is_async = self.config.is_async;
         let function_name = self.config.function_name.clone();
         let py_function = &self.py_function;
@@ -213,6 +213,15 @@ where
     // Callback handle is set and injected in the macro branch for the child process
     let mut actor = actor.init_with_runtime().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     tracing::info!("running child actor loop");
-    run_child_actor_loop::<PythonActor<M, C>, M>(&mut actor, request_conn).await?;
+    match run_child_actor_loop(&mut actor, request_conn).await {
+        Ok(()) => {},
+        Err(kameo_child_process::ChildProcessLoopError::ChildProcessClosedCleanly) => {
+            tracing::info!("Child process exited cleanly.");
+        },
+        Err(kameo_child_process::ChildProcessLoopError::Io(e)) => {
+            tracing::error!(error = ?e, "Child process IO error");
+            return Err(Box::new(e));
+        }
+    }
     Ok(())
 } 

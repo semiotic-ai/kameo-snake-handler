@@ -16,22 +16,21 @@ use opentelemetry::global;
 use opentelemetry::Context as OTelContext;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tracing::trace;
+use tracing::{debug, error, info, warn, instrument, Level};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use uuid::Uuid;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex;
+use thiserror::Error;
+use tokio::time::Duration;
+use parity_tokio_ipc::Endpoint;
+use std::process::Stdio;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
-use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
-use tracing::{debug, error, instrument, warn, Level};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-use uuid::Uuid;
-use tokio::time::Duration;
-use parity_tokio_ipc::Endpoint;
-use std::process::Stdio;
 
 pub use callback::{CallbackHandle, ChildCallbackMessage, CallbackSender, CallbackReceiver, CallbackHandler, NoopCallbackHandler};
 
@@ -339,7 +338,7 @@ where
 
         // Strictly ordered handshake: accept request, then callback
         tracing::debug!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent waiting for request connection");
-        let mut request_conn = match tokio::time::timeout(Duration::from_secs(3), request_incoming.next()).await {
+        let mut request_conn = match tokio::time::timeout(Duration::from_secs(30), request_incoming.next()).await {
             Ok(Some(Ok(conn))) => {
                 tracing::debug!(event = "handshake_accept",  which = "request", socket = %request_socket_path.to_string_lossy(), "Parent accepted request connection");
                 conn
@@ -364,7 +363,7 @@ where
         perform_handshake::<M, E>(&mut request_conn, true).await.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Handshake failed: {e:?}")))?;
         // After accepting request connection and handshake, proceed directly
         tracing::debug!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent waiting for callback connection");
-        let callback_conn = match tokio::time::timeout(Duration::from_secs(10), callback_incoming.next()).await {
+        let callback_conn = match tokio::time::timeout(Duration::from_secs(30), callback_incoming.next()).await {
             Ok(Some(Ok(conn))) => {
                 tracing::debug!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent accepted callback connection");
                 conn
@@ -400,28 +399,40 @@ pub trait ChildProcessMessageHandler<Msg>: Send + 'static {
 }
 
 /// Run the IPC handler loop in the child process. No ActorRef, no Clone, no spawn, just handle messages.
+#[derive(Debug)]
+pub enum ChildProcessLoopError {
+    Io(std::io::Error),
+    ChildProcessClosedCleanly,
+}
+
+impl From<std::io::Error> for ChildProcessLoopError {
+    fn from(e: std::io::Error) -> Self {
+        ChildProcessLoopError::Io(e)
+    }
+}
+
 pub async fn run_child_actor_loop<A, M>(
     actor: &mut A,
     mut conn: Box<dyn AsyncReadWrite>,
-) -> std::io::Result<()> 
+) -> Result<(), ChildProcessLoopError>
 where
     A: ChildProcessMessageHandler<M> + Send + 'static,
     M: KameoChildProcessMessage + Send + 'static,
     A::Reply: serde::Serialize + bincode::Encode + std::fmt::Debug + 'static,
 {
-    use tracing::{debug, error, trace};
+    use tracing::{debug, error, info, trace};
     debug!(event = "lifecycle", status = "running", "Child IPC handler loop started");
     loop {
         let mut buf = vec![0u8; 4096];
         let n = match conn.read(&mut buf).await {
             Ok(0) => {
-                error!(event = "lifecycle", status = "shutdown", "Child process closed connection, shutting down handler");
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, "Child process closed connection"));
+                info!(event = "lifecycle", status = "shutdown", "Child process closed connection, shutting down handler");
+                return Err(ChildProcessLoopError::ChildProcessClosedCleanly);
             }
             Ok(n) => n,
             Err(e) => {
                 error!(event = "lifecycle", error = ?e, "Read error");
-                break;
+                return Err(ChildProcessLoopError::Io(e));
             }
         };
         let (msg, trace_context) = {
@@ -440,7 +451,7 @@ where
                         Ok(bytes) => bytes,
                         Err(e) => {
                             error!(event = "handshake", error = ?e, "Failed to encode handshake response");
-                            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to encode handshake response: {e}")));
+                            return Err(ChildProcessLoopError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to encode handshake response: {e}"))));
                         }
                     };
                     conn.write_all(&resp_bytes).await?;
