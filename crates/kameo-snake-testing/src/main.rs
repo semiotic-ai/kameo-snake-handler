@@ -229,9 +229,9 @@ kameo_snake_handler::setup_python_subprocess_system! {
                 site_packages.to_string(),
                 python_path.to_string_lossy().to_string(),
             ];
-            //run_sync_tests(python_path_vec.clone()).await?;
-            //run_async_tests(python_path_vec.clone()).await?;
-            //run_invalid_config_tests(python_path_vec.clone()).await?;
+            run_sync_tests(python_path_vec.clone()).await?;
+            run_async_tests(python_path_vec.clone()).await?;
+            run_invalid_config_tests(python_path_vec.clone()).await?;
             run_trader_demo(python_path_vec.clone()).await?;
             Ok::<(), Box<dyn std::error::Error>>(())
         })?
