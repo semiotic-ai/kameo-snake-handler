@@ -6,7 +6,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use futures::StreamExt;
-use futures::FutureExt;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::{Context, Message};
@@ -23,13 +22,12 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, instrument, warn, Instrument, Level};
+use tracing::{debug, error, instrument, warn, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
-use tokio::time::{Duration, sleep};
-use tokio::process::Command;
+use tokio::time::Duration;
 use parity_tokio_ipc::Endpoint;
 use std::process::Stdio;
 
@@ -161,15 +159,15 @@ pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessActorError {
 
 /// Define a ProtocolError trait for error types used in SubprocessActor
 pub trait ProtocolError: std::fmt::Debug + Send + Sync + 'static {
-    fn Protocol(msg: String) -> Self;
-    fn HandshakeFailed(msg: String) -> Self;
-    fn ConnectionClosed() -> Self;
+    fn protocol(msg: String) -> Self;
+    fn handshake_failed(msg: String) -> Self;
+    fn connection_closed() -> Self;
 }
 
 impl ProtocolError for SubprocessActorIpcError {
-    fn Protocol(msg: String) -> Self { Self::Protocol(msg) }
-    fn HandshakeFailed(msg: String) -> Self { Self::HandshakeFailed(msg) }
-    fn ConnectionClosed() -> Self { Self::ConnectionClosed }
+    fn protocol(msg: String) -> Self { Self::Protocol(msg) }
+    fn handshake_failed(msg: String) -> Self { Self::HandshakeFailed(msg) }
+    fn connection_closed() -> Self { Self::ConnectionClosed }
 }
 
 /// Actor that manages a subprocess and communicates with it via IPC
@@ -728,17 +726,17 @@ where
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::trace!(event = "parent_ipc", step = "encode_failed", error = ?e, "Failed to encode message");
-                    return Err(E::Protocol(format!("Failed to encode message: {e}")));
+                    return Err(E::protocol(format!("Failed to encode message: {e}")));
                 }
             };
             tracing::trace!(event = "parent_ipc", step = "before_write", ?control, raw_bytes = ?msg_bytes, "About to write message to child");
             if let Err(e) = conn.write_all(&msg_bytes).await {
                 tracing::trace!(event = "parent_ipc", step = "write_failed", error = ?e, "Failed to write message to child");
-                return Err(E::Protocol(format!("Failed to write message: {e}")));
+                return Err(E::protocol(format!("Failed to write message: {e}")));
             }
             if let Err(e) = conn.flush().await {
                 tracing::trace!(event = "parent_ipc", step = "flush_failed", error = ?e, "Failed to flush message to child");
-                return Err(E::Protocol(format!("Failed to flush message: {e}")));
+                return Err(E::protocol(format!("Failed to flush message: {e}")));
             }
             tracing::trace!(event = "parent_ipc", step = "after_write", "Wrote message to child, about to read response");
 
@@ -749,13 +747,13 @@ where
                 Ok(n) => n,
                 Err(e) => {
                     tracing::trace!(event = "parent_ipc", step = "read_failed", error = ?e, "Failed to read response from child");
-                    return Err(E::Protocol(format!("Failed to read response: {e}")));
+                    return Err(E::protocol(format!("Failed to read response: {e}")));
                 }
             };
 
             if n == 0 {
                 tracing::trace!(event = "parent_ipc", step = "connection_closed", "Child closed connection while waiting for response");
-                return Err(E::ConnectionClosed());
+                return Err(E::connection_closed());
             }
 
             tracing::trace!(event = "parent_ipc", step = "after_read", raw_bytes = ?&resp_buf[..n], "Read response from child, about to decode");
@@ -764,13 +762,13 @@ where
                 Ok((ctrl, len)) => (ctrl, len),
                 Err(e) => {
                     tracing::trace!(event = "parent_ipc", step = "decode_failed", error = ?e, "Failed to decode response from child");
-                    return Err(E::Protocol(format!("Failed to decode response: {e}")));
+                    return Err(E::protocol(format!("Failed to decode response: {e}")));
                 }
             };
             tracing::trace!(event = "parent_ipc", step = "after_decode", ?control, "Decoded response from child");
 
             match control {
-                Control::Handshake => Err(E::Protocol(
+                Control::Handshake => Err(E::protocol(
                     "Unexpected handshake response".into(),
                 )),
                 Control::Real(reply, _trace_context) => reply,
@@ -804,40 +802,40 @@ where
         // Parent sends handshake
         let handshake_msg = Control::<M>::Handshake;
         let handshake_bytes = encode_to_vec(&handshake_msg, bincode::config::standard())
-            .map_err(|e| E::Protocol(format!("Failed to encode handshake: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to encode handshake: {e}")))?;
         conn.write_all(&handshake_bytes).await
-            .map_err(|e| E::Protocol(format!("Failed to write handshake: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to write handshake: {e}")))?;
         // Parent reads handshake response
         let mut resp_buf = vec![0u8; 1024];
         let n = conn.read(&mut resp_buf).await
-            .map_err(|e| E::Protocol(format!("Failed to read handshake response: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to read handshake response: {e}")))?;
         if n == 0 {
-            return Err(E::HandshakeFailed("Connection closed during handshake".into()));
+            return Err(E::handshake_failed("Connection closed during handshake".into()));
         }
         let (resp, _): (Control<M>, _) = decode_from_slice(&resp_buf[..n], bincode::config::standard())
-            .map_err(|e| E::Protocol(format!("Failed to decode handshake response: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to decode handshake response: {e}")))?;
         if !resp.is_handshake() {
-            return Err(E::HandshakeFailed("Invalid handshake response".into()));
+            return Err(E::handshake_failed("Invalid handshake response".into()));
         }
     } else {
         // Child reads handshake
         let mut buf = vec![0u8; 1024];
         let n = conn.read(&mut buf).await
-            .map_err(|e| E::Protocol(format!("Failed to read handshake: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to read handshake: {e}")))?;
         if n == 0 {
-            return Err(E::HandshakeFailed("Connection closed during handshake".into()));
+            return Err(E::handshake_failed("Connection closed during handshake".into()));
         }
         let (handshake, _): (Control<M>, _) = decode_from_slice(&buf[..n], bincode::config::standard())
-            .map_err(|e| E::Protocol(format!("Failed to decode handshake: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to decode handshake: {e}")))?;
         if !handshake.is_handshake() {
-            return Err(E::HandshakeFailed("Invalid handshake message".into()));
+            return Err(E::handshake_failed("Invalid handshake message".into()));
         }
         // Child sends handshake response
         let resp = Control::<M>::Handshake;
         let resp_bytes = encode_to_vec(&resp, bincode::config::standard())
-            .map_err(|e| E::Protocol(format!("Failed to encode handshake response: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to encode handshake response: {e}")))?;
         conn.write_all(&resp_bytes).await
-            .map_err(|e| E::Protocol(format!("Failed to write handshake response: {e}")))?;
+            .map_err(|e| E::handshake_failed(format!("Failed to write handshake response: {e}")))?;
     }
     Ok(())
 }

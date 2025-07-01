@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "pyo3_async_minimal_test"]
+members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]

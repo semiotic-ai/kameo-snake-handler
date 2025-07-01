@@ -1199,18 +1199,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyo3_async_minimal_test"
-version = "0.1.0"
-dependencies = [
- "console-subscriber",
- "pyo3",
- "pyo3-async-runtimes",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

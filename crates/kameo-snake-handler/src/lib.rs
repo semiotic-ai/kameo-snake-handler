@@ -1,35 +1,25 @@
-use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
-use std::thread;
-use std::process;
-use std::fs;
-use std::ffi::CString;
-use std::any::TypeId;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
-use kameo::message::{Context, Message};
+use kameo::message::Message;
 use kameo_child_process::{
-    CallbackHandle, CallbackHandler, ChildCallbackMessage, ChildProcessBuilder, KameoChildProcessMessage, SubprocessActor, RuntimeConfig, RuntimeFlavor, RuntimeAware
+    CallbackHandle, CallbackHandler, ChildCallbackMessage, KameoChildProcessMessage, RuntimeAware
 };
 use pyo3::exceptions::{
     PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
     PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::pyclass;
-use pyo3::pymethods;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, info, instrument, Level};
+use tracing::{error, instrument, Level};
 use pyo3::Python;
 use kameo_child_process::ChildProcessMessageHandler;
-use kameo_child_process::run_child_actor_loop;
-use once_cell::sync::OnceCell;
 #[macro_export]
 macro_rules! declare_callback_glue {
     ($type:ty) => {
@@ -555,7 +545,7 @@ pub mod prelude {
 /// Python-specific child process main entrypoint. Does handshake, sets callback, calls init_with_runtime, and runs the actor loop.
 // NOTE: We do NOT bound Reply here, as it's private and PythonExecutionError is already fully serializable and debuggable.
 #[instrument(skip(actor, request_conn), name = "child_process_main_with_python_actor")]
-pub async fn child_process_main_with_python_actor<M, C>(mut actor: PythonActor<M, C>, mut request_conn: Box<dyn kameo_child_process::AsyncReadWrite>) -> Result<(), Box<dyn std::error::Error>>
+pub async fn child_process_main_with_python_actor<M, C>(actor: PythonActor<M, C>, mut request_conn: Box<dyn kameo_child_process::AsyncReadWrite>) -> Result<(), Box<dyn std::error::Error>>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     C: kameo_child_process::ChildCallbackMessage + Send + 'static,
@@ -568,7 +558,7 @@ where
         + std::fmt::Debug
         + 'static,
 {
-    use kameo_child_process::{run_child_actor_loop, perform_handshake, ProtocolError};
+    use kameo_child_process::{run_child_actor_loop, perform_handshake};
     tracing::info!("child_process_main_with_python_actor: about to handshake");
     // Perform handshake as child
     perform_handshake::<M, crate::PythonExecutionError>(&mut request_conn, false).await?;
@@ -663,13 +653,13 @@ where
 }
 
 impl kameo_child_process::ProtocolError for PythonExecutionError {
-    fn Protocol(msg: String) -> Self {
+    fn protocol(msg: String) -> Self {
         PythonExecutionError::ExecutionError { message: msg }
     }
-    fn HandshakeFailed(msg: String) -> Self {
+    fn handshake_failed(msg: String) -> Self {
         PythonExecutionError::ExecutionError { message: format!("Handshake failed: {msg}") }
     }
-    fn ConnectionClosed() -> Self {
+    fn connection_closed() -> Self {
         PythonExecutionError::ExecutionError { message: "Connection closed".to_string() }
     }
 }
