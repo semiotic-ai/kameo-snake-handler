@@ -52,7 +52,7 @@ where
 {
     type Error = PythonExecutionError;
 
-    #[instrument(skip(self, _actor_ref), fields(actor_type = "PythonActor"))]
+    #[instrument(skip(self, _actor_ref), fields(actor_type = "PythonActor"), parent = tracing::Span::current())]
     fn on_start(
         &mut self,
         _actor_ref: ActorRef<Self>,
@@ -63,7 +63,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "PythonActor"))]
+    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "PythonActor"), parent = tracing::Span::current())]
     fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
@@ -75,7 +75,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "PythonActor"))]
+    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "PythonActor"), parent = tracing::Span::current())]
     fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
@@ -95,19 +95,24 @@ where
     M: KameoChildProcessMessage + Send + 'static,
 {
     type Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>;
-    #[tracing::instrument(skip(self, _ctx, message), fields(actor_type = "PythonActor", message_type = std::any::type_name::<M>()))]
+    #[tracing::instrument(skip(self, _ctx, message), fields(actor_type = "PythonActor", message_type = std::any::type_name::<M>()), parent = tracing::Span::current())]
     fn handle(
         &mut self,
         message: M,
         _ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) -> impl std::future::Future<Output = Self::Reply> + Send {
-        tracing::trace!(
-            event = "actor_recv",
-            step = "handle_child_message",
-            message_type = std::any::type_name::<M>(),
-            "PythonActor received message"
-        );
-        self.handle_child_message(message)
+        let span = tracing::info_span!("parent_message_handle", process_role = "parent");
+        let fut = async move {
+            let _enter = span.enter();
+            tracing::trace!(
+                event = "actor_recv",
+                step = "handle_child_message",
+                message_type = std::any::type_name::<M>(),
+                "PythonActor received message"
+            );
+            self.handle_child_message(message).await
+        };
+        fut
     }
 }
 
@@ -222,7 +227,8 @@ where
 /// Python-specific child process main entrypoint. Does handshake, sets callback, calls init_with_runtime, and runs the actor loop.
 #[instrument(
     skip(actor, request_conn),
-    name = "child_process_main_with_python_actor"
+    name = "child_process_main_with_python_actor",
+    parent = tracing::Span::current()
 )]
 pub async fn child_process_main_with_python_actor<M, C>(
     actor: PythonActor<M, C>,

@@ -2,54 +2,27 @@
 macro_rules! declare_callback_glue {
     ($type:ty) => {
         use kameo_snake_handler::serde_py::{from_pyobject, to_pyobject};
-        static CALLBACK_HANDLE: once_cell::sync::OnceCell<
-            std::sync::Arc<kameo_child_process::CallbackHandle<$type>>,
-        > = once_cell::sync::OnceCell::new();
+        static CALLBACK_HANDLE: once_cell::sync::OnceCell<std::sync::Arc<kameo_child_process::CallbackHandle<$type>>> = once_cell::sync::OnceCell::new();
 
         pub fn register_callback_glue(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
             use kameo_snake_handler::serde_py::{from_pyobject, to_pyobject};
             #[pyo3::pyfunction]
-            fn callback_handle(
-                py: pyo3::Python<'_>,
-                py_msg: &pyo3::Bound<'_, pyo3::PyAny>,
-            ) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-                let handle = CALLBACK_HANDLE.get().cloned().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("Callback handle not initialized yet")
-                })?;
+            fn callback_handle(py: pyo3::Python<'_>, py_msg: &pyo3::Bound<'_, pyo3::PyAny>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
+                let handle = CALLBACK_HANDLE.get().cloned().ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Callback handle not initialized yet"))?;
                 let msg = match from_pyobject::<$type>(py_msg.as_ref()) {
                     Ok(m) => m,
-                    Err(e) => {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "Failed to parse callback: {e}"
-                        )))
-                    }
+                    Err(e) => return Err(pyo3::exceptions::PyValueError::new_err(format!("Failed to parse callback: {e}"))),
                 };
                 pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                    tracing::trace!(
-                        event = "child_callback_send",
-                        ?msg,
-                        "About to send callback message from child to parent"
-                    );
+                    tracing::trace!(event = "child_callback_send", ?msg, "About to send callback message from child to parent");
                     let reply = handle.ask(msg).await;
-                    tracing::trace!(
-                        event = "child_callback_send",
-                        ?reply,
-                        "Received reply from parent callback handler"
-                    );
+                    tracing::trace!(event = "child_callback_send", ?reply, "Received reply from parent callback handler");
                     match reply {
-                        Ok(val) => pyo3::Python::with_gil(|py| {
-                            to_pyobject(py, &val).map_err(|e| {
-                                pyo3::exceptions::PyValueError::new_err(format!(
-                                    "Failed to serialize reply: {e}"
-                                ))
-                            })
-                        }),
-                        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Callback error: {e:?}"
-                        ))),
+                        Ok(val) => pyo3::Python::with_gil(|py| to_pyobject(py, &val)
+                            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize reply: {e}")))),
+                        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Callback error: {e:?}"))),
                     }
-                })
-                .map(|bound| bound.unbind())
+                }).map(|bound| bound.unbind())
             }
             let py_func = pyo3::wrap_pyfunction!(callback_handle, py)?;
             let sys = py.import("sys")?;
@@ -69,9 +42,7 @@ macro_rules! declare_callback_glue {
             Ok(())
         }
 
-        pub fn set_callback_handle(
-            handle: std::sync::Arc<kameo_child_process::CallbackHandle<$type>>,
-        ) {
+        pub fn set_callback_handle(handle: std::sync::Arc<kameo_child_process::CallbackHandle<$type>>) {
             let _ = CALLBACK_HANDLE.set(handle);
         }
     };
@@ -114,7 +85,7 @@ macro_rules! setup_python_subprocess_system {
                             kameo_snake_handler::setup_python_runtime(builder);
                             tracing::trace!(event = "child_entry", step = "before_gil", "Child about to enter GIL and Python setup");
                             pyo3::Python::with_gil(|py| {
-
+                                
                                 tracing::trace!(event = "child_entry", step = "in_gil", "Child inside GIL, about to import module and function");
                                 let config_json = std::env::var("KAMEO_PYTHON_CONFIG").expect("KAMEO_PYTHON_CONFIG must be set in child");
                                 let config: kameo_snake_handler::PythonConfig = serde_json::from_str(&config_json).expect("Failed to parse KAMEO_PYTHON_CONFIG");
@@ -136,7 +107,8 @@ macro_rules! setup_python_subprocess_system {
                                 });
                                 debug!(?rust_thread_id, py_thread_id, "Thread IDs at start of async block");
                                 tracing::trace!(event = "child_entry", step = "before_async_block", "Child about to enter async block");
-                                pyo3_async_runtimes::tokio::run(py, async move {
+                                let root_span = tracing::info_span!("child_process", process_role = "child");
+                                let result = pyo3_async_runtimes::tokio::run(py, (async move {
                                     let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
                                         TelemetryExportConfig {
                                             otlp_enabled: true,
@@ -144,7 +116,6 @@ macro_rules! setup_python_subprocess_system {
                                         }
                                     ).await;
                                     tracing::subscriber::set_global_default(subscriber).expect("set global");
-                                    tracing::trace!(event = "child_entry", step = "in_async_block", "Setup OpenTelemetry trace exporter");
                                     tracing::trace!(event = "child_entry", step = "in_async_block", "Child inside async block, about to connect sockets");
                                     let request_socket_path = std::env::var("KAMEO_REQUEST_SOCKET").unwrap_or_else(|_| "<unset>".to_string());
                                     tracing::info!(event = "child_handshake", step = "before_child_request", socket = %request_socket_path, "Child about to connect to request socket");
@@ -159,7 +130,6 @@ macro_rules! setup_python_subprocess_system {
                                         }
                                     };
                                     let callback_conn = kameo_child_process::child_callback().await.expect("child_callback handshake failed");
-                                    tracing::debug!("in async block, after tracing subscriber setup");
                                     let handle = kameo_child_process::CallbackHandle::new(callback_conn);
                                     set_callback_handle(std::sync::Arc::new(handle));
                                     info!("Child connected to both sockets and set callback handle");
@@ -168,8 +138,8 @@ macro_rules! setup_python_subprocess_system {
                                     let result = $crate::child_process_main_with_python_actor::<$msg, $callback>(actor, request_conn).await;
                                     tracing::trace!(event = "child_entry", step = "after_main_actor", ?result, "Child returned from child_process_main_with_python_actor");
                                     result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
-                                })
-                                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+                                }).instrument(root_span));
+                                result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
                             })
                         }
                     ),
@@ -201,4 +171,4 @@ macro_rules! setup_python_subprocess_system {
             parent_init = $parent_init,
         }
     };
-}
+} 

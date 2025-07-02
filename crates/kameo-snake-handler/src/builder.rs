@@ -3,6 +3,7 @@ use crate::NoopCallbackHandler;
 use kameo_child_process::{CallbackHandler, ChildCallbackMessage, KameoChildProcessMessage};
 use std::marker::PhantomData;
 use tracing::Level;
+use tracing_futures::Instrument;
 
 /// Builder for a Python child process
 /// NOTE: For PythonActor, use the macro-based entrypoint (setup_python_subprocess_system!). This builder is not supported for PythonActor.
@@ -112,7 +113,7 @@ where
             step = "after_builder_spawn",
             "Returned from builder.spawn, about to spawn callback_receiver.run()"
         );
-        tokio::spawn(callback_receiver.run());
+        tokio::spawn(callback_receiver.run().instrument(tracing::Span::current()));
         tracing::trace!(
             event = "py_spawn",
             step = "after_callback_spawn",

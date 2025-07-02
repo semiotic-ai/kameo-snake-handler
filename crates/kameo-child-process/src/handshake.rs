@@ -17,7 +17,7 @@ pub fn unique_socket_path(actor_name: &str) -> PathBuf {
     path
 }
 
-#[instrument(skip(exe), fields(actor_name))]
+#[instrument(skip(exe), fields(actor_name), parent = tracing::Span::current())]
 pub async fn host<M, R>(
     actor_name: &str,
     exe: &str,
@@ -57,7 +57,7 @@ where
     Ok((Box::new(conn), child, socket_path))
 }
 
-#[instrument(fields(pid= std::process::id(), actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
+#[instrument(fields(pid= std::process::id(), actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()), parent = tracing::Span::current())]
 pub async fn child_request() -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let req_env = std::env::var("KAMEO_REQUEST_SOCKET");
     let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");
@@ -77,7 +77,7 @@ pub async fn child_request() -> std::io::Result<Box<dyn AsyncReadWrite>> {
     Ok(Box::new(stream) as Box<dyn AsyncReadWrite>)
 }
 
-#[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()))]
+#[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()), parent = tracing::Span::current())]
 pub async fn child_callback() -> std::io::Result<Box<dyn AsyncReadWrite>> {
     let pid = std::process::id();
     let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");

@@ -137,7 +137,7 @@ where
 {
     type Error = E;
 
-    #[instrument(skip(self, _actor_ref), fields(actor_type = "SubprocessActor"))]
+    #[instrument(skip(self, _actor_ref), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
     fn on_start(
         &mut self,
         _actor_ref: ActorRef<Self>,
@@ -149,7 +149,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "SubprocessActor"))]
+    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
     fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
@@ -175,7 +175,7 @@ where
         }
     }
 
-    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "SubprocessActor"))]
+    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
     fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
@@ -562,7 +562,8 @@ where
         let span = tracing::info_span!(
             "child_message_handler",
             event = "message",
-            handler = "child"
+            handler = "child",
+            process_role = "child"
         );
         span.set_parent(parent_cx);
         trace!(event = "message", status = "handling", handler = "child");
@@ -612,7 +613,7 @@ where
 {
     type Reply = Result<<M as KameoChildProcessMessage>::Reply, E>;
 
-    #[instrument(skip(self, _ctx), fields(actor_type = "SubprocessActor"))]
+    #[instrument(skip(self, _ctx), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
     fn handle(
         &mut self,
         msg: M,

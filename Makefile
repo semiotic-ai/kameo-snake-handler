@@ -25,6 +25,6 @@ run:
 	PYTHONPATH=`$$PYTHON_BIN -c 'import site; print(site.getsitepackages()[0])'`:crates/kameo-snake-testing/python \
 	PATH=crates/kameo-snake-testing/python/venv/bin:$$PATH \
 	PYTHON_GIL=1 \
-	RUST_LOG=trace cargo run -p kameo-snake-testing
+	cargo run -p kameo-snake-testing
 
 .PHONY: pyenv install clean run 

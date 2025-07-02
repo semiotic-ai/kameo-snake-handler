@@ -222,7 +222,7 @@ where
             let parent_cx = global::get_text_map_propagator(|propagator| {
                 propagator.extract(&wrapped_msg.context.0)
             });
-            let span = tracing::info_span!("callback_handler");
+            let span = tracing::info_span!("callback_handler", process_role = "child");
             span.set_parent(parent_cx);
             let reply = self
                 .handler

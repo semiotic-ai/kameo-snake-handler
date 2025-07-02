@@ -12,6 +12,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time::timeout;
 use tracing::{error, info};
+use tracing_futures::Instrument;
 
 /// Custom error type for logic operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -227,7 +228,7 @@ kameo_snake_handler::setup_python_subprocess_system! {
             .worker_threads(2)
             .thread_name("test-main")
             .enable_all()
-            .build()?;
+            .build().unwrap();
 
         runtime.block_on(async {
             // Use OpenTelemetry + fmt subscriber, respects RUST_LOG/env_filter
