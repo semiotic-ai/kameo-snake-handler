@@ -1,10 +1,10 @@
 use super::*;
 use futures::StreamExt;
-use tokio::process::Command;
-use uuid::Uuid;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio::process::Command;
 use tracing::{debug, error, instrument};
-use serde::{Serialize, Deserialize};
+use uuid::Uuid;
 
 pub fn unique_socket_path(actor_name: &str) -> PathBuf {
     let mut path = std::path::PathBuf::from("/tmp");
@@ -46,7 +46,10 @@ where
 
     debug!(status = "waiting", actor_type = actor_name);
     let conn = incoming.next().await.transpose()?.ok_or_else(|| {
-        error!(actor_type = actor_name, message = "No child connection received");
+        error!(
+            actor_type = actor_name,
+            message = "No child connection received"
+        );
         std::io::Error::new(std::io::ErrorKind::Other, "No child connection")
     })?;
 
@@ -93,4 +96,4 @@ pub async fn child_callback() -> std::io::Result<Box<dyn AsyncReadWrite>> {
     debug!(pid = pid, which = "callback", socket_path = %socket_path, "Child attempting to connect to callback socket");
     let stream = parity_tokio_ipc::Endpoint::connect(&socket_path).await?;
     Ok(Box::new(stream) as Box<dyn AsyncReadWrite>)
-} 
+}

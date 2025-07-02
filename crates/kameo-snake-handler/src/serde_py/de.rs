@@ -1,13 +1,12 @@
 use pyo3::{
     prelude::*,
-    types::{
-        PyAny, PyDict, PyList, PyString,
-        PyBool, PyInt, PyFloat,
-    }, FromPyObject,
-    Bound,
+    types::{PyAny, PyBool, PyDict, PyFloat, PyInt, PyList, PyString},
+    Bound, FromPyObject,
 };
-use serde::de::{self, Deserialize, DeserializeSeed, MapAccess, SeqAccess, Visitor, EnumAccess, VariantAccess};
-use tracing::{trace, error, instrument};
+use serde::de::{
+    self, Deserialize, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor,
+};
+use tracing::{error, instrument, trace};
 
 use super::{Error, Result};
 
@@ -80,18 +79,30 @@ where
         } else if self.input.is_instance_of::<PyString>() {
             visitor.visit_string(String::extract_bound(&self.input)?)
         } else if self.input.is_instance_of::<PyList>() {
-            let list = self.input.downcast::<PyList>()
+            let list = self
+                .input
+                .downcast::<PyList>()
                 .map_err(|_| Error::Deserialization("expected list".to_string()))?;
-            visitor.visit_seq(SeqDeserializer { seq: list.clone(), idx: 0 })
+            visitor.visit_seq(SeqDeserializer {
+                seq: list.clone(),
+                idx: 0,
+            })
         } else if self.input.is_instance_of::<PyDict>() {
-            let dict = self.input.downcast::<PyDict>()
+            let dict = self
+                .input
+                .downcast::<PyDict>()
                 .map_err(|_| Error::Deserialization("expected dict".to_string()))?;
-            let keys = dict.keys().iter()
-                .map(|k| k.clone())
-                .collect::<Vec<_>>();
-            visitor.visit_map(MapDeserializer { map: dict.clone(), keys, current_idx: 0 })
+            let keys = dict.keys().iter().map(|k| k.clone()).collect::<Vec<_>>();
+            visitor.visit_map(MapDeserializer {
+                map: dict.clone(),
+                keys,
+                current_idx: 0,
+            })
         } else {
-            Err(Error::Deserialization(format!("unsupported Python type: {}", self.input.get_type().name()?)))
+            Err(Error::Deserialization(format!(
+                "unsupported Python type: {}",
+                self.input.get_type().name()?
+            )))
         }
     }
 
@@ -180,7 +191,9 @@ where
         let mut chars = s.chars();
         match (chars.next(), chars.next()) {
             (Some(c), None) => visitor.visit_char(c),
-            _ => Err(Error::Deserialization("expected single character string".to_string())),
+            _ => Err(Error::Deserialization(
+                "expected single character string".to_string(),
+            )),
         }
     }
 
@@ -235,22 +248,14 @@ where
         }
     }
 
-    fn deserialize_unit_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value>
+    fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
         self.deserialize_unit(visitor)
     }
 
-    fn deserialize_newtype_struct<V>(
-        self,
-        _name: &'static str,
-        visitor: V,
-    ) -> Result<V::Value>
+    fn deserialize_newtype_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
@@ -262,14 +267,19 @@ where
         V: Visitor<'de>,
     {
         if !self.input.is_instance_of::<PyList>() {
-            return Err(Error::Deserialization(format!("expected list, got {}", self.input.get_type().name()?)));
+            return Err(Error::Deserialization(format!(
+                "expected list, got {}",
+                self.input.get_type().name()?
+            )));
         }
-        
-        let list = self.input.downcast::<PyList>()
+
+        let list = self
+            .input
+            .downcast::<PyList>()
             .map_err(|_| Error::Deserialization("expected list".to_string()))?;
-        visitor.visit_seq(SeqDeserializer { 
-            seq: list.clone(), 
-            idx: 0 
+        visitor.visit_seq(SeqDeserializer {
+            seq: list.clone(),
+            idx: 0,
         })
     }
 
@@ -297,19 +307,22 @@ where
         V: Visitor<'de>,
     {
         if !self.input.is_instance_of::<PyDict>() {
-            return Err(Error::Deserialization(format!("expected dict, got {}", self.input.get_type().name()?)));
+            return Err(Error::Deserialization(format!(
+                "expected dict, got {}",
+                self.input.get_type().name()?
+            )));
         }
-        
-        let dict = self.input.downcast::<PyDict>()
+
+        let dict = self
+            .input
+            .downcast::<PyDict>()
             .map_err(|_| Error::Deserialization("expected dict".to_string()))?;
-        let keys = dict.keys().iter()
-            .map(|k| k.clone())
-            .collect::<Vec<_>>();
-            
-        visitor.visit_map(MapDeserializer { 
+        let keys = dict.keys().iter().map(|k| k.clone()).collect::<Vec<_>>();
+
+        visitor.visit_map(MapDeserializer {
             map: dict.clone(),
             keys,
-            current_idx: 0 
+            current_idx: 0,
         })
     }
 
@@ -335,12 +348,10 @@ where
         V: Visitor<'de>,
     {
         let _py = self.input.py();
-        
+
         if let Ok(dict) = self.input.downcast::<PyDict>() {
             if dict.len() == 1 {
-                return visitor.visit_enum(EnumDeserializer {
-                    input: self.input,
-                });
+                return visitor.visit_enum(EnumDeserializer { input: self.input });
             }
         }
 
@@ -383,7 +394,8 @@ where
         let element = self.seq.get_item(self.idx)?;
         self.idx += 1;
 
-        seed.deserialize(PythonDeserializer { input: element }).map(Some)
+        seed.deserialize(PythonDeserializer { input: element })
+            .map(Some)
     }
 }
 
@@ -402,7 +414,8 @@ where
         }
 
         let key = &self.keys[self.current_idx];
-        seed.deserialize(PythonDeserializer { input: key.clone() }).map(Some)
+        seed.deserialize(PythonDeserializer { input: key.clone() })
+            .map(Some)
     }
 
     fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
@@ -410,7 +423,9 @@ where
         V: DeserializeSeed<'de>,
     {
         let key = &self.keys[self.current_idx];
-        let value = self.map.get_item(key)
+        let value = self
+            .map
+            .get_item(key)
             .map_err(|e| Error::Deserialization(format!("failed to get dict item: {}", e)))?
             .ok_or_else(|| Error::Deserialization("missing value for key".to_string()))?;
         self.current_idx += 1;
@@ -430,14 +445,20 @@ where
     where
         V: DeserializeSeed<'de>,
     {
-        let dict = self.input.downcast::<PyDict>()
+        let dict = self
+            .input
+            .downcast::<PyDict>()
             .map_err(|_| Error::Deserialization("expected dict for enum variant".to_string()))?;
-        
-        let (key, _) = dict.iter().next()
+
+        let (key, _) = dict
+            .iter()
+            .next()
             .ok_or_else(|| Error::Deserialization("empty dict for enum variant".to_string()))?;
-        
+
         let key_str = String::extract_bound(&key)?;
-        let variant = seed.deserialize(serde::de::value::StringDeserializer::<Self::Error>::new(key_str))?;
+        let variant = seed.deserialize(
+            serde::de::value::StringDeserializer::<Self::Error>::new(key_str),
+        )?;
         Ok((variant, self))
     }
 }
@@ -456,53 +477,72 @@ where
     where
         T: DeserializeSeed<'de>,
     {
-        let dict = self.input.downcast::<PyDict>()
+        let dict = self
+            .input
+            .downcast::<PyDict>()
             .map_err(|_| Error::Deserialization("expected dict for enum variant".to_string()))?;
-        
-        let (_, value) = dict.iter().next()
+
+        let (_, value) = dict
+            .iter()
+            .next()
             .ok_or_else(|| Error::Deserialization("empty dict for enum variant".to_string()))?;
-        
-        seed.deserialize(PythonDeserializer { input: value.clone() })
+
+        seed.deserialize(PythonDeserializer {
+            input: value.clone(),
+        })
     }
 
     fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let dict = self.input.downcast::<PyDict>()
+        let dict = self
+            .input
+            .downcast::<PyDict>()
             .map_err(|_| Error::Deserialization("expected dict for enum variant".to_string()))?;
-        
-        let (_, value) = dict.iter().next()
+
+        let (_, value) = dict
+            .iter()
+            .next()
             .ok_or_else(|| Error::Deserialization("empty dict for enum variant".to_string()))?;
-        
+
         if let Ok(list) = value.downcast::<PyList>() {
-            visitor.visit_seq(SeqDeserializer { seq: list.clone(), idx: 0 })
+            visitor.visit_seq(SeqDeserializer {
+                seq: list.clone(),
+                idx: 0,
+            })
         } else {
-            Err(Error::Deserialization("expected list for tuple variant".to_string()))
+            Err(Error::Deserialization(
+                "expected list for tuple variant".to_string(),
+            ))
         }
     }
 
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        visitor: V,
-    ) -> Result<V::Value>
+    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let dict = self.input.downcast::<PyDict>()
+        let dict = self
+            .input
+            .downcast::<PyDict>()
             .map_err(|_| Error::Deserialization("expected dict for enum variant".to_string()))?;
-        
-        let (_, value) = dict.iter().next()
+
+        let (_, value) = dict
+            .iter()
+            .next()
             .ok_or_else(|| Error::Deserialization("empty dict for enum variant".to_string()))?;
-        
+
         if let Ok(dict) = value.downcast::<PyDict>() {
-            let keys = dict.keys().iter()
-                .map(|k| k.clone())
-                .collect::<Vec<_>>();
-            visitor.visit_map(MapDeserializer { map: dict.clone(), keys, current_idx: 0 })
+            let keys = dict.keys().iter().map(|k| k.clone()).collect::<Vec<_>>();
+            visitor.visit_map(MapDeserializer {
+                map: dict.clone(),
+                keys,
+                current_idx: 0,
+            })
         } else {
-            Err(Error::Deserialization("expected dict for struct variant".to_string()))
+            Err(Error::Deserialization(
+                "expected dict for struct variant".to_string(),
+            ))
         }
     }
 }
@@ -516,7 +556,9 @@ impl<'de> EnumAccess<'de> for UnitEnumDeserializer {
         V: DeserializeSeed<'de>,
     {
         let variant = std::mem::take(&mut self.variant);
-        let variant_value = seed.deserialize(serde::de::value::StringDeserializer::<Self::Error>::new(variant))?;
+        let variant_value = seed.deserialize(
+            serde::de::value::StringDeserializer::<Self::Error>::new(variant),
+        )?;
         Ok((variant_value, self))
     }
 }
@@ -532,24 +574,26 @@ impl<'de> VariantAccess<'de> for UnitEnumDeserializer {
     where
         T: DeserializeSeed<'de>,
     {
-        Err(Error::Deserialization("unit enum deserializer cannot deserialize newtype variant".to_string()))
+        Err(Error::Deserialization(
+            "unit enum deserializer cannot deserialize newtype variant".to_string(),
+        ))
     }
 
     fn tuple_variant<V>(self, _len: usize, _visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        Err(Error::Deserialization("unit enum deserializer cannot deserialize tuple variant".to_string()))
+        Err(Error::Deserialization(
+            "unit enum deserializer cannot deserialize tuple variant".to_string(),
+        ))
     }
 
-    fn struct_variant<V>(
-        self,
-        _fields: &'static [&'static str],
-        _visitor: V,
-    ) -> Result<V::Value>
+    fn struct_variant<V>(self, _fields: &'static [&'static str], _visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        Err(Error::Deserialization("unit enum deserializer cannot deserialize struct variant".to_string()))
+        Err(Error::Deserialization(
+            "unit enum deserializer cannot deserialize struct variant".to_string(),
+        ))
     }
 }

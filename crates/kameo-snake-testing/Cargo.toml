@@ -30,6 +30,9 @@ proptest = { workspace = true }
 thiserror = { workspace = true }
 once_cell = "1.19"
 console-subscriber = "0.2"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.4"

@@ -26,9 +26,11 @@ futures = "0.3"
 nix = { version = "0.27", features = ["process"] }
 rand = "0.8"
 parity-tokio-ipc = "0.9"
-opentelemetry = { version = "0.22" }
-opentelemetry_sdk = { version = "0.22", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.23"
+opentelemetry = { version = "0.30", features = ["trace"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.31"
+opentelemetry-stdout = { version = "0.30", features = ["logs","metrics","trace"] }
 
 # Python integration
 pyo3 = { version = "0.25", features = ["auto-initialize"] }

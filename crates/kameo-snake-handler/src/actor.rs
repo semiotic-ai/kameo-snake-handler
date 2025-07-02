@@ -1,18 +1,19 @@
-use std::marker::PhantomData;
-use std::ops::ControlFlow;
+use crate::error::PythonExecutionError;
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::Message;
-use kameo_child_process::{CallbackHandle, ChildCallbackMessage, KameoChildProcessMessage, RuntimeAware};
+use kameo_child_process::ChildProcessMessageHandler;
+use kameo_child_process::{
+    CallbackHandle, ChildCallbackMessage, KameoChildProcessMessage, RuntimeAware,
+};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
+use std::ops::ControlFlow;
 use tracing::instrument;
-use kameo_child_process::ChildProcessMessageHandler;
-use crate::error::PythonExecutionError;
-
 /// Configuration for Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct PythonConfig {
@@ -95,8 +96,17 @@ where
 {
     type Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>;
     #[tracing::instrument(skip(self, _ctx, message), fields(actor_type = "PythonActor", message_type = std::any::type_name::<M>()))]
-    fn handle(&mut self, message: M, _ctx: &mut kameo::message::Context<Self, Self::Reply>) -> impl std::future::Future<Output = Self::Reply> + Send {
-        tracing::trace!(event = "actor_recv", step = "handle_child_message", message_type = std::any::type_name::<M>(), "PythonActor received message");
+    fn handle(
+        &mut self,
+        message: M,
+        _ctx: &mut kameo::message::Context<Self, Self::Reply>,
+    ) -> impl std::future::Future<Output = Self::Reply> + Send {
+        tracing::trace!(
+            event = "actor_recv",
+            step = "handle_child_message",
+            message_type = std::any::type_name::<M>(),
+            "PythonActor received message"
+        );
         self.handle_child_message(message)
     }
 }
@@ -140,7 +150,11 @@ where
         let py_msg = Python::with_gil(|py| crate::serde_py::to_pyobject(py, &msg));
         let py_msg = match py_msg {
             Ok(obj) => obj,
-            Err(e) => return Err(PythonExecutionError::SerializationError { message: e.to_string() }),
+            Err(e) => {
+                return Err(PythonExecutionError::SerializationError {
+                    message: e.to_string(),
+                })
+            }
         };
         if is_async {
             // Async Python function: create coroutine and future inside GIL
@@ -148,7 +162,12 @@ where
                 let py_func = py_function.bind(py);
                 let coro = match py_func.call1((py_msg,)) {
                     Ok(coro) => coro,
-                    Err(e) => return Err(PythonExecutionError::CallError { function: function_name.clone(), message: e.to_string() }),
+                    Err(e) => {
+                        return Err(PythonExecutionError::CallError {
+                            function: function_name.clone(),
+                            message: e.to_string(),
+                        })
+                    }
                 };
                 match into_future(coro) {
                     Ok(fut) => Ok(fut),
@@ -166,8 +185,11 @@ where
             // Deserialize Python result to Rust
             let rust_result = Python::with_gil(|py| {
                 let bound = py_output.bind(py);
-                crate::serde_py::from_pyobject(&bound)
-                    .map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() })
+                crate::serde_py::from_pyobject(&bound).map_err(|e| {
+                    PythonExecutionError::DeserializationError {
+                        message: e.to_string(),
+                    }
+                })
             });
             match rust_result {
                 Ok(reply) => Ok(reply),
@@ -178,9 +200,15 @@ where
             let rust_result = Python::with_gil(|py| {
                 let py_func = py_function.bind(py);
                 match py_func.call1((py_msg,)) {
-                    Ok(result) => crate::serde_py::from_pyobject(&result)
-                        .map_err(|e| PythonExecutionError::DeserializationError { message: e.to_string() }),
-                    Err(e) => Err(PythonExecutionError::CallError { function: function_name.clone(), message: e.to_string() }),
+                    Ok(result) => crate::serde_py::from_pyobject(&result).map_err(|e| {
+                        PythonExecutionError::DeserializationError {
+                            message: e.to_string(),
+                        }
+                    }),
+                    Err(e) => Err(PythonExecutionError::CallError {
+                        function: function_name.clone(),
+                        message: e.to_string(),
+                    }),
                 }
             });
             match rust_result {
@@ -192,36 +220,44 @@ where
 }
 
 /// Python-specific child process main entrypoint. Does handshake, sets callback, calls init_with_runtime, and runs the actor loop.
-#[instrument(skip(actor, request_conn), name = "child_process_main_with_python_actor")]
-pub async fn child_process_main_with_python_actor<M, C>(actor: PythonActor<M, C>, mut request_conn: Box<dyn kameo_child_process::AsyncReadWrite>) -> Result<(), Box<dyn std::error::Error>>
+#[instrument(
+    skip(actor, request_conn),
+    name = "child_process_main_with_python_actor"
+)]
+pub async fn child_process_main_with_python_actor<M, C>(
+    actor: PythonActor<M, C>,
+    mut request_conn: Box<dyn kameo_child_process::AsyncReadWrite>,
+) -> Result<(), Box<dyn std::error::Error>>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     C: kameo_child_process::ChildCallbackMessage + Send + 'static,
-    <PythonActor<M, C> as ChildProcessMessageHandler<M>>::Reply:
-        Serialize
+    <PythonActor<M, C> as ChildProcessMessageHandler<M>>::Reply: Serialize
         + for<'de> Deserialize<'de>
         + Encode
-        + Decode<()> 
+        + Decode<()>
         + Send
         + std::fmt::Debug
         + 'static,
 {
-    use kameo_child_process::{run_child_actor_loop, perform_handshake};
+    use kameo_child_process::{perform_handshake, run_child_actor_loop};
     tracing::info!("child_process_main_with_python_actor: about to handshake");
     // Perform handshake as child
     perform_handshake::<M, crate::error::PythonExecutionError>(&mut request_conn, false).await?;
     // Callback handle is set and injected in the macro branch for the child process
-    let mut actor = actor.init_with_runtime().await.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let mut actor = actor
+        .init_with_runtime()
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     tracing::info!("running child actor loop");
     match run_child_actor_loop(&mut actor, request_conn).await {
-        Ok(()) => {},
+        Ok(()) => {}
         Err(kameo_child_process::ChildProcessLoopError::ChildProcessClosedCleanly) => {
             tracing::info!("Child process exited cleanly.");
-        },
+        }
         Err(kameo_child_process::ChildProcessLoopError::Io(e)) => {
             tracing::error!(error = ?e, "Child process IO error");
             return Err(Box::new(e));
         }
     }
     Ok(())
-} 
+}

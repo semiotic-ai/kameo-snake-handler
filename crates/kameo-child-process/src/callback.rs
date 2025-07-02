@@ -32,7 +32,13 @@ pub enum CallbackError {
 pub trait ChildCallbackMessage:
     Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static
 {
-    type Reply: Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static;
+    type Reply: Send
+        + Serialize
+        + DeserializeOwned
+        + Encode
+        + Decode<()>
+        + std::fmt::Debug
+        + 'static;
 }
 
 #[async_trait]
@@ -124,8 +130,16 @@ where
     C::Reply: Send,
 {
     async fn handle(&mut self, callback: C) -> C::Reply {
-        tracing::trace!(event = "callback_handler", ?callback, "NoopCallbackHandler received callback");
-        tracing::info!(event = "noop_callback", ?callback, "NoopCallbackHandler received callback");
+        tracing::trace!(
+            event = "callback_handler",
+            ?callback,
+            "NoopCallbackHandler received callback"
+        );
+        tracing::info!(
+            event = "noop_callback",
+            ?callback,
+            "NoopCallbackHandler received callback"
+        );
         panic!("NoopCallbackHandler called but no Default for callback reply; implement your own handler if you need a real reply");
     }
 }
@@ -157,10 +171,17 @@ where
     pub async fn run(mut self) -> Result<(), CallbackError> {
         loop {
             let mut buf = vec![0u8; 4096];
-            tracing::trace!(event = "callback_receiver", step = "before_read", "Callback receiver about to read from connection");
+            tracing::trace!(
+                event = "callback_receiver",
+                step = "before_read",
+                "Callback receiver about to read from connection"
+            );
             let n = match self.connection.read(&mut buf).await {
                 Ok(0) => {
-                    tracing::debug!(status = "connection_closed", message_type = std::any::type_name::<M>());
+                    tracing::debug!(
+                        status = "connection_closed",
+                        message_type = std::any::type_name::<M>()
+                    );
                     break;
                 }
                 Ok(n) => n,
@@ -169,27 +190,45 @@ where
                     return Err(e.into());
                 }
             };
-            tracing::trace!(event = "callback_receiver", step = "after_read", n = n, "Callback receiver read from connection");
+            tracing::trace!(
+                event = "callback_receiver",
+                step = "after_read",
+                n = n,
+                "Callback receiver read from connection"
+            );
             if n == 0 {
-                tracing::debug!(status = "connection_closed_no_data", message_type = std::any::type_name::<M>());
+                tracing::debug!(
+                    status = "connection_closed_no_data",
+                    message_type = std::any::type_name::<M>()
+                );
                 break;
             }
-            tracing::trace!(event = "callback_receiver", step = "before_decode", "Callback receiver about to decode message");
-            let (wrapped_msg, _): (WithTracingContext<M>, _) =
-                match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
-                    Ok(decoded) => decoded,
-                    Err(e) => {
-                        tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to decode callback message");
-                        continue;
-                    }
-                };
+            tracing::trace!(
+                event = "callback_receiver",
+                step = "before_decode",
+                "Callback receiver about to decode message"
+            );
+            let (wrapped_msg, _): (WithTracingContext<M>, _) = match bincode::decode_from_slice(
+                &buf[..n],
+                bincode::config::standard(),
+            ) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to decode callback message");
+                    continue;
+                }
+            };
 
             let parent_cx = global::get_text_map_propagator(|propagator| {
                 propagator.extract(&wrapped_msg.context.0)
             });
             let span = tracing::info_span!("callback_handler");
             span.set_parent(parent_cx);
-            let reply = self.handler.handle(wrapped_msg.inner).instrument(span).await;
+            let reply = self
+                .handler
+                .handle(wrapped_msg.inner)
+                .instrument(span)
+                .await;
             let mut trace_context_map = std::collections::HashMap::new();
             global::get_text_map_propagator(|propagator| {
                 propagator.inject_context(&OTelContext::current(), &mut trace_context_map);
@@ -201,7 +240,10 @@ where
                 context: trace_context,
             };
 
-            let reply_bytes = match bincode::encode_to_vec(&wrapped_reply, bincode::config::standard()) {
+            let reply_bytes = match bincode::encode_to_vec(
+                &wrapped_reply,
+                bincode::config::standard(),
+            ) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     tracing::error!(error = ?e, message_type = std::any::type_name::<M>(), message = "Failed to encode callback reply");
@@ -227,4 +269,4 @@ where
     fn set_callback_handle(&mut self, handle: crate::callback::CallbackHandle<C>) {
         self.callback_handle = Some(handle);
     }
-} 
+}

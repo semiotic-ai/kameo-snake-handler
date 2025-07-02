@@ -1,6 +1,6 @@
+use bincode::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use std::io;
-use serde::{Serialize, Deserialize};
-use bincode::{Encode, Decode};
 use thiserror::Error;
 use tracing::error;
 
@@ -38,7 +38,9 @@ impl From<SubprocessActorError> for SubprocessActorIpcError {
             SubprocessActorError::Protocol(s) => Self::Protocol(s),
             SubprocessActorError::HandshakeFailed(s) => Self::HandshakeFailed(s),
             SubprocessActorError::ConnectionClosed => Self::ConnectionClosed,
-            SubprocessActorError::UnknownActorType { actor_name } => Self::UnknownActorType { actor_name },
+            SubprocessActorError::UnknownActorType { actor_name } => {
+                Self::UnknownActorType { actor_name }
+            }
             other => Self::Protocol(format!("Non-serializable error: {other}")),
         }
     }
@@ -46,7 +48,11 @@ impl From<SubprocessActorError> for SubprocessActorIpcError {
 
 #[tracing::instrument(level = "error", fields(actor_name))]
 pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessActorError {
-    error!(status = "error", actor_type = actor_name, message = "Unknown actor type encountered");
+    error!(
+        status = "error",
+        actor_type = actor_name,
+        message = "Unknown actor type encountered"
+    );
     SubprocessActorError::UnknownActorType {
         actor_name: actor_name.to_string(),
     }
@@ -59,7 +65,13 @@ pub trait ProtocolError: std::fmt::Debug + Send + Sync + 'static {
 }
 
 impl ProtocolError for SubprocessActorIpcError {
-    fn protocol(msg: String) -> Self { Self::Protocol(msg) }
-    fn handshake_failed(msg: String) -> Self { Self::HandshakeFailed(msg) }
-    fn connection_closed() -> Self { Self::ConnectionClosed }
-} 
+    fn protocol(msg: String) -> Self {
+        Self::Protocol(msg)
+    }
+    fn handshake_failed(msg: String) -> Self {
+        Self::HandshakeFailed(msg)
+    }
+    fn connection_closed() -> Self {
+        Self::ConnectionClosed
+    }
+}

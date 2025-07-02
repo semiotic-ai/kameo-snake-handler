@@ -1,14 +1,11 @@
-use pyo3::{
-    prelude::*,
-    types::PyAny,
-};
+use pyo3::{prelude::*, types::PyAny};
 use serde::Deserialize;
 
-mod ser;
 mod de;
+mod ser;
 
-pub use ser::to_pyobject;
 pub use de::from_pyobject;
+pub use ser::to_pyobject;
 
 /// Trait for types that can be converted from PyAny
 pub trait FromPyAny: Sized {
@@ -68,14 +65,14 @@ impl From<serde::de::value::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::collection::{hash_map, vec};
     use proptest::prelude::*;
-    use proptest::collection::{vec, hash_map};
-    use proptest::strategy::{Strategy, BoxedStrategy};
-    use std::collections::HashMap;
+    use proptest::strategy::{BoxedStrategy, Strategy};
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     mod nested_option_helper {
-        use serde::{self, Deserializer, Serializer, Deserialize};
+        use serde::{self, Deserialize, Deserializer, Serializer};
 
         pub fn serialize<S>(option: &Option<Option<i32>>, serializer: S) -> Result<S::Ok, S::Error>
         where
@@ -163,7 +160,8 @@ mod tests {
             any::<u16>(),
             any::<u32>(),
             any::<u64>(),
-        ).boxed()
+        )
+            .boxed()
     }
 
     fn float_strategy() -> BoxedStrategy<(f32, f64)> {
@@ -184,7 +182,8 @@ mod tests {
                 Just(f64::MAX),
                 any::<f64>()
             ],
-        ).boxed()
+        )
+            .boxed()
     }
 
     fn other_primitives_strategy() -> BoxedStrategy<(char, bool, String, Vec<u8>)> {
@@ -193,7 +192,8 @@ mod tests {
             any::<bool>(),
             any::<String>(),
             vec(any::<u8>(), 0..100),
-        ).boxed()
+        )
+            .boxed()
     }
 
     fn all_primitives_strategy() -> BoxedStrategy<AllPrimitivesStruct> {
@@ -201,24 +201,32 @@ mod tests {
             integer_strategy(),
             float_strategy(),
             other_primitives_strategy(),
-        ).prop_map(|((i8_f, i16_f, i32_f, i64_f, u8_f, u16_f, u32_f, u64_f), (f32_f, f64_f), (char_f, bool_f, string_f, bytes_f))| {
-            AllPrimitivesStruct {
-                i8_field: i8_f,
-                i16_field: i16_f,
-                i32_field: i32_f,
-                i64_field: i64_f,
-                u8_field: u8_f,
-                u16_field: u16_f,
-                u32_field: u32_f,
-                u64_field: u64_f,
-                f32_field: f32_f,
-                f64_field: f64_f,
-                char_field: char_f,
-                bool_field: bool_f,
-                string_field: string_f,
-                bytes_field: bytes_f,
-            }
-        }).boxed()
+        )
+            .prop_map(
+                |(
+                    (i8_f, i16_f, i32_f, i64_f, u8_f, u16_f, u32_f, u64_f),
+                    (f32_f, f64_f),
+                    (char_f, bool_f, string_f, bytes_f),
+                )| {
+                    AllPrimitivesStruct {
+                        i8_field: i8_f,
+                        i16_field: i16_f,
+                        i32_field: i32_f,
+                        i64_field: i64_f,
+                        u8_field: u8_f,
+                        u16_field: u16_f,
+                        u32_field: u32_f,
+                        u64_field: u64_f,
+                        f32_field: f32_f,
+                        f64_field: f64_f,
+                        char_field: char_f,
+                        bool_field: bool_f,
+                        string_field: string_f,
+                        bytes_field: bytes_f,
+                    }
+                },
+            )
+            .boxed()
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,22 +275,88 @@ mod tests {
             let nested_map_eq = self.nested_map == other.nested_map;
 
             // Print debug info if any field doesn't match
-            if !empty_vec_eq { println!("empty_vec mismatch: {:?} != {:?}", self.empty_vec, other.empty_vec); }
-            if !empty_map_eq { println!("empty_map mismatch: {:?} != {:?}", self.empty_map, other.empty_map); }
-            if !nested_option_eq { println!("nested_option mismatch: {:?} != {:?}", self.nested_option, other.nested_option); }
-            if !unit_eq { println!("unit mismatch"); }
-            if !newtype_eq { println!("newtype mismatch: {:?} != {:?}", self.newtype, other.newtype); }
-            if !recursive_eq { println!("recursive mismatch: {:?} != {:?}", self.recursive, other.recursive); }
-            if !empty_string_eq { println!("empty_string mismatch: {:?} != {:?}", self.empty_string, other.empty_string); }
-            if !unicode_string_eq { println!("unicode_string mismatch: {:?} != {:?}", self.unicode_string, other.unicode_string); }
-            if !single_item_vec_eq { println!("single_item_vec mismatch: {:?} != {:?}", self.single_item_vec, other.single_item_vec); }
-            if !single_item_map_eq { println!("single_item_map mismatch: {:?} != {:?}", self.single_item_map, other.single_item_map); }
-            if !nested_vec_eq { println!("nested_vec mismatch: {:?} != {:?}", self.nested_vec, other.nested_vec); }
-            if !nested_map_eq { println!("nested_map mismatch: {:?} != {:?}", self.nested_map, other.nested_map); }
+            if !empty_vec_eq {
+                println!(
+                    "empty_vec mismatch: {:?} != {:?}",
+                    self.empty_vec, other.empty_vec
+                );
+            }
+            if !empty_map_eq {
+                println!(
+                    "empty_map mismatch: {:?} != {:?}",
+                    self.empty_map, other.empty_map
+                );
+            }
+            if !nested_option_eq {
+                println!(
+                    "nested_option mismatch: {:?} != {:?}",
+                    self.nested_option, other.nested_option
+                );
+            }
+            if !unit_eq {
+                println!("unit mismatch");
+            }
+            if !newtype_eq {
+                println!(
+                    "newtype mismatch: {:?} != {:?}",
+                    self.newtype, other.newtype
+                );
+            }
+            if !recursive_eq {
+                println!(
+                    "recursive mismatch: {:?} != {:?}",
+                    self.recursive, other.recursive
+                );
+            }
+            if !empty_string_eq {
+                println!(
+                    "empty_string mismatch: {:?} != {:?}",
+                    self.empty_string, other.empty_string
+                );
+            }
+            if !unicode_string_eq {
+                println!(
+                    "unicode_string mismatch: {:?} != {:?}",
+                    self.unicode_string, other.unicode_string
+                );
+            }
+            if !single_item_vec_eq {
+                println!(
+                    "single_item_vec mismatch: {:?} != {:?}",
+                    self.single_item_vec, other.single_item_vec
+                );
+            }
+            if !single_item_map_eq {
+                println!(
+                    "single_item_map mismatch: {:?} != {:?}",
+                    self.single_item_map, other.single_item_map
+                );
+            }
+            if !nested_vec_eq {
+                println!(
+                    "nested_vec mismatch: {:?} != {:?}",
+                    self.nested_vec, other.nested_vec
+                );
+            }
+            if !nested_map_eq {
+                println!(
+                    "nested_map mismatch: {:?} != {:?}",
+                    self.nested_map, other.nested_map
+                );
+            }
 
-            empty_vec_eq && empty_map_eq && nested_option_eq && unit_eq && newtype_eq && 
-            recursive_eq && empty_string_eq && unicode_string_eq && single_item_vec_eq && 
-            single_item_map_eq && nested_vec_eq && nested_map_eq
+            empty_vec_eq
+                && empty_map_eq
+                && nested_option_eq
+                && unit_eq
+                && newtype_eq
+                && recursive_eq
+                && empty_string_eq
+                && unicode_string_eq
+                && single_item_vec_eq
+                && single_item_map_eq
+                && nested_vec_eq
+                && nested_map_eq
         }
     }
 
@@ -307,17 +381,20 @@ mod tests {
                 // Very long string
                 Just("x".repeat(1000)),
             ],
-        ).boxed()
+        )
+            .boxed()
     }
 
     fn special_collection_strategy() -> BoxedStrategy<(Vec<i32>, HashMap<String, i32>)> {
         (
             Just(vec![42]),
             hash_map(Just("key".to_string()), Just(42), 1..=1),
-        ).boxed()
+        )
+            .boxed()
     }
 
-    fn nested_collection_strategy() -> BoxedStrategy<(Vec<Vec<Vec<i32>>>, HashMap<String, HashMap<String, i32>>)> {
+    fn nested_collection_strategy(
+    ) -> BoxedStrategy<(Vec<Vec<Vec<i32>>>, HashMap<String, HashMap<String, i32>>)> {
         let nested_vec = Just(vec![vec![vec![1, 2, 3]], vec![vec![4, 5, 6]]]);
         let nested_map = {
             let mut inner = HashMap::new();
@@ -343,64 +420,86 @@ mod tests {
             special_string_strategy(),
             special_collection_strategy(),
             nested_collection_strategy(),
-        ).prop_map(|(empty_vec, empty_map, nested_option, unit, newtype, 
-                     (empty_string, unicode_string), 
-                     (single_item_vec, single_item_map),
-                     (nested_vec, nested_map))| {
-            EdgeCaseStruct {
-                empty_vec,
-                empty_map,
-                nested_option,
-                unit,
-                newtype,
-                recursive: None,
-                empty_string,
-                unicode_string,
-                single_item_vec,
-                single_item_map,
-                nested_vec,
-                nested_map,
-            }
-        });
-
-        leaf.prop_recursive(
-            3, // depth
-            256, // total elements
-            10, // items per collection
-            |inner| (
-                Just(Vec::new()),
-                Just(HashMap::new()),
-                prop_oneof![
-                    Just(None),
-                    any::<i32>().prop_map(|x| Some(Some(x))),
-                    Just(Some(None))
-                ],
-                Just(UnitStruct),
-                any::<i32>().prop_map(NewtypeStruct),
-                prop::option::of(inner.prop_map(Box::new)),
-                special_string_strategy(),
-                special_collection_strategy(),
-                nested_collection_strategy(),
-            ).prop_map(|(empty_vec, empty_map, nested_option, unit, newtype, recursive, 
-                         (empty_string, unicode_string), 
-                         (single_item_vec, single_item_map),
-                         (nested_vec, nested_map))| {
-                EdgeCaseStruct {
+        )
+            .prop_map(
+                |(
                     empty_vec,
                     empty_map,
                     nested_option,
                     unit,
                     newtype,
-                    recursive,
-                    empty_string,
-                    unicode_string,
-                    single_item_vec,
-                    single_item_map,
-                    nested_vec,
-                    nested_map,
-                }
-            })
-        ).boxed()
+                    (empty_string, unicode_string),
+                    (single_item_vec, single_item_map),
+                    (nested_vec, nested_map),
+                )| {
+                    EdgeCaseStruct {
+                        empty_vec,
+                        empty_map,
+                        nested_option,
+                        unit,
+                        newtype,
+                        recursive: None,
+                        empty_string,
+                        unicode_string,
+                        single_item_vec,
+                        single_item_map,
+                        nested_vec,
+                        nested_map,
+                    }
+                },
+            );
+
+        leaf.prop_recursive(
+            3,   // depth
+            256, // total elements
+            10,  // items per collection
+            |inner| {
+                (
+                    Just(Vec::new()),
+                    Just(HashMap::new()),
+                    prop_oneof![
+                        Just(None),
+                        any::<i32>().prop_map(|x| Some(Some(x))),
+                        Just(Some(None))
+                    ],
+                    Just(UnitStruct),
+                    any::<i32>().prop_map(NewtypeStruct),
+                    prop::option::of(inner.prop_map(Box::new)),
+                    special_string_strategy(),
+                    special_collection_strategy(),
+                    nested_collection_strategy(),
+                )
+                    .prop_map(
+                        |(
+                            empty_vec,
+                            empty_map,
+                            nested_option,
+                            unit,
+                            newtype,
+                            recursive,
+                            (empty_string, unicode_string),
+                            (single_item_vec, single_item_map),
+                            (nested_vec, nested_map),
+                        )| {
+                            EdgeCaseStruct {
+                                empty_vec,
+                                empty_map,
+                                nested_option,
+                                unit,
+                                newtype,
+                                recursive,
+                                empty_string,
+                                unicode_string,
+                                single_item_vec,
+                                single_item_map,
+                                nested_vec,
+                                nested_map,
+                            }
+                        },
+                    )
+            },
+        )
+        .boxed()
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -408,11 +507,7 @@ mod tests {
         Unit,
         NewType(i32),
         Tuple(i32, String, bool),
-        Struct {
-            x: i32,
-            y: String,
-            z: bool,
-        },
+        Struct { x: i32, y: String, z: bool },
     }
 
     fn complex_enum_strategy() -> BoxedStrategy<ComplexEnum> {
@@ -423,7 +518,8 @@ mod tests {
                 .prop_map(|(i, s, b)| ComplexEnum::Tuple(i, s, b)),
             (any::<i32>(), any::<String>(), any::<bool>())
                 .prop_map(|(x, y, z)| ComplexEnum::Struct { x, y, z })
-        ].boxed()
+        ]
+        .boxed()
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -437,14 +533,16 @@ mod tests {
         (
             prop::option::of(any::<i32>()),
             vec(any::<String>(), 0..10),
-            vec(prop::option::of(complex_enum_strategy()), 0..5)
-        ).prop_map(|(future_result, stream_results, nested_futures)| {
-            AsyncTestStruct {
-                future_result,
-                stream_results,
-                nested_futures,
-            }
-        }).boxed()
+            vec(prop::option::of(complex_enum_strategy()), 0..5),
+        )
+            .prop_map(
+                |(future_result, stream_results, nested_futures)| AsyncTestStruct {
+                    future_result,
+                    stream_results,
+                    nested_futures,
+                },
+            )
+            .boxed()
     }
 
     proptest! {
@@ -508,4 +606,4 @@ mod tests {
             });
         }
     }
-} 
+}

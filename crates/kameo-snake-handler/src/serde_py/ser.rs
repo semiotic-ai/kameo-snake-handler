@@ -1,12 +1,12 @@
 use pyo3::{
     prelude::*,
     types::{PyDict, PyList},
-    IntoPyObjectExt,
-    Bound,
-    Python,
-    PyObject,
+    Bound, IntoPyObjectExt, PyObject, Python,
 };
-use serde::ser::{Serialize, SerializeMap, SerializeSeq, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, SerializeStruct, SerializeStructVariant};
+use serde::ser::{
+    Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
+    SerializeTupleStruct, SerializeTupleVariant,
+};
 
 use super::Error;
 use super::Result;
@@ -125,11 +125,7 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
         Ok(variant.into_bound_py_any(self.py)?.into())
     }
 
-    fn serialize_newtype_struct<T: ?Sized>(
-        self,
-        _name: &'static str,
-        value: &T,
-    ) -> Result<Self::Ok>
+    fn serialize_newtype_struct<T: ?Sized>(self, _name: &'static str, value: &T) -> Result<Self::Ok>
     where
         T: Serialize,
     {
@@ -187,11 +183,7 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
         PythonMapSerializer::new(self.py)
     }
 
-    fn serialize_struct(
-        self,
-        _name: &'static str,
-        _len: usize,
-    ) -> Result<Self::SerializeStruct> {
+    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
         let dict = PyDict::new(self.py);
         Ok(PythonMapSerializer {
             py: self.py,
@@ -221,8 +213,8 @@ pub struct PythonSeqSerializer<'py> {
 
 impl<'py> PythonSeqSerializer<'py> {
     fn new(py: Python<'py>) -> Result<Self> {
-        Ok(Self { 
-            py, 
+        Ok(Self {
+            py,
             list: PyList::empty(py).into(),
             next_key: None,
         })
@@ -234,7 +226,9 @@ impl<'py> SerializeSeq for PythonSeqSerializer<'py> {
     type Error = Error;
 
     fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where T: Serialize {
+    where
+        T: Serialize,
+    {
         let element = value.serialize(PythonSerializer::new(self.py))?;
         self.list.append(element)?;
         Ok(())
@@ -256,7 +250,9 @@ impl<'py> SerializeTuple for PythonSeqSerializer<'py> {
     type Error = Error;
 
     fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where T: Serialize {
+    where
+        T: Serialize,
+    {
         SerializeSeq::serialize_element(self, value)
     }
 
@@ -270,7 +266,9 @@ impl<'py> SerializeTupleStruct for PythonSeqSerializer<'py> {
     type Error = Error;
 
     fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where T: Serialize {
+    where
+        T: Serialize,
+    {
         SerializeSeq::serialize_element(self, value)
     }
 
@@ -291,7 +289,9 @@ impl<'py> SerializeTupleVariant for PythonSeqSerializer<'py> {
     }
 
     fn end(self) -> Result<Self::Ok> {
-        let variant = self.next_key.ok_or_else(|| Error::Serialization("missing variant key".to_string()))?;
+        let variant = self
+            .next_key
+            .ok_or_else(|| Error::Serialization("missing variant key".to_string()))?;
         let outer = PyDict::new(self.py);
         outer.set_item(variant, self.list)?;
         Ok(outer.into_bound_py_any(self.py)?.into())
@@ -319,25 +319,38 @@ impl<'py> SerializeMap for PythonMapSerializer<'py> {
     type Error = Error;
 
     fn serialize_key<T: ?Sized>(&mut self, key: &T) -> Result<()>
-    where T: Serialize {
-        self.next_key = Some(key.serialize(PythonSerializer::new(self.py))?.extract(self.py)
-            .map_err(|e| Error::Serialization(format!("failed to extract key: {}", e)))?);
+    where
+        T: Serialize,
+    {
+        self.next_key = Some(
+            key.serialize(PythonSerializer::new(self.py))?
+                .extract(self.py)
+                .map_err(|e| Error::Serialization(format!("failed to extract key: {}", e)))?,
+        );
         Ok(())
     }
 
     fn serialize_value<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where T: Serialize {
-        let key = self.next_key.take()
+    where
+        T: Serialize,
+    {
+        let key = self
+            .next_key
+            .take()
             .ok_or_else(|| Error::Serialization("missing key in map serialization".to_string()))?;
         let value = value.serialize(PythonSerializer::new(self.py))?;
-        self.dict.set_item(key, value)
+        self.dict
+            .set_item(key, value)
             .map_err(|e| Error::Serialization(format!("failed to set dict item: {}", e)))?;
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok> {
-        Ok(self.dict.into_bound_py_any(self.py)
-            .map_err(|e| Error::Serialization(format!("failed to convert dict to PyAny: {}", e)))?.into())
+        Ok(self
+            .dict
+            .into_bound_py_any(self.py)
+            .map_err(|e| Error::Serialization(format!("failed to convert dict to PyAny: {}", e)))?
+            .into())
     }
 }
 
@@ -345,21 +358,23 @@ impl<'py> SerializeStruct for PythonMapSerializer<'py> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> Result<()>
-    where T: Serialize {
+    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
         let value = value.serialize(PythonSerializer::new(self.py))?;
-        self.dict.set_item(key, value)
-            .map_err(|e| Error::Serialization(format!("failed to set struct field '{}': {}", key, e)))?;
+        self.dict.set_item(key, value).map_err(|e| {
+            Error::Serialization(format!("failed to set struct field '{}': {}", key, e))
+        })?;
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok> {
-        Ok(self.dict.into_bound_py_any(self.py)
-            .map_err(|e| Error::Serialization(format!("failed to convert struct to PyAny: {}", e)))?.into())
+        Ok(self
+            .dict
+            .into_bound_py_any(self.py)
+            .map_err(|e| Error::Serialization(format!("failed to convert struct to PyAny: {}", e)))?
+            .into())
     }
 }
 
@@ -367,27 +382,30 @@ impl<'py> SerializeStructVariant for PythonMapSerializer<'py> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized>(
-        &mut self,
-        key: &'static str,
-        value: &T,
-    ) -> Result<()>
+    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()>
     where
         T: Serialize,
     {
         let value = value.serialize(PythonSerializer::new(self.py))?;
-        self.dict.set_item(key, value)
-            .map_err(|e| Error::Serialization(format!("failed to set variant field '{}': {}", key, e)))?;
+        self.dict.set_item(key, value).map_err(|e| {
+            Error::Serialization(format!("failed to set variant field '{}': {}", key, e))
+        })?;
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok> {
-        let variant = self.next_key
-            .ok_or_else(|| Error::Serialization("missing variant key in enum serialization".to_string()))?;
+        let variant = self.next_key.ok_or_else(|| {
+            Error::Serialization("missing variant key in enum serialization".to_string())
+        })?;
         let outer = PyDict::new(self.py);
-        outer.set_item(variant, self.dict)
+        outer
+            .set_item(variant, self.dict)
             .map_err(|e| Error::Serialization(format!("failed to set variant dict: {}", e)))?;
-        Ok(outer.into_bound_py_any(self.py)
-            .map_err(|e| Error::Serialization(format!("failed to convert variant to PyAny: {}", e)))?.into())
+        Ok(outer
+            .into_bound_py_any(self.py)
+            .map_err(|e| {
+                Error::Serialization(format!("failed to convert variant to PyAny: {}", e))
+            })?
+            .into())
     }
-} 
+}

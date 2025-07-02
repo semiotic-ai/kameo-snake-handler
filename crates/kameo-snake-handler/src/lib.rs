@@ -2,7 +2,7 @@ pub mod serde_py;
 pub use serde_py::{from_pyobject, to_pyobject, FromPyAny};
 
 mod error;
-pub use error::{PythonExecutionError, ErrorReply};
+pub use error::{ErrorReply, PythonExecutionError};
 
 mod builder;
 pub use builder::PythonChildProcessBuilder;
@@ -10,9 +10,11 @@ pub use builder::PythonChildProcessBuilder;
 pub use kameo_child_process::NoopCallbackHandler;
 
 mod actor;
-pub use actor::{PythonActor, PythonConfig, child_process_main_with_python_actor};
+pub use actor::{child_process_main_with_python_actor, PythonActor, PythonConfig};
 
 mod macros;
+
+pub mod telemetry;
 
 #[tracing::instrument(skip(builder), name = "setup_python_runtime")]
 pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
@@ -22,7 +24,7 @@ pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
 
 pub mod prelude {
     pub use super::{
-        PythonActor, PythonChildProcessBuilder, PythonConfig, PythonExecutionError, setup_python_runtime
+        setup_python_runtime, PythonActor, PythonChildProcessBuilder, PythonConfig,
+        PythonExecutionError,
     };
 }
-
