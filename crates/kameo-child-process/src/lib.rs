@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod callback;
-mod handshake;
+pub mod handshake;
 pub use handshake::*;
 
 use anyhow::Result;
@@ -10,11 +10,10 @@ use bincode::{Decode, Encode};
 use futures::StreamExt;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, PanicError};
-use kameo::message::{Context, Message};
+use kameo::message::Context;
 use kameo::prelude::*;
 use opentelemetry::global;
 use opentelemetry::Context as OTelContext;
-use parity_tokio_ipc::Endpoint;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -26,9 +25,19 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex as TokioMutex, Notify};
 use tokio::time::Duration;
 use tracing::{debug, error, info, instrument, warn, Level};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use std::collections::HashMap;
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
+use tracing_futures::Instrument;
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicU64, Ordering};
+pub mod error;
+pub use error::PythonExecutionError;
 
 pub use callback::{
     CallbackHandle, CallbackHandler, CallbackReceiver, CallbackSender, ChildCallbackMessage,
@@ -60,7 +69,7 @@ where
 }
 
 /// Trait object for async read/write operations
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl std::fmt::Debug for dyn AsyncReadWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,8 +77,7 @@ impl std::fmt::Debug for dyn AsyncReadWrite {
     }
 }
 
-#[async_trait]
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncReadWrite for T {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> AsyncReadWrite for T {}
 
 // Helper methods are now part of the trait itself
 impl dyn AsyncReadWrite {
@@ -90,119 +98,121 @@ pub trait KameoChildProcessMessage:
         + 'static;
 }
 
-/// Control message for handshake and real messages
+/// Control message for handshake and real messages (errors are always inside the envelope)
 #[derive(Debug, Serialize, Deserialize, Encode, Decode)]
 pub enum Control<T> {
     Handshake,
-    Real(T, TracingContext),
+    Real(MultiplexEnvelope<T>),
 }
 
 impl<T> Control<T> {
     pub fn is_handshake(&self) -> bool {
         matches!(self, Control::Handshake)
     }
-    pub fn into_real(self) -> Option<(T, TracingContext)> {
+    pub fn into_real(self) -> Option<MultiplexEnvelope<T>> {
         match self {
-            Control::Real(t, tc) => Some((t, tc)),
+            Control::Real(env) => Some(env),
             _ => None,
         }
     }
 }
 
-mod error;
-pub use error::{
-    handle_unknown_actor_error, ProtocolError, SubprocessActorError, SubprocessActorIpcError,
-};
-
-/// Actor that manages a subprocess and communicates with it via IPC
-#[derive(Debug)]
-pub struct SubprocessActor<M, C, E>
-where
-    C: crate::callback::ChildCallbackMessage,
-    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static,
-{
-    connection: Arc<Mutex<Box<dyn AsyncReadWrite>>>,
-    child: Option<tokio::process::Child>,
-    socket_path: PathBuf,
-    callback_handle: Option<crate::callback::CallbackHandle<C>>,
-    _phantom: PhantomData<(M, E)>,
+/// Envelope for multiplexed requests
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct MultiplexEnvelope<T> {
+    pub correlation_id: u64,
+    pub inner: T,
+    pub context: TracingContext,
 }
 
-#[async_trait]
-impl<M, C, E> Actor for SubprocessActor<M, C, E>
+pub struct WriteRequest {
+    pub bytes: Vec<u8>,
+    pub correlation_id: u64,
+}
+
+/// A slot for a reply: an Arc containing a Mutex for the reply and a Notify for wakeup.
+type ReplySlot<R> = Arc<(TokioMutex<Option<R>>, Notify)>;
+
+/// The in-flight map: an Arc<Mutex<HashMap<u64, ReplySlot<R>>>>
+type InFlightMap<R> = Arc<TokioMutex<HashMap<u64, ReplySlot<R>>>>;
+
+/// Refactor SubprocessParentActor into SubprocessIpcBackend (pure async backend)
+pub struct SubprocessIpcBackend<M>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: crate::callback::ChildCallbackMessage + Sync,
-    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static,
 {
-    type Error = E;
-
-    #[instrument(skip(self, _actor_ref), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
-    fn on_start(
-        &mut self,
-        _actor_ref: ActorRef<Self>,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            // No handshake here! Connection is already handshaked by builder.
-            tracing::debug!(status = "started", actor_type = "SubprocessActor");
-            Ok(())
-        }
-    }
-
-    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
-    fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        reason: ActorStopReason,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        debug!(status = "stopping", actor_type = "SubprocessActor", ?reason);
-
-        async move {
-            // Kill child process if it exists
-            if let Some(mut child) = self.child.take() {
-                if let Err(e) = child.kill().await {
-                    warn!(event = "lifecycle", error = ?e, "Failed to kill child process");
-                }
-            }
-
-            // Clean up socket file
-            if let Err(e) = tokio::fs::remove_file(&self.socket_path).await {
-                warn!(event = "lifecycle", error = ?e, "Failed to remove socket file");
-            }
-
-            debug!(status = "stopped", actor_type = "SubprocessActor");
-            Ok(())
-        }
-    }
-
-    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
-    fn on_panic(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        err: PanicError,
-    ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
-    {
-        error!(status = "panicked", actor_type = "SubprocessActor", ?err);
-        async move { Ok(ControlFlow::Break(ActorStopReason::Panicked(err))) }
-    }
+    write_tx: mpsc::Sender<WriteRequest>,
+    in_flight: InFlightMap<Result<M::Reply, PythonExecutionError>>,
+    next_id: AtomicU64,
+    _phantom: std::marker::PhantomData<M>,
 }
 
-impl<M, C, E> SubprocessActor<M, C, E>
+impl<M> SubprocessIpcBackend<M>
 where
-    C: crate::callback::ChildCallbackMessage,
-    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static,
+    M: KameoChildProcessMessage + Send + Sync + 'static,
 {
-    pub fn new(
-        connection: Box<dyn AsyncReadWrite>,
-        child: tokio::process::Child,
-        socket_path: PathBuf,
-    ) -> Self {
+    pub fn new(write_tx: mpsc::Sender<WriteRequest>, in_flight: InFlightMap<Result<M::Reply, PythonExecutionError>>) -> Self {
         Self {
-            connection: Arc::new(Mutex::new(connection)),
-            child: Some(child),
-            socket_path,
-            callback_handle: None,
-            _phantom: PhantomData,
+            write_tx,
+            in_flight,
+            next_id: AtomicU64::new(1),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Always generate a unique correlation_id using the atomic counter.
+    fn next_correlation_id(&self) -> u64 {
+        self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub async fn send(&self, msg: M) -> Result<M::Reply, PythonExecutionError> {
+        use tracing::trace;
+        use std::sync::atomic::Ordering;
+        // Always use atomic counter for correlation_id
+        let correlation_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let span = tracing::Span::current();
+        let span_id = span.id();
+        trace!(event = "parent_send", step = "correlation_id", correlation_id, ?span_id, "Generated atomic correlation_id and using current span for tracing");
+        let mut trace_context_map = std::collections::HashMap::new();
+        global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(&tracing_opentelemetry::OpenTelemetrySpanExt::context(&span), &mut trace_context_map)
+        });
+        let envelope = MultiplexEnvelope {
+            correlation_id,
+            inner: msg,
+            context: TracingContext(trace_context_map),
+        };
+        let ctrl = Control::Real(envelope);
+        let msg_bytes = bincode::encode_to_vec(ctrl, bincode::config::standard())
+            .map_err(|e| PythonExecutionError::ExecutionError { message: format!("Failed to encode message: {e}") })?;
+        let notify: ReplySlot<Result<M::Reply, PythonExecutionError>> = Arc::new((TokioMutex::new(None), Notify::new()));
+        {
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.insert(correlation_id, notify.clone());
+            trace!(event = "parent_in_flight", action = "insert", in_flight_len = in_flight.len(), correlation_id, ?span_id, "Inserted into parent in_flight");
+        }
+        let write_req = WriteRequest {
+            bytes: msg_bytes,
+            correlation_id,
+        };
+        if let Err(e) = self.write_tx.send(write_req).await {
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.remove(&correlation_id);
+            return Err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") });
+        }
+        let notify_strong = notify.clone();
+        let (reply_mutex, notify) = &*notify_strong;
+        notify.notified().await;
+        let mut guard = reply_mutex.lock().await;
+        match guard.take() {
+            Some(res) => {
+                trace!(event = "parent_send", step = "reply_received", correlation_id, ?span_id, ?res, "Received reply via notify");
+                res
+            },
+            None => {
+                tracing::error!(event = "parent_send", step = "reply_missing", correlation_id, ?span_id, "Reply missing after notify");
+                Err(PythonExecutionError::ExecutionError { message: "Reply missing after notify".to_string() })
+            }
         }
     }
 }
@@ -225,44 +235,32 @@ impl Default for ChildProcessConfig {
     }
 }
 
-/// A builder for creating child process actors
-pub struct ChildProcessBuilder<A, M, C, E>
-where
-    A: Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
-    M: KameoChildProcessMessage + Send + Sync + 'static,
-    <A as Message<M>>::Reply:
-        Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
-    C: ChildCallbackMessage + Sync,
-    E: ProtocolError
-        + std::fmt::Debug
-        + Send
-        + Sync
-        + 'static
-        + Encode
-        + Decode<()>
-        + Serialize
-        + for<'de> Deserialize<'de>,
-{
-    config: ChildProcessConfig,
-    _phantom: PhantomData<(A, M, C, E)>,
+/// Message trait for actors, supporting both in-process and protocol (serializable) replies.
+pub trait ConcurrentMessage<M> {
+    type Reply;
+    type ProtocolReply: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Encode + Decode<()> + 'static;
+    /// Convert in-process reply to protocol reply for IPC serialization.
+    fn into_protocol_reply(reply: Self::Reply) -> Self::ProtocolReply;
 }
 
-impl<A, M, C, E> ChildProcessBuilder<A, M, C, E>
+/// A builder for creating child process actors
+pub struct ChildProcessBuilder<A, M, C>
 where
-    A: Message<M> + Send + Sync + Actor + CallbackSender<C> + 'static,
+    A: kameo::message::Message<M> + ConcurrentMessage<M> + Send + Sync + Actor + CallbackSender<C, PythonExecutionError> + 'static,
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    <A as Message<M>>::Reply:
-        Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+    <A as ConcurrentMessage<M>>::ProtocolReply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
     C: ChildCallbackMessage + Sync,
-    E: ProtocolError
-        + std::fmt::Debug
-        + Send
-        + Sync
-        + 'static
-        + Encode
-        + Decode<()>
-        + Serialize
-        + for<'de> Deserialize<'de>,
+{
+    config: ChildProcessConfig,
+    _phantom: PhantomData<(A, M, C)>,
+}
+
+impl<A, M, C> ChildProcessBuilder<A, M, C>
+where
+    A: kameo::message::Message<M> + ConcurrentMessage<M> + Send + Sync + Actor + CallbackSender<C, PythonExecutionError> + 'static,
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+    <A as ConcurrentMessage<M>>::ProtocolReply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+    C: ChildCallbackMessage + Sync,
 {
     pub fn new() -> Self {
         Self {
@@ -312,13 +310,13 @@ where
         self
     }
 
-    /// Spawn the child process actor and return a reference to it
+    /// Spawn the child process backend and return it (not an actor)
     pub async fn spawn<H>(
         self,
         handler: H,
-    ) -> io::Result<(ActorRef<SubprocessActor<M, C, E>>, CallbackReceiver<C, H>)>
+    ) -> io::Result<(Arc<SubprocessIpcBackend<M>>, CallbackReceiver<C, H>)>
     where
-        H: CallbackHandler<C>,
+        H: CallbackHandler<C> + Clone,
     {
         let request_socket_path =
             handshake::unique_socket_path(&format!("{}-req", self.config.name));
@@ -327,11 +325,11 @@ where
 
         tracing::debug!(event = "handshake_setup", request_socket = %request_socket_path.to_string_lossy(), callback_socket = %callback_socket_path.to_string_lossy(), "Parent binding sockets and setting env vars");
         // Set up the Unix domain sockets
-        let request_endpoint = Endpoint::new(request_socket_path.to_string_lossy().to_string());
-        let mut request_incoming = request_endpoint.incoming()?;
+        let request_endpoint = request_socket_path.to_string_lossy().to_string();
+        let mut request_incoming = tokio::net::UnixListener::bind(&request_endpoint)?;
         tracing::debug!(event = "handshake_setup", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent bound request socket");
-        let callback_endpoint = Endpoint::new(callback_socket_path.to_string_lossy().to_string());
-        let mut callback_incoming = callback_endpoint.incoming()?;
+        let callback_endpoint = callback_socket_path.to_string_lossy().to_string();
+        let mut callback_incoming = tokio::net::UnixListener::bind(&callback_endpoint)?;
         tracing::debug!(event = "handshake_setup", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent bound callback socket");
         // Get current executable path
         let current_exe = std::env::current_exe()?;
@@ -385,92 +383,97 @@ where
 
         // Strictly ordered handshake: accept request, then callback
         tracing::debug!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent waiting for request connection");
-        let mut request_conn = match tokio::time::timeout(
+        let (mut request_conn, _addr) = tokio::time::timeout(
             Duration::from_secs(30),
-            request_incoming.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(conn))) => {
-                tracing::debug!(event = "handshake_accept",  which = "request", socket = %request_socket_path.to_string_lossy(), "Parent accepted request connection");
-                conn
-            }
-            Ok(Some(Err(e))) => {
-                tracing::error!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), error = ?e, "Parent saw error accepting request connection");
-                return Err(e);
-            }
-            Ok(None) => {
-                tracing::error!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Parent saw end of request incoming stream");
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "No request connection received",
-                ));
-            }
-            Err(_) => {
-                tracing::error!(event = "handshake_accept", which = "request", socket = %request_socket_path.to_string_lossy(), "Timeout waiting for request connection");
-                let _ = child.kill().await;
-                let _ = tokio::fs::remove_file(&request_socket_path).await;
-                let _ = tokio::fs::remove_file(&callback_socket_path).await;
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Timeout waiting for request connection",
-                ));
-            }
-        };
+            request_incoming.accept(),
+        ).await??;
         // Parent performs handshake using perform_handshake
-        perform_handshake::<M, E>(&mut request_conn, true)
+        perform_handshake::<M>(&mut request_conn, true)
             .await
             .map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("Handshake failed: {e:?}"))
             })?;
         // After accepting request connection and handshake, proceed directly
         tracing::debug!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent waiting for callback connection");
-        let callback_conn = match tokio::time::timeout(
+        let (callback_conn, _addr) = tokio::time::timeout(
             Duration::from_secs(30),
-            callback_incoming.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(conn))) => {
-                tracing::debug!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent accepted callback connection");
-                conn
-            }
-            Ok(Some(Err(e))) => {
-                tracing::error!(event = "handshake_accept",  which = "callback", socket = %callback_socket_path.to_string_lossy(), error = ?e, "Parent saw error accepting callback connection");
-                return Err(e);
-            }
-            Ok(None) => {
-                tracing::error!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Parent saw end of callback incoming stream");
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "No callback connection received",
-                ));
-            }
-            Err(_) => {
-                tracing::error!(event = "handshake_accept", which = "callback", socket = %callback_socket_path.to_string_lossy(), "Timeout waiting for callback connection");
-                let _ = child.kill().await;
-                let _ = tokio::fs::remove_file(&request_socket_path).await;
-                let _ = tokio::fs::remove_file(&callback_socket_path).await;
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "Timeout waiting for callback connection",
-                ));
-            }
-        };
+            callback_incoming.accept(),
+        ).await??;
         tracing::trace!(
             event = "parent_spawn",
             step = "after_callback_accept",
-            "Parent accepted callback connection, about to return actor ref"
+            "Parent accepted callback connection, about to return backend and callback receiver"
         );
-        let actor = SubprocessActor::new(Box::new(request_conn), child, request_socket_path);
+        // Split the request_conn into read and write halves
+        let (read_half, write_half) = request_conn.into_split();
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(128);
+        let in_flight: InFlightMap<Result<M::Reply, PythonExecutionError>> = Arc::new(TokioMutex::new(HashMap::new()));
+        let in_flight_writer = in_flight.clone();
+        let in_flight_reader = in_flight.clone();
+        // Writer task
+        tokio::spawn(async move {
+            let mut write_conn = write_half;
+            while let Some(req) = write_rx.recv().await {
+                let len = (req.bytes.len() as u32).to_le_bytes();
+                if let Err(e) = write_conn.write_all(&len).await {
+                    let mut in_flight = in_flight_writer.lock().await;
+                    in_flight.remove(&req.correlation_id);
+                    continue;
+                }
+                if let Err(e) = write_conn.write_all(&req.bytes).await {
+                    let mut in_flight = in_flight_writer.lock().await;
+                    in_flight.remove(&req.correlation_id);
+                    continue;
+                }
+                if let Err(e) = write_conn.flush().await {
+                    let mut in_flight = in_flight_writer.lock().await;
+                    in_flight.remove(&req.correlation_id);
+                }
+            }
+        });
+        // Reader task
+        tokio::spawn(async move {
+            let mut read_conn = read_half;
+            loop {
+                let mut len_buf = [0u8; 4];
+                if let Err(_) = read_conn.read_exact(&mut len_buf).await {
+                    break;
+                }
+                let msg_len = u32::from_le_bytes(len_buf) as usize;
+                let mut msg_buf = vec![0u8; msg_len];
+                if let Err(_) = read_conn.read_exact(&mut msg_buf).await {
+                    break;
+                }
+                let ctrl: Control<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>> = match bincode::decode_from_slice(&msg_buf[..], bincode::config::standard()) {
+                    Ok((ctrl, _)) => ctrl,
+                    Err(_) => continue,
+                };
+                match ctrl {
+                    Control::Real(envelope) => {
+                        let entry = {
+                            let mut in_flight = in_flight_reader.lock().await;
+                            in_flight.remove(&envelope.correlation_id)
+                        };
+                        if let Some(entry) = entry {
+                            let (reply_mutex, notify) = &*entry;
+                            let mut guard = reply_mutex.lock().await;
+                            *guard = Some(envelope.inner);
+                            notify.notify_waiters();
+                        }
+                    }
+                    Control::Handshake => continue,
+                }
+            }
+        });
+        let backend = Arc::new(SubprocessIpcBackend::<M>::new(write_tx, in_flight));
         let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), handler);
-        Ok((kameo::spawn(actor), callback_receiver))
+        Ok((backend, callback_receiver))
     }
 }
 
 /// Trait for message handlers in the child process (no Context, no actor system)
 #[async_trait]
-pub trait ChildProcessMessageHandler<Msg>: Send + 'static {
+pub trait ChildProcessMessageHandler<Msg> {
     type Reply: Send + 'static;
     async fn handle_child_message(&mut self, msg: Msg) -> Self::Reply;
 }
@@ -488,101 +491,124 @@ impl From<std::io::Error> for ChildProcessLoopError {
     }
 }
 
-pub async fn run_child_actor_loop<A, M>(
-    actor: &mut A,
-    mut conn: Box<dyn AsyncReadWrite>,
+// Helper to read the next message from the socket
+async fn read_next_message<M>(conn: &mut tokio::net::UnixStream) -> Option<(u64, Vec<u8>)>
+where
+    M: KameoChildProcessMessage + Send + 'static,
+{
+    // Read the length prefix (u32 LE)
+    let mut len_buf = [0u8; 4];
+    if let Err(_) = conn.read_exact(&mut len_buf).await {
+        return None;
+    }
+    let msg_len = u32::from_le_bytes(len_buf) as usize;
+    let mut msg_buf = vec![0u8; msg_len];
+    if let Err(_) = conn.read_exact(&mut msg_buf).await {
+        return None;
+    }
+    // Decode the Control<M> envelope to extract correlation_id
+    let ctrl: Control<M> = match bincode::decode_from_slice(&msg_buf[..], bincode::config::standard()) {
+        Ok((ctrl, _)) => ctrl,
+        Err(_) => return None,
+    };
+    match ctrl {
+        Control::Real(envelope) => Some((envelope.correlation_id, msg_buf)),
+        Control::Handshake => None,
+    }
+}
+
+pub async fn run_child_actor_loop<H, M>(
+    mut handler: H,
+    mut conn: Box<tokio::net::UnixStream>,
 ) -> Result<(), ChildProcessLoopError>
 where
-    A: ChildProcessMessageHandler<M> + Send + 'static,
+    H: ChildProcessMessageHandler<M, Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>> + Send + Clone + 'static,
     M: KameoChildProcessMessage + Send + 'static,
-    A::Reply: serde::Serialize + bincode::Encode + std::fmt::Debug + 'static,
+    M::Reply: serde::Serialize + bincode::Encode + std::fmt::Debug + 'static,
 {
-    use tracing::{debug, error, info, trace};
-    debug!(
-        event = "lifecycle",
-        status = "running",
-        "Child IPC handler loop started"
-    );
+    use futures::stream::{FuturesUnordered, StreamExt};
+    const MAX_CONCURRENCY: usize = 1024;
+    let mut in_flight = FuturesUnordered::new();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(64);
+    let mut shutdown = false;
     loop {
-        let mut buf = vec![0u8; 4096];
-        let n = match conn.read(&mut buf).await {
-            Ok(0) => {
-                info!(
-                    event = "lifecycle",
-                    status = "shutdown",
-                    "Child process closed connection, shutting down handler"
-                );
-                return Err(ChildProcessLoopError::ChildProcessClosedCleanly);
-            }
-            Ok(n) => n,
-            Err(e) => {
-                error!(event = "lifecycle", error = ?e, "Read error");
-                return Err(ChildProcessLoopError::Io(e));
-            }
-        };
-        let (msg, trace_context) = {
-            let (ctrl, _): (Control<M>, _) =
-                match bincode::decode_from_slice(&buf[..n], bincode::config::standard()) {
-                    Ok((ctrl, _len)) => (ctrl, _len),
+        let in_flight_len = in_flight.len();
+        tokio::select! {
+            biased;
+            // Prioritize reading new messages if under concurrency limit
+            Some((correlation_id, msg)) = async {
+                if !shutdown && in_flight_len < MAX_CONCURRENCY {
+                    read_next_message::<M>(&mut conn).await
+                } else {
+                    None
+                }
+            } => {
+                tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..], "Read message from parent");
+                let ctrl: Control<M> = match bincode::decode_from_slice(&msg[..], bincode::config::standard()) {
+                    Ok((ctrl, _)) => {
+                        tracing::trace!(event = "bincode_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
+                        ctrl
+                    },
                     Err(e) => {
-                        error!(event = "message", error = ?e, "Failed to decode message");
-                        continue;
+                        tracing::error!(event = "bincode_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
+                        return Ok(());
                     }
                 };
-            match ctrl {
-                Control::Handshake => {
-                    debug!(
-                        event = "handshake",
-                        status = "responding",
-                        "Responding to handshake"
-                    );
-                    let resp = Control::<()>::Handshake;
-                    let resp_bytes = match bincode::encode_to_vec(
-                        &resp,
-                        bincode::config::standard(),
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            error!(event = "handshake", error = ?e, "Failed to encode handshake response");
-                            return Err(ChildProcessLoopError::Io(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("Failed to encode handshake response: {e}"),
-                            )));
-                        }
-                    };
-                    conn.write_all(&resp_bytes).await?;
-                    continue;
+                match ctrl {
+                    Control::Handshake => {
+                        tracing::debug!(event = "child_ipc", step = "handshake", "Received handshake from parent");
+                    }
+                    Control::Real(envelope) => {
+                        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&envelope.context.0)
+                        });
+                        let span = tracing::info_span!("child_message_handler", event = "message", handler = "child", process_role = "child");
+                        span.set_parent(parent_cx);
+                        let mut handler = handler.clone();
+                        let reply_tx = reply_tx.clone();
+                        let fut = async move {
+                            let reply = handler.handle_child_message(envelope.inner).instrument(span).await;
+                            tracing::trace!(event = "child_ipc", step = "after_handle", ?reply, correlation_id = correlation_id, "Got reply from handle_child_message");
+                            let reply_envelope = MultiplexEnvelope {
+                                correlation_id,
+                                context: Default::default(),
+                                inner: reply,
+                            };
+                            let ctrl = Control::Real(reply_envelope);
+                            match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
+                                Ok(reply_bytes) => {
+                                    let _ = reply_tx.send((correlation_id, reply_bytes)).await;
+                                },
+                                Err(e) => {
+                                    tracing::error!(event = "bincode_encode_error", correlation_id = correlation_id, error = ?e, "Failed to encode reply envelope");
+                                }
+                            }
+                        };
+                        in_flight.push(fut);
+                        tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(), "Pushed to child in_flight");
+                    }
                 }
-                Control::Real(msg, trace_context) => (msg, trace_context),
             }
-        };
-        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(&trace_context.0)
-        });
-        let span = tracing::info_span!(
-            "child_message_handler",
-            event = "message",
-            handler = "child",
-            process_role = "child"
-        );
-        span.set_parent(parent_cx);
-        trace!(event = "message", status = "handling", handler = "child");
-        let result = actor.handle_child_message(msg).await;
-        let reply_bytes = match bincode::encode_to_vec(
-            &Control::Real(result, TracingContext::default()),
-            bincode::config::standard(),
-        ) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!(event = "message", error = ?e, handler = "child", message = "Failed to encode reply");
-                break;
+            Some(_) = in_flight.next() => {
+                tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
             }
-        };
-        if let Err(e) = conn.write_all(&reply_bytes).await {
-            error!(event = "message", error = ?e, handler = "child", message = "Failed to send reply to parent");
-            break;
+            Some((correlation_id, reply_bytes)) = reply_rx.recv() => {
+                if let Err(e) = conn.write_all(&(reply_bytes.len() as u32).to_le_bytes()).await {
+                    tracing::error!(event = "child_ipc", step = "write_len_error", correlation_id, error = %e, "Failed to write reply length to parent");
+                    break;
+                }
+                if let Err(e) = conn.write_all(&reply_bytes).await {
+                    tracing::error!(event = "child_ipc", step = "write_reply_error", correlation_id, error = %e, "Failed to write reply to parent");
+                    break;
+                }
+                tracing::trace!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
+            }
+            else => {
+                if shutdown && in_flight.is_empty() && reply_rx.is_empty() {
+                    break;
+                }
+            }
         }
-        trace!(event = "message", status = "complete", handler = "child");
     }
     Ok(())
 }
@@ -592,115 +618,7 @@ pub mod prelude {
     // pub use crate::child_process_main; // REMOVED: no longer exists
     // pub use crate::child_process_main_with_runtime; // REMOVED: python/handler actors must provide their own entrypoint
     pub use crate::ChildProcessBuilder;
-    pub use crate::SubprocessActor;
     pub use tokio::runtime;
-}
-
-#[async_trait]
-impl<M, C, E> Message<M> for SubprocessActor<M, C, E>
-where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: crate::callback::ChildCallbackMessage + Sync,
-    E: ProtocolError
-        + std::fmt::Debug
-        + Send
-        + Sync
-        + 'static
-        + bincode::Decode<()>
-        + bincode::Encode
-        + serde::Serialize
-        + for<'de> serde::Deserialize<'de>,
-{
-    type Reply = Result<<M as KameoChildProcessMessage>::Reply, E>;
-
-    #[instrument(skip(self, _ctx), fields(actor_type = "SubprocessActor"), parent = tracing::Span::current())]
-    fn handle(
-        &mut self,
-        msg: M,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> impl Future<Output = Self::Reply> + Send {
-        async move {
-            let mut conn = self.connection.lock().await;
-
-            let mut trace_context_map = std::collections::HashMap::new();
-            global::get_text_map_propagator(|propagator| {
-                propagator.inject_context(&OTelContext::current(), &mut trace_context_map);
-            });
-            let trace_context = TracingContext(trace_context_map);
-
-            // Encode and send the message
-            let control = Control::Real(msg, trace_context);
-            let msg_bytes = match bincode::encode_to_vec(&control, bincode::config::standard()) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::trace!(event = "parent_ipc", step = "encode_failed", error = ?e, "Failed to encode message");
-                    return Err(E::protocol(format!("Failed to encode message: {e}")));
-                }
-            };
-            tracing::trace!(event = "parent_ipc", step = "before_write", ?control, raw_bytes = ?msg_bytes, "About to write message to child");
-            if let Err(e) = conn.write_all(&msg_bytes).await {
-                tracing::trace!(event = "parent_ipc", step = "write_failed", error = ?e, "Failed to write message to child");
-                return Err(E::protocol(format!("Failed to write message: {e}")));
-            }
-            if let Err(e) = conn.flush().await {
-                tracing::trace!(event = "parent_ipc", step = "flush_failed", error = ?e, "Failed to flush message to child");
-                return Err(E::protocol(format!("Failed to flush message: {e}")));
-            }
-            tracing::trace!(
-                event = "parent_ipc",
-                step = "after_write",
-                "Wrote message to child, about to read response"
-            );
-
-            // Read response
-            let mut resp_buf = vec![0u8; 1024 * 64]; // 64KB buffer for responses
-            tracing::trace!(
-                event = "parent_ipc",
-                step = "before_read",
-                "About to read response from child"
-            );
-            let n = match conn.read(&mut resp_buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::trace!(event = "parent_ipc", step = "read_failed", error = ?e, "Failed to read response from child");
-                    return Err(E::protocol(format!("Failed to read response: {e}")));
-                }
-            };
-
-            if n == 0 {
-                tracing::trace!(
-                    event = "parent_ipc",
-                    step = "connection_closed",
-                    "Child closed connection while waiting for response"
-                );
-                return Err(E::connection_closed());
-            }
-
-            tracing::trace!(event = "parent_ipc", step = "after_read", raw_bytes = ?&resp_buf[..n], "Read response from child, about to decode");
-            // Decode response
-            let (control, _) = match bincode::decode_from_slice(
-                &resp_buf[..n],
-                bincode::config::standard(),
-            ) {
-                Ok((ctrl, len)) => (ctrl, len),
-                Err(e) => {
-                    tracing::trace!(event = "parent_ipc", step = "decode_failed", error = ?e, "Failed to decode response from child");
-                    return Err(E::protocol(format!("Failed to decode response: {e}")));
-                }
-            };
-            tracing::trace!(
-                event = "parent_ipc",
-                step = "after_decode",
-                ?control,
-                "Decoded response from child"
-            );
-
-            match control {
-                Control::Handshake => Err(E::protocol("Unexpected handshake response".into())),
-                Control::Real(reply, _trace_context) => reply,
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -716,13 +634,12 @@ pub struct RuntimeConfig {
 }
 
 // 1. Add perform_handshake function for parent/child handshake
-pub async fn perform_handshake<M, E>(
+pub async fn perform_handshake<M>(
     conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
     is_parent: bool,
-) -> Result<(), E>
+) -> Result<(), PythonExecutionError>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    E: ProtocolError + std::fmt::Debug + Send + Sync + 'static,
 {
     use crate::Control;
     use bincode::{decode_from_slice, encode_to_vec};
@@ -731,27 +648,25 @@ where
         // Parent sends handshake
         let handshake_msg = Control::<M>::Handshake;
         let handshake_bytes = encode_to_vec(&handshake_msg, bincode::config::standard())
-            .map_err(|e| E::handshake_failed(format!("Failed to encode handshake: {e}")))?;
+            .map_err(|e| PythonExecutionError::SerializationError { message: format!("Failed to encode handshake: {e}") })?;
         conn.write_all(&handshake_bytes)
             .await
-            .map_err(|e| E::handshake_failed(format!("Failed to write handshake: {e}")))?;
+            .map_err(|e| PythonExecutionError::ExecutionError { message: format!("Failed to write handshake: {e}") })?;
         // Parent reads handshake response
         let mut resp_buf = vec![0u8; 1024];
         let n = conn
             .read(&mut resp_buf)
             .await
-            .map_err(|e| E::handshake_failed(format!("Failed to read handshake response: {e}")))?;
+            .map_err(|e| PythonExecutionError::ExecutionError { message: format!("Failed to read handshake response: {e}") })?;
         if n == 0 {
-            return Err(E::handshake_failed(
-                "Connection closed during handshake".into(),
-            ));
+            return Err(PythonExecutionError::ExecutionError { message: "Connection closed during handshake".into() });
         }
         let (resp, _): (Control<M>, _) =
             decode_from_slice(&resp_buf[..n], bincode::config::standard()).map_err(|e| {
-                E::handshake_failed(format!("Failed to decode handshake response: {e}"))
+                PythonExecutionError::SerializationError { message: format!("Failed to decode handshake response: {e}") }
             })?;
         if !resp.is_handshake() {
-            return Err(E::handshake_failed("Invalid handshake response".into()));
+            return Err(PythonExecutionError::ExecutionError { message: "Invalid handshake response".into() });
         }
     } else {
         // Child reads handshake
@@ -759,26 +674,69 @@ where
         let n = conn
             .read(&mut buf)
             .await
-            .map_err(|e| E::handshake_failed(format!("Failed to read handshake: {e}")))?;
+            .map_err(|e| PythonExecutionError::ExecutionError { message: format!("Failed to read handshake: {e}") })?;
         if n == 0 {
-            return Err(E::handshake_failed(
-                "Connection closed during handshake".into(),
-            ));
+            return Err(PythonExecutionError::ExecutionError { message: "Connection closed during handshake".into() });
         }
         let (handshake, _): (Control<M>, _) =
             decode_from_slice(&buf[..n], bincode::config::standard())
-                .map_err(|e| E::handshake_failed(format!("Failed to decode handshake: {e}")))?;
+                .map_err(|e| PythonExecutionError::SerializationError { message: format!("Failed to decode handshake: {e}") })?;
         if !handshake.is_handshake() {
-            return Err(E::handshake_failed("Invalid handshake message".into()));
+            return Err(PythonExecutionError::ExecutionError { message: "Invalid handshake message".into() });
         }
         // Child sends handshake response
         let resp = Control::<M>::Handshake;
         let resp_bytes = encode_to_vec(&resp, bincode::config::standard()).map_err(|e| {
-            E::handshake_failed(format!("Failed to encode handshake response: {e}"))
+            PythonExecutionError::SerializationError { message: format!("Failed to encode handshake response: {e}") }
         })?;
         conn.write_all(&resp_bytes)
             .await
-            .map_err(|e| E::handshake_failed(format!("Failed to write handshake response: {e}")))?;
+            .map_err(|e| PythonExecutionError::ExecutionError { message: format!("Failed to write handshake response: {e}") })?;
     }
     Ok(())
+}
+
+// 1. Define SubprocessIpcActor<M>
+pub struct SubprocessIpcActor<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    backend: Arc<SubprocessIpcBackend<M>>,
+    _phantom: std::marker::PhantomData<M>,
+}
+
+impl<M> Actor for SubprocessIpcActor<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    type Error = PythonExecutionError;
+    fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+impl<M> kameo::message::Message<M> for SubprocessIpcActor<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    type Reply = Result<M::Reply, PythonExecutionError>;
+    fn handle(
+        &mut self,
+        msg: M,
+        _ctx: &mut kameo::message::Context<Self, Self::Reply>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Self::Reply> + Send>> {
+        let backend = self.backend.clone();
+        Box::pin(async move {
+            let span = tracing::info_span!("ipc_message", message_type = std::any::type_name::<M>());
+            backend.send(msg).instrument(span).await
+        })
+    }
+}
+
+// 3. Factory function to create and spawn the actor shim
+pub fn spawn_subprocess_ipc_actor<M>(backend: Arc<SubprocessIpcBackend<M>>) -> ActorRef<SubprocessIpcActor<M>>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    kameo::spawn(SubprocessIpcActor::<M> { backend, _phantom: std::marker::PhantomData })
 }

@@ -13,6 +13,14 @@ use thiserror::Error;
 use tokio::time::timeout;
 use tracing::{error, info};
 use tracing_futures::Instrument;
+use rand::{Rng, thread_rng};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use std::env;
+use std::fmt::Write as _;
+use futures::stream::StreamExt;
+use kameo_child_process::error::PythonExecutionError;
 
 /// Custom error type for logic operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -126,17 +134,18 @@ impl ChildCallbackMessage for TestCallbackMessage {
 }
 
 // Define a real callback handler for the test
+#[derive(Clone)]
 pub struct TestCallbackHandler;
 
 #[async_trait::async_trait]
 impl kameo_child_process::CallbackHandler<TestCallbackMessage> for TestCallbackHandler {
-    async fn handle(&mut self, callback: TestCallbackMessage) -> u32 {
+    async fn handle(&mut self, callback: TestCallbackMessage) -> Result<u32, kameo_child_process::error::PythonExecutionError> {
         tracing::info!(
             event = "callback_roundtrip",
             value = callback.value,
             "Received callback in Rust"
         );
-        callback.value + 1
+        Ok(callback.value + 1)
     }
 }
 
@@ -197,29 +206,79 @@ impl ChildCallbackMessage for TraderCallbackMessage {
     type Reply = u32;
 }
 
+#[derive(Clone)]
 pub struct TraderCallbackHandler;
 
 #[async_trait::async_trait]
 impl kameo_child_process::CallbackHandler<TraderCallbackMessage> for TraderCallbackHandler {
-    async fn handle(&mut self, callback: TraderCallbackMessage) -> u32 {
+    async fn handle(&mut self, callback: TraderCallbackMessage) -> Result<u32, kameo_child_process::error::PythonExecutionError> {
         tracing::info!(
             event = "trader_callback",
             value = callback.value,
             "Received trader callback in Rust"
         );
-        callback.value + 10
+        Ok(callback.value + 10)
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct BenchMessage {
+    pub id: u64,
+    pub py_sleep_ms: u64,
+    pub rust_sleep_ms: u64,
+}
+
+impl KameoChildProcessMessage for BenchMessage {
+    type Reply = BenchCallbackReply;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct BenchCallback {
+    pub id: u64,
+    pub rust_sleep_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct BenchCallbackReply {
+    pub id: u64,
+}
+
+impl kameo::reply::Reply for BenchCallbackReply {
+    type Ok = Self;
+    type Error = ();
+    type Value = Self;
+    fn to_result(self) -> Result<Self::Ok, Self::Error> { Ok(self) }
+    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> { None }
+    fn into_value(self) -> Self::Value { self }
+}
+
+impl kameo_child_process::ChildCallbackMessage for BenchCallback {
+    type Reply = BenchCallbackReply;
+}
+
+#[derive(Clone)]
+pub struct BenchCallbackHandler;
+
+#[async_trait::async_trait]
+impl kameo_child_process::CallbackHandler<BenchCallback> for BenchCallbackHandler {
+    async fn handle(&mut self, cb: BenchCallback) -> Result<BenchCallbackReply, kameo_child_process::error::PythonExecutionError> {
+        tokio::time::sleep(std::time::Duration::from_millis(cb.rust_sleep_ms)).await;
+        Ok(BenchCallbackReply { id: cb.id })
+    }
+}
+
+const POOL_SIZE: usize = 4;
+
 kameo_snake_handler::setup_python_subprocess_system! {
     actors = {
-        (PythonActor<TestMessage, TestCallbackMessage>, TestMessage, TestCallbackMessage),
-        (PythonActor<TraderMessage, TraderCallbackMessage>, TraderMessage, TraderCallbackMessage),
+        (PythonActor<TestMessage, TestCallbackMessage, PythonExecutionError>, TestMessage, TestCallbackMessage),
+        (PythonActor<TraderMessage, TraderCallbackMessage, PythonExecutionError>, TraderMessage, TraderCallbackMessage),
+        (PythonActor<BenchMessage, BenchCallback, PythonExecutionError>, BenchMessage, BenchCallback),
     },
     child_init = {{
         kameo_child_process::RuntimeConfig {
             flavor: kameo_child_process::RuntimeFlavor::MultiThread ,
-            worker_threads: Some(2),
+            worker_threads: Some(8),
         }
     }},
     parent_init = {
@@ -228,7 +287,19 @@ kameo_snake_handler::setup_python_subprocess_system! {
             .worker_threads(2)
             .thread_name("test-main")
             .enable_all()
-            .build().unwrap();
+            .build()?;
+
+        let args: Vec<String> = env::args().collect();
+        let run_all = args.len() == 1;
+        let run_sync = run_all || args.iter().any(|a| a == "sync");
+        let run_async = run_all || args.iter().any(|a| a == "async");
+        let run_trader = run_all || args.iter().any(|a| a == "trader");
+        let run_bench = run_all || args.iter().any(|a| a == "bench");
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            println!("Usage: kameo-snake-testing [sync] [async] [trader] [bench]");
+            println!("  If no args, runs all tests.");
+            return Ok(());
+        }
 
         runtime.block_on(async {
             // Use OpenTelemetry + fmt subscriber, respects RUST_LOG/env_filter
@@ -241,7 +312,6 @@ kameo_snake_handler::setup_python_subprocess_system! {
             tracing::subscriber::set_global_default(subscriber).expect("set global");
             tracing::info!("Parent runtime initialized");
 
-            // Set up Python subprocess
             let python_path = std::env::current_dir()?
                 .join("crates")
                 .join("kameo-snake-testing")
@@ -251,10 +321,18 @@ kameo_snake_handler::setup_python_subprocess_system! {
                 site_packages.to_string(),
                 python_path.to_string_lossy().to_string(),
             ];
+            if run_sync {
             run_sync_tests(python_path_vec.clone()).await?;
+            }
+            if run_async {
             run_async_tests(python_path_vec.clone()).await?;
-            //run_invalid_config_tests(python_path_vec.clone()).await?;
+            }
+            if run_trader {
             run_trader_demo(python_path_vec.clone()).await?;
+            }
+            if run_bench {
+                run_bench_throughput_test(python_path_vec.clone()).await?;
+            }
             Ok::<(), Box<dyn std::error::Error>>(())
         })?
     }
@@ -275,9 +353,10 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         step = "before_spawn",
         "About to spawn Python child process"
     );
-    let sync_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(sync_config)
-        .spawn::<TestMessage>()
+    let sync_pool = PythonChildProcessBuilder::<TestCallbackMessage>::new(sync_config)
+        .spawn_pool::<TestMessage>(POOL_SIZE)
         .await?;
+    let sync_ref = sync_pool.get_actor();
     tracing::trace!(
         event = "test_spawn",
         step = "after_spawn",
@@ -347,7 +426,7 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         "SYNC Test 6 failed: got {:?}",
         resp
     );
-
+    sync_pool.shutdown().await;
     Ok(())
 }
 
@@ -361,10 +440,11 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/logic_async.py".to_string(),
     };
-    let async_ref = PythonChildProcessBuilder::<TestCallbackMessage>::new(async_config)
+    let async_pool = PythonChildProcessBuilder::<TestCallbackMessage>::new(async_config)
         .with_callback_handler(TestCallbackHandler)
-        .spawn::<TestMessage>()
+        .spawn_pool::<TestMessage>(POOL_SIZE)
         .await?;
+    let async_ref = async_pool.get_actor();
 
     // Test 1: Valid message
     let resp = async_ref
@@ -458,7 +538,7 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
             resp
         );
     }
-
+    async_pool.shutdown().await;
     Ok(())
 }
 
@@ -479,7 +559,7 @@ async fn run_invalid_config_tests(
     let spawn_result = timeout(
         Duration::from_secs(31),
         PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_module_config)
-            .spawn::<TestMessage>(),
+            .spawn_pool::<TestMessage>(POOL_SIZE),
     )
     .await;
     match spawn_result {
@@ -500,7 +580,7 @@ async fn run_invalid_config_tests(
     let spawn_result = timeout(
         Duration::from_secs(31),
         PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_function_config)
-            .spawn::<TestMessage>(),
+            .spawn_pool::<TestMessage>(POOL_SIZE),
     )
     .await;
     match spawn_result {
@@ -521,7 +601,7 @@ async fn run_invalid_config_tests(
     let spawn_result = timeout(
         Duration::from_secs(32),
         PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_path_config)
-            .spawn::<TestMessage>(),
+            .spawn_pool::<TestMessage>(POOL_SIZE),
     )
     .await;
     match spawn_result {
@@ -542,10 +622,11 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/dspy_trader.py".to_string(),
     };
-    let trader_ref = PythonChildProcessBuilder::<TraderCallbackMessage>::new(trader_config)
+    let trader_pool = PythonChildProcessBuilder::<TraderCallbackMessage>::new(trader_config)
         .with_callback_handler(TraderCallbackHandler)
-        .spawn::<TraderMessage>()
+        .spawn_pool::<TraderMessage>(POOL_SIZE)
         .await?;
+    let trader_ref = trader_pool.get_actor();
     let resp = trader_ref
         .ask(TraderMessage::OrderDetails {
             item: "widget".to_string(),
@@ -558,5 +639,108 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         "Trader demo failed: got {:?}",
         resp
     );
+    trader_pool.shutdown().await;
+    Ok(())
+}
+
+async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    const N: usize = 10;
+    const MAX_SLEEP_MS: u64 = 100;
+    let mut rng = thread_rng();
+    let bench_config = PythonConfig {
+        python_path: python_path.clone(),
+        module_name: "bench_async".to_string(),
+        function_name: "handle_bench_message".to_string(),
+        env_vars: vec![],
+        is_async: true,
+        module_path: "crates/kameo-snake-testing/python/bench_async.py".to_string(),
+    };
+    let bench_pool = PythonChildProcessBuilder::<BenchCallback>::new(bench_config)
+        .with_callback_handler(BenchCallbackHandler)
+        .spawn_pool::<BenchMessage>(100)
+        .await?;
+    let start = Instant::now();
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_concurrency = Arc::new(AtomicUsize::new(0));
+    let mut handles = futures::stream::FuturesUnordered::new();
+    let mut latencies = Vec::with_capacity(N);
+    for i in 0..N {
+        let py_sleep_ms = rng.gen_range(10..=MAX_SLEEP_MS);
+        let rust_sleep_ms = rng.gen_range(10..=MAX_SLEEP_MS);
+        let msg = BenchMessage { id: i as u64, py_sleep_ms, rust_sleep_ms };
+        let bench_ref = bench_pool.get_actor();
+        let in_flight = in_flight.clone();
+        let max_concurrency = max_concurrency.clone();
+        handles.push(tokio::spawn(async move {
+            let t0 = Instant::now();
+            let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_concurrency.fetch_max(cur, Ordering::SeqCst);
+            let resp = bench_ref.ask(msg).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            let latency = t0.elapsed();
+            (resp, latency)
+        }));
+    }
+    while let Some(res) = handles.next().await {
+        match res {
+            Ok((Ok(_), latency)) => latencies.push(latency),
+            Ok((Err(e), _)) => eprintln!("Bench error: {e}"),
+            Err(e) => eprintln!("Task join error: {e}"),
+        }
+    }
+    let elapsed = start.elapsed();
+    let max_conc = max_concurrency.load(Ordering::SeqCst);
+    let total = latencies.len();
+    let mean = latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / total as f64;
+    let min = latencies.iter().map(|d| d.as_secs_f64()).fold(f64::INFINITY, f64::min);
+    let max = latencies.iter().map(|d| d.as_secs_f64()).fold(0.0, f64::max);
+    // Histogram buckets: <20ms, 20-40ms, 40-60ms, 60-80ms, 80-100ms, >=100ms
+    let mut buckets = [0usize; 6];
+    for d in &latencies {
+        let ms = d.as_secs_f64() * 1000.0;
+        let idx = if ms < 20.0 {
+            0
+        } else if ms < 40.0 {
+            1
+        } else if ms < 60.0 {
+            2
+        } else if ms < 80.0 {
+            3
+        } else if ms < 100.0 {
+            4
+        } else {
+            5
+        };
+        buckets[idx] += 1;
+    }
+    let mut table = String::new();
+    writeln!(table, "\n┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓").unwrap();
+    writeln!(table,   "┃        🐍  PYTHON BENCHMARK STATS  🦀            ┃").unwrap();
+    writeln!(table,   "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┫").unwrap();
+    writeln!(table,   "┃ Metric                    ┃ Value                 ┃").unwrap();
+    writeln!(table,   "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━╋━━━━━━━━━━━━━━━━━━━━━━━┫").unwrap();
+    writeln!(table,   "┃ Total ops                 ┃ {:>9}              ┃", total).unwrap();
+    writeln!(table,   "┃ Elapsed                   ┃ {:>9.3} s           ┃", elapsed.as_secs_f64()).unwrap();
+    let throughput = total as f64 / elapsed.as_secs_f64();
+    writeln!(table,   "┃ Throughput                ┃ {:>9.1} ops/sec     ┃", throughput).unwrap();
+    writeln!(table,   "┃ Max concurrency           ┃ {:>9}              ┃", max_conc).unwrap();
+    writeln!(table,   "┃ Latency min               ┃ {:>9.3} ms         ┃", min*1000.0).unwrap();
+    writeln!(table,   "┃ Latency mean              ┃ {:>9.3} ms         ┃", mean*1000.0).unwrap();
+    writeln!(table,   "┃ Latency max               ┃ {:>9.3} ms         ┃", max*1000.0).unwrap();
+    writeln!(table,   "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━╋━━━━━━━━━━━━━━━━━━━━━━━┫").unwrap();
+    writeln!(table,   "┃ Latency histogram         ┃                       ┃").unwrap();
+    writeln!(table,   "┃   < 20 ms                 ┃ {:>5}                ┃", buckets[0]).unwrap();
+    writeln!(table,   "┃   20–40 ms                ┃ {:>5}                ┃", buckets[1]).unwrap();
+    writeln!(table,   "┃   40–60 ms                ┃ {:>5}                ┃", buckets[2]).unwrap();
+    writeln!(table,   "┃   60–80 ms                ┃ {:>5}                ┃", buckets[3]).unwrap();
+    writeln!(table,   "┃   80–100 ms               ┃ {:>5}                ┃", buckets[4]).unwrap();
+    writeln!(table,   "┃   >= 100 ms               ┃ {:>5}                ┃", buckets[5]).unwrap();
+    writeln!(table,   "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━┻━━━━━━━━━━━━━━━━━━━━━━━┛").unwrap();
+    if throughput > 500.0 {
+        println!("{}\n✅ Throughput is excellent!", table);
+    } else {
+        println!("{}\n⚠️  Throughput is below target!", table);
+    }
+    bench_pool.shutdown().await;
     Ok(())
 }

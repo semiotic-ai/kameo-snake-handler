@@ -50,7 +50,6 @@ try:
     lm = dspy.LM(
         model="openrouter/deepseek/deepseek-r1:free",
         api_key=os.environ.get("OPENROUTER_API_KEY"),
-        allow_tool_async_sync_conversion=True,
     )
     dspy.configure(lm=lm)
     print("[DEBUG] DSPy LM initialized successfully!")

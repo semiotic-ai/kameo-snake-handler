@@ -34,6 +34,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-futures = "0.2"
+rand.workspace = true
 
 [dev-dependencies]
 proptest = "1.4"

@@ -28,6 +28,7 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dictionary containing response data
     """
+    import kameo
     try:
         logging.info(f"Received message: {message}")
         # Accept both old and new keys for each operation
@@ -99,12 +100,11 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
             if currency_val < 0 or points_val < 0:
                 raise LogicError(f"currency/teef and points/victory_points must be non-negative, got {currency_val}, {points_val}")
             result = await process_async_calculation(calculate_reward, currency_val, points_val)
-            resp = {"RewardResult": {"total_currency": int(result["total_currency"]), "bonus_currency": int(result["bonus_currency"])}}
+            resp = {"RewardResult": {"total_currency": int(result["total_currency"]), "bonus_currency": int(result["bonus_currency"])} }
             logging.info(f"Returning: {resp}")
             return resp
         elif "CallbackRoundtrip" in message:
             value = message["CallbackRoundtrip"]["value"]
-            import kameo
             result = await kameo.callback_handle({"value": value})
             return {"CallbackRoundtripResult": {"value": result}}
         else:

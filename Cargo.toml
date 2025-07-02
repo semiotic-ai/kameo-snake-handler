@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "kameo-pyo3-async-test"]
 resolver = "2"
 
 [workspace.package]
@@ -44,6 +44,6 @@ console-subscriber = "0.2"
 
 [workspace.metadata.maturin]
 python-source = "python"
-python-packages = ["kameo-snake-testing"]
+python-packages = ["kameo-snake-testing"] 
 
 tracing-futures = "0.2" 

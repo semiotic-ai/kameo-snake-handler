@@ -52,12 +52,12 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
 
     if config.otlp_enabled {
         tracing::info!(protocol = %protocol, "Adding OTLP exporter");
-        let builder = opentelemetry_otlp::SpanExporter::builder();
-        let exporter = match protocol.as_str() {
-            "grpc" => builder.with_tonic().build().expect("Failed to create OTLP span exporter"),
+    let builder = opentelemetry_otlp::SpanExporter::builder();
+    let exporter = match protocol.as_str() {
+        "grpc" => builder.with_tonic().build().expect("Failed to create OTLP span exporter"),
             "http/protobuf" => builder.with_http().build().expect("Failed to create OTLP span exporter"),
-            other => panic!("Unknown OTEL_EXPORTER_OTLP_PROTOCOL: {} (expected 'grpc' or 'http/protobuf')", other),
-        };
+        other => panic!("Unknown OTEL_EXPORTER_OTLP_PROTOCOL: {} (expected 'grpc' or 'http/protobuf')", other),
+    };
         provider_builder = provider_builder.with_batch_exporter(exporter);
     }
     if config.stdout_enabled {
@@ -97,12 +97,12 @@ pub fn setup_otel_layer_with_config(config: TelemetryExportConfig) -> impl traci
 
     if config.otlp_enabled {
         tracing::info!(protocol = %protocol, "Adding OTLP exporter");
-        let builder = opentelemetry_otlp::SpanExporter::builder();
-        let exporter = match protocol.as_str() {
-            "grpc" => builder.with_tonic().build().expect("Failed to create OTLP span exporter"),
-            "http/protobuf" => builder.with_http().build().expect("Failed to create OTLP span exporter"),
-            other => panic!("Unknown OTEL_EXPORTER_OTLP_PROTOCOL: {} (expected 'grpc' or 'http/protobuf')", other),
-        };
+    let builder = opentelemetry_otlp::SpanExporter::builder();
+    let exporter = match protocol.as_str() {
+        "grpc" => builder.with_tonic().build().expect("Failed to create OTLP span exporter"),
+        "http/protobuf" => builder.with_http().build().expect("Failed to create OTLP span exporter"),
+        other => panic!("Unknown OTEL_EXPORTER_OTLP_PROTOCOL: {} (expected 'grpc' or 'http/protobuf')", other),
+    };
         provider_builder = provider_builder.with_batch_exporter(exporter);
     }
     if config.stdout_enabled {
