@@ -1,14 +1,9 @@
-use super::*;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::process::Command;
-use tracing::{debug, error, instrument};
+use tracing::{debug, instrument};
 use uuid::Uuid;
 use tokio::net::{UnixListener, UnixStream};
-use std::any::Any;
-use crate::AsyncReadWrite;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 pub fn unique_socket_path(actor_name: &str) -> PathBuf {
     let mut path = std::path::PathBuf::from("/tmp");

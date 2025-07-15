@@ -3,9 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
 use tracing::error;
+#[cfg(feature = "python")]
 use pyo3::exceptions::{
-    PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError, PyValueError,
+    PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError, PyValueError
 };
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 #[derive(Debug, Error)]
@@ -90,45 +92,35 @@ impl ProtocolError for SubprocessIpcBackendIpcError {
 pub enum PythonExecutionError {
     #[error("Python module '{module}' not found: {message}")]
     ModuleNotFound { module: String, message: String },
-
     #[error("Python function '{function}' not found in module '{module}': {message}")]
     FunctionNotFound {
         module: String,
         function: String,
         message: String,
     },
-
     #[error("Python execution error: {message}")]
     ExecutionError { message: String },
-
     #[error("Python value error: {message}")]
     ValueError { message: String },
-
     #[error("Python type error: {message}")]
     TypeError { message: String },
-
     #[error("Python import error for module '{module}': {message}")]
     ImportError { module: String, message: String },
-
     #[error("Python attribute error: {message}")]
     AttributeError { message: String },
-
     #[error("Python runtime error: {message}")]
     RuntimeError { message: String },
-
     #[error("Failed to serialize Rust value to Python: {message}")]
     SerializationError { message: String },
-
     #[error("Failed to deserialize Python value to Rust: {message}")]
     DeserializationError { message: String },
-
     #[error("Failed to call Python function '{function}': {message}")]
     CallError { function: String, message: String },
-
     #[error("Failed to convert between Python and Rust types: {message}")]
     ConversionError { message: String },
 }
 
+#[cfg(feature = "python")]
 impl PythonExecutionError {
     pub fn from_pyerr(err: PyErr, py: Python) -> Self {
         if err.is_instance_of::<PyModuleNotFoundError>(py) {
@@ -169,6 +161,7 @@ impl PythonExecutionError {
     }
 }
 
+#[cfg(feature = "python")]
 impl From<PyErr> for PythonExecutionError {
     fn from(err: PyErr) -> Self {
         Python::with_gil(|py| Self::from_pyerr(err, py))

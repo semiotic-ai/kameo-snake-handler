@@ -5,7 +5,6 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use tracing_subscriber::{layer::SubscriberExt, Registry};
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing::Level;
 use opentelemetry_stdout::SpanExporter;
 use tracing_subscriber::filter::EnvFilter;
 

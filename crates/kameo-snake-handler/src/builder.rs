@@ -1,15 +1,25 @@
-use kameo_child_process::error::PythonExecutionError;
-use kameo_child_process::callback::{ChildCallbackMessage, CallbackHandler, NoopCallbackHandler};
 use kameo_child_process::KameoChildProcessMessage;
-use std::marker::PhantomData;
 use tracing::Level;
 use tracing_futures::Instrument;
-use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot, Mutex as TokioMutex, Notify};
+use kameo_child_process::callback::{NoopCallbackHandler, CallbackHandler};
+use std::time::Duration;
 
 /// Builder for a Python child process
 /// NOTE: For PythonActor, use the macro-based entrypoint (setup_python_subprocess_system!). This builder is not supported for PythonActor.
 /// NOTE: SubprocessParentActor is only valid as an in-process actor with DelegatedReply. If used as a protocol boundary, use the serializable reply type and the original actor.
+
+/// Configuration for the parent actor loop concurrency
+pub struct ParentActorLoopConfig {
+    pub max_concurrency: usize,
+}
+
+impl Default for ParentActorLoopConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: 10_000,
+        }
+    }
+}
 
 // --- Actor Pool for Python Child Process ---
 pub struct PythonChildProcessActorPool<M>
@@ -27,7 +37,8 @@ where
     actors: Vec<kameo::actor::ActorRef<kameo_child_process::SubprocessIpcActor<M>>>,
     next: std::sync::atomic::AtomicUsize,
     child: Option<tokio::process::Child>,
-    write_tx: Option<tokio::sync::mpsc::Sender<kameo_child_process::WriteRequest>>,
+    write_tx: Option<tokio::sync::mpsc::UnboundedSender<kameo_child_process::WriteRequest<M>>>,
+    // callback_shutdown: Option<tokio::sync::Notify>,
 }
 
 impl<M> PythonChildProcessActorPool<M>
@@ -60,9 +71,9 @@ where
     }
 }
 
-pub struct PythonChildProcessBuilder<C, H = NoopCallbackHandler<C>>
+pub struct PythonChildProcessBuilder<C, H>
 where
-    C: ChildCallbackMessage + Sync + Clone,
+    C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
     H: CallbackHandler<C> + Clone + Send + Sync + 'static,
 {
     python_config: crate::PythonConfig,
@@ -73,7 +84,7 @@ where
 
 impl<C> PythonChildProcessBuilder<C, NoopCallbackHandler<C>>
 where
-    C: ChildCallbackMessage + Sync + Clone,
+    C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
 {
     /// Creates a new builder with the given Python configuration.
     #[tracing::instrument]
@@ -102,19 +113,13 @@ where
 
 impl<C, H> PythonChildProcessBuilder<C, H>
 where
-    C: ChildCallbackMessage + Sync + Clone,
+    C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
     H: CallbackHandler<C> + Clone + Send + Sync + 'static,
 {
     /// Sets the log level for the child process.
-    pub fn log_level(mut self, level: Level) -> Self {
-        self.log_level = level;
-        self
-    }
-
-    /// Inject a custom callback handler for callback IPC.
-    pub fn with_callback_handler<NH>(self, handler: NH) -> PythonChildProcessBuilder<C, NH>
+    pub fn with_callback_handler<T>(self, handler: T) -> PythonChildProcessBuilder<C, T>
     where
-        NH: CallbackHandler<C> + Clone + Send + Sync + 'static,
+        T: CallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         PythonChildProcessBuilder {
             python_config: self.python_config,
@@ -124,9 +129,15 @@ where
         }
     }
 
+    pub fn log_level(mut self, level: Level) -> Self {
+        self.log_level = level;
+        self
+    }
+
     pub async fn spawn_pool<M>(
         self,
         pool_size: usize,
+        parent_config: Option<ParentActorLoopConfig>,
     ) -> std::io::Result<PythonChildProcessActorPool<M>>
     where
         M: KameoChildProcessMessage + Send + Sync + 'static,
@@ -139,12 +150,10 @@ where
             + Sync
             + 'static,
     {
-        use kameo_child_process::{SubprocessIpcBackend, spawn_subprocess_ipc_actor, CallbackReceiver, WriteRequest, Control, PythonExecutionError};
+        use kameo_child_process::spawn_subprocess_ipc_actor;
+        use kameo_child_process::callback::CallbackReceiver;
         use tokio::net::UnixListener;
-        use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use std::time::Duration;
-        use std::collections::HashMap;
+        let _parent_config = parent_config.unwrap_or_default();
         // Serialize the PythonConfig as JSON for the child
         let config_json = serde_json::to_string(&self.python_config).map_err(|e| {
             std::io::Error::new(
@@ -153,7 +162,7 @@ where
             )
         })?;
         // Set up the Unix domain sockets
-        let actor_name = std::any::type_name::<crate::PythonActor<M, C, PythonExecutionError>>();
+        let actor_name = std::any::type_name::<crate::PythonActor<M, C>>();
         let request_socket_path = kameo_child_process::handshake::unique_socket_path(&format!("{}-req", actor_name));
         let callback_socket_path = kameo_child_process::handshake::unique_socket_path(&format!("{}-cb", actor_name));
         let request_endpoint = request_socket_path.to_string_lossy().to_string();
@@ -177,7 +186,7 @@ where
         }
         cmd.stdout(std::process::Stdio::inherit());
         cmd.stderr(std::process::Stdio::inherit());
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         // Accept request connection and perform handshake
         let (mut request_conn, _addr) = tokio::time::timeout(
             Duration::from_secs(30),
@@ -192,119 +201,24 @@ where
             callback_incoming.accept(),
         ).await??;
         // Backend and callback receiver setup (copied from backend builder)
-        let (read_half, write_half) = request_conn.into_split();
-        let (write_tx, mut write_rx) = mpsc::channel::<WriteRequest>(128);
-        let in_flight: Arc<TokioMutex<HashMap<u64, Arc<(TokioMutex<Option<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>>>, Notify)>>>> = Arc::new(TokioMutex::new(HashMap::new()));
-        let in_flight_writer = in_flight.clone();
-        let in_flight_reader = in_flight.clone();
-        // Writer task
-        tokio::spawn(async move {
-            let mut write_conn = write_half;
-            while let Some(req) = write_rx.recv().await {
-                let len = (req.bytes.len() as u32).to_le_bytes();
-                if let Err(e) = write_conn.write_all(&len).await {
-                    let mut in_flight = in_flight_writer.lock().await;
-                    if let Some(slot) = in_flight.remove(&req.correlation_id) {
-                        let (reply_mutex, notify) = &*slot;
-                        let mut guard = reply_mutex.lock().await;
-                        *guard = Some(Err(PythonExecutionError::ExecutionError { message: format!("Failed to write length prefix: {e}") }));
-                        notify.notify_waiters();
-                    }
-                    break;
-                }
-                if let Err(e) = write_conn.write_all(&req.bytes).await {
-                    let mut in_flight = in_flight_writer.lock().await;
-                    if let Some(slot) = in_flight.remove(&req.correlation_id) {
-                        let (reply_mutex, notify) = &*slot;
-                        let mut guard = reply_mutex.lock().await;
-                        *guard = Some(Err(PythonExecutionError::ExecutionError { message: format!("Failed to write message: {e}") }));
-                        notify.notify_waiters();
-                    }
-                    break;
-                }
-                if let Err(e) = write_conn.flush().await {
-                    let mut in_flight = in_flight_writer.lock().await;
-                    if let Some(slot) = in_flight.remove(&req.correlation_id) {
-                        let (reply_mutex, notify) = &*slot;
-                        let mut guard = reply_mutex.lock().await;
-                        *guard = Some(Err(PythonExecutionError::ExecutionError { message: format!("Failed to flush: {e}") }));
-                        notify.notify_waiters();
-                    }
-                    break;
-                }
-            }
-        });
-        // Reader task
-        tokio::spawn(async move {
-            let mut read_conn = read_half;
-            tracing::info!(event = "parent_reader", step = "start", "Parent reader task started (span ID is used as correlation_id)");
-            loop {
-                let mut len_buf = [0u8; 4];
-                match read_conn.read_exact(&mut len_buf).await {
-                    Ok(_) => {},
-                    Err(e) => {
-                        tracing::error!(event = "parent_reader", step = "read_len", error = ?e, "Failed to read length prefix, exiting reader task");
-                        break;
-                    }
-                }
-                let msg_len = u32::from_le_bytes(len_buf) as usize;
-                let mut msg_buf = vec![0u8; msg_len];
-                match read_conn.read_exact(&mut msg_buf).await {
-                    Ok(_) => {
-                        tracing::trace!(event = "parent_reader", step = "read_msg", msg_len, raw = ?&msg_buf[..], "Read message from child");
-                    },
-                    Err(e) => {
-                        tracing::error!(event = "parent_reader", step = "read_msg", error = ?e, "Failed to read message body, exiting reader task");
-                        break;
-                    }
-                }
-                let ctrl_result = bincode::decode_from_slice::<Control<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>>, _>(&msg_buf[..], bincode::config::standard());
-                match ctrl_result {
-                    Ok((ctrl, _)) => {
-                        tracing::trace!(event = "parent_reader", step = "decode_ctrl", ctrl_type = ?std::any::type_name::<Control<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>>>(), "Decoded Control envelope");
-                        match ctrl {
-                            Control::Real(envelope) => {
-                                let correlation_id = envelope.correlation_id;
-                                let slot = {
-                                    let mut in_flight = in_flight_reader.lock().await;
-                                    in_flight.remove(&correlation_id)
-                                };
-                                if let Some(slot) = slot {
-                                    tracing::trace!(event = "parent_reader", step = "match_in_flight", correlation_id, "Matched reply to in_flight request");
-                                    let (reply_mutex, notify) = &*slot;
-                                    let mut guard = reply_mutex.lock().await;
-                                    *guard = Some(envelope.inner);
-                                    notify.notify_waiters();
-                                } else {
-                                    tracing::warn!(event = "parent_reader", step = "no_in_flight", correlation_id, "No in_flight entry for correlation_id");
-                                }
-                            }
-                            Control::Handshake => {
-                                tracing::trace!(event = "parent_reader", step = "handshake", "Received handshake control message");
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(event = "parent_reader", step = "decode_error", error = ?e, raw = ?&msg_buf[..], "Failed to decode Control envelope, skipping message");
-                        continue;
-                    }
-                }
-            }
-            tracing::warn!(event = "parent_reader", step = "exit", "Reader task exiting");
-        });
-        let backend = Arc::new(SubprocessIpcBackend::new(write_tx.clone(), in_flight.clone()));
-        let callback_receiver = CallbackReceiver::new(Box::new(callback_conn), self.callback_handler);
+        let backend = kameo_child_process::SubprocessIpcBackend::from_duplex(
+            kameo_child_process::DuplexUnixStream::new(request_conn)
+        );
+        let receiver = CallbackReceiver::<C, H>::from_duplex(
+            kameo_child_process::DuplexUnixStream::new(callback_conn),
+            self.callback_handler.clone(),
+        );
         let mut actors = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
             actors.push(spawn_subprocess_ipc_actor(backend.clone()));
         }
-        tokio::spawn(callback_receiver.run().instrument(tracing::Span::current()));
+        tokio::spawn(receiver.run().instrument(tracing::Span::current()));
         Ok(PythonChildProcessActorPool {
             actors,
             next: std::sync::atomic::AtomicUsize::new(0),
             child: Some(child),
-            write_tx: Some(write_tx),
+            write_tx: None, // No longer needed
+            // callback_shutdown: None, // No longer needed
         })
     }
 }

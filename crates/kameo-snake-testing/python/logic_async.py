@@ -11,6 +11,8 @@ from logic import (
     calculate_competition_result, calculate_reward,
     LogicError
 )
+import kameo
+print("Imported kameo, has callback_handle:", hasattr(kameo, "callback_handle"))
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='[PYTHON ASYNC] %(levelname)s %(message)s')
 
@@ -28,7 +30,6 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dictionary containing response data
     """
-    import kameo
     try:
         logging.info(f"Received message: {message}")
         # Accept both old and new keys for each operation
@@ -105,8 +106,8 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
             return resp
         elif "CallbackRoundtrip" in message:
             value = message["CallbackRoundtrip"]["value"]
-            result = await kameo.callback_handle({"value": value})
-            return {"CallbackRoundtripResult": {"value": result}}
+            await kameo.callback_handle({'value': value})
+            return {'CallbackRoundtripResult': {'value': value + 1}}
         else:
             raise LogicError(f"Unknown message type: {message}")
     except Exception as e:

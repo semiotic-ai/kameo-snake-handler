@@ -8,8 +8,6 @@ pub use kameo_child_process::error::PythonExecutionError;
 mod builder;
 pub use builder::PythonChildProcessBuilder;
 
-pub use kameo_child_process::NoopCallbackHandler;
-
 mod actor;
 pub use actor::{child_process_main_with_python_actor, PythonActor, PythonConfig};
 

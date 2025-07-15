@@ -951,9 +951,11 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tracing",
  "tracing-futures",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 

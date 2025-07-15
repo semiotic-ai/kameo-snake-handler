@@ -7,16 +7,15 @@ use kameo::error::{ActorStopReason, PanicError};
 use kameo::message::Message;
 use kameo_child_process::ChildProcessMessageHandler;
 use kameo_child_process::{
-    CallbackHandle, ChildCallbackMessage, KameoChildProcessMessage, RuntimeAware,
+    KameoChildProcessMessage, RuntimeAware,
 };
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use tracing::instrument;
-use kameo_child_process::callback;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// Configuration for Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct PythonConfig {
@@ -30,17 +29,13 @@ pub struct PythonConfig {
 
 /// Python subprocess actor
 #[derive(Debug)]
-pub struct PythonActor<M, C, E>
+pub struct PythonActor<M, E>
 where
-    C: callback::ChildCallbackMessage + Sync,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
-    config: PythonConfig,
-    py_function: PyObject,
-    callback_handle: Option<Arc<callback::CallbackHandle<C, E>>>,
-    _phantom: std::marker::PhantomData<(M, E)>,
     handler: PythonMessageHandler,
     concurrent_tasks: Arc<AtomicUsize>,
+    _phantom: std::marker::PhantomData<(M, E)>,
 }
 
 #[derive(Debug)]
@@ -67,35 +62,28 @@ impl Clone for PythonMessageHandler {
     }
 }
 
-impl<M, C, E> PythonActor<M, C, E>
+impl<M, E> PythonActor<M, E>
 where
-    C: callback::ChildCallbackMessage + Sync,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
-    pub fn new(config: PythonConfig, py_function: PyObject) -> Self {
-        let handler = Python::with_gil(|py| {
-            let py_any: Py<PyAny> = py_function.extract(py).expect("Failed to extract Py<PyAny> from PyObject");
-            PythonMessageHandler {
-                py_function: py_any,
-                config: config.clone(),
-            }
-        });
-        Self {
-            config: config.clone(),
+    pub fn new(config: PythonConfig, py_function: Py<PyAny>) -> Self {
+        tracing::debug!("Storing reference to Python function in handler: {:?}", py_function);
+        let handler = PythonMessageHandler {
             py_function,
-            callback_handle: None,
-            _phantom: std::marker::PhantomData,
+            config,
+        };
+        Self {
             handler,
             concurrent_tasks: Arc::new(AtomicUsize::new(0)),
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
 #[async_trait]
-impl<M, C, E> Actor for PythonActor<M, C, E>
+impl<M, E> Actor for PythonActor<M, E>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: callback::ChildCallbackMessage + Sync,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
     type Error = PythonExecutionError;
@@ -138,10 +126,9 @@ where
 }
 
 #[async_trait]
-impl<M, C, E> Message<M> for PythonActor<M, C, E>
+impl<M, E> Message<M> for PythonActor<M, E>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: callback::ChildCallbackMessage + Sync,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
     type Reply = kameo::reply::DelegatedReply<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>>;
@@ -151,7 +138,7 @@ where
         message: M,
         ctx: &mut kameo::message::Context<Self, Self::Reply>,
     ) -> impl std::future::Future<Output = Self::Reply> + Send {
-        let mut handler = self.handler.clone();
+        let handler = self.handler.clone();
         let (delegated, reply_sender) = ctx.reply_sender();
         let concurrent_tasks = self.concurrent_tasks.clone();
         if let Some(reply_sender) = reply_sender {
@@ -171,25 +158,16 @@ where
     }
 }
 
-impl<M, C, E> callback::CallbackSender<C, E> for PythonActor<M, C, E>
-where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: callback::ChildCallbackMessage + Sync,
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
-{
-    fn set_callback_handle(&mut self, handle: std::sync::Arc<callback::CallbackHandle<C, E>>) {
-        self.callback_handle = Some(handle);
-    }
-}
-
 #[async_trait]
-impl<M, C, E> RuntimeAware for PythonActor<M, C, E>
+impl<M, E> RuntimeAware for PythonActor<M, E>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: callback::ChildCallbackMessage + Sync,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
-    async fn init_with_runtime(self) -> Result<Self, Self::Error> {
+    async fn init_with_runtime(self) -> Result<Self, Self::Error>
+    where
+        Self: Sized,
+    {
         // Any actor-specific setup can go here
         Ok(self)
     }
@@ -197,17 +175,17 @@ where
 
 /// Python-specific child process main entrypoint. Does handshake, sets callback, calls init_with_runtime, and runs the actor loop.
 #[instrument(
-    skip(actor, request_conn),
+    skip(actor, request_conn, config),
     name = "child_process_main_with_python_actor",
     parent = tracing::Span::current()
 )]
-pub async fn child_process_main_with_python_actor<M, C, E>(
-    actor: PythonActor<M, C, E>,
+pub async fn child_process_main_with_python_actor<M, E>(
+    actor: PythonActor<M, E>,
     request_conn: Box<tokio::net::UnixStream>,
+    config: Option<kameo_child_process::ChildActorLoopConfig>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    C: callback::ChildCallbackMessage + Sync,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
     use kameo_child_process::{perform_handshake, run_child_actor_loop};
@@ -215,7 +193,7 @@ where
     let mut conn = request_conn;
     perform_handshake::<M>(&mut conn, false).await?;
     tracing::info!("running child actor loop");
-    match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn).await {
+    match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn, config).await {
         Ok(()) => {
             tracing::info!("Child process exited cleanly.");
             Ok(())
@@ -239,17 +217,18 @@ where
 }
 
 impl PythonMessageHandler {
-    pub async fn handle_child_message_impl<M>(&mut self, msg: M) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>
+    pub async fn handle_child_message_impl<M>(&self, message: M) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>
     where
-        M: KameoChildProcessMessage + Send + Sync + 'static,
+        M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
     {
+        tracing::debug!("Calling stored Python function for message: {:?}", message);
         use pyo3::prelude::*;
         use pyo3_async_runtimes::tokio::into_future;
-        tracing::debug!(event = "python_call", step = "start", ?msg, "handle_child_message entry");
+        tracing::debug!(event = "python_call", step = "start", ?message, "handle_child_message entry");
         let is_async = self.config.is_async;
         let function_name = self.config.function_name.clone();
         let py_function = Python::with_gil(|py| self.py_function.clone_ref(py));
-        let py_msg = Python::with_gil(|py| crate::serde_py::to_pyobject(py, &msg));
+        let py_msg = Python::with_gil(|py| crate::serde_py::to_pyobject(py, &message));
         let py_msg = match py_msg {
             Ok(obj) => obj,
             Err(e) => {

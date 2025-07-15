@@ -1,8 +1,6 @@
 use bincode::{Decode, Encode};
 use kameo::reply::Reply;
-use kameo_child_process::ChildCallbackMessage;
 use kameo_child_process::KameoChildProcessMessage;
-use kameo_snake_handler::declare_callback_glue;
 use kameo_snake_handler::prelude::*;
 use kameo_snake_handler::telemetry::build_subscriber_with_otel_and_fmt_async_with_config;
 use kameo_snake_handler::telemetry::TelemetryExportConfig;
@@ -21,6 +19,11 @@ use std::env;
 use std::fmt::Write as _;
 use futures::stream::StreamExt;
 use kameo_child_process::error::PythonExecutionError;
+use kameo_child_process::callback::{CallbackHandler, NoopCallbackHandler};
+use pyo3::prelude::*;
+use pyo3::pyfunction;
+use pyo3::types::{PyAny, PyModule};
+
 
 /// Custom error type for logic operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone, Decode, Encode)]
@@ -129,23 +132,30 @@ pub struct TestCallbackMessage {
     pub value: u32,
 }
 
-impl ChildCallbackMessage for TestCallbackMessage {
-    type Reply = u32;
-}
-
-// Define a real callback handler for the test
 #[derive(Clone)]
 pub struct TestCallbackHandler;
 
 #[async_trait::async_trait]
-impl kameo_child_process::CallbackHandler<TestCallbackMessage> for TestCallbackHandler {
-    async fn handle(&mut self, callback: TestCallbackMessage) -> Result<u32, kameo_child_process::error::PythonExecutionError> {
-        tracing::info!(
-            event = "callback_roundtrip",
-            value = callback.value,
-            "Received callback in Rust"
-        );
-        Ok(callback.value + 1)
+impl CallbackHandler<TestCallbackMessage> for TestCallbackHandler {
+    async fn handle(&self, callback: TestCallbackMessage) -> Result<(), PythonExecutionError> {
+        tracing::info!(event = "test_callback", value = callback.value, "TestCallbackHandler received callback");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CallbackHandler<TraderCallbackMessage> for TestCallbackHandler {
+    async fn handle(&self, callback: TraderCallbackMessage) -> Result<(), PythonExecutionError> {
+        tracing::info!(event = "trader_callback", value = callback.value, "TestCallbackHandler received trader callback");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl CallbackHandler<BenchCallback> for TestCallbackHandler {
+    async fn handle(&self, callback: BenchCallback) -> Result<(), PythonExecutionError> {
+        tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "TestCallbackHandler received bench callback");
+        Ok(())
     }
 }
 
@@ -202,25 +212,6 @@ pub struct TraderCallbackMessage {
     pub value: u32,
 }
 
-impl ChildCallbackMessage for TraderCallbackMessage {
-    type Reply = u32;
-}
-
-#[derive(Clone)]
-pub struct TraderCallbackHandler;
-
-#[async_trait::async_trait]
-impl kameo_child_process::CallbackHandler<TraderCallbackMessage> for TraderCallbackHandler {
-    async fn handle(&mut self, callback: TraderCallbackMessage) -> Result<u32, kameo_child_process::error::PythonExecutionError> {
-        tracing::info!(
-            event = "trader_callback",
-            value = callback.value,
-            "Received trader callback in Rust"
-        );
-        Ok(callback.value + 10)
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct BenchMessage {
     pub id: u64,
@@ -252,91 +243,7 @@ impl kameo::reply::Reply for BenchCallbackReply {
     fn into_value(self) -> Self::Value { self }
 }
 
-impl kameo_child_process::ChildCallbackMessage for BenchCallback {
-    type Reply = BenchCallbackReply;
-}
-
-#[derive(Clone)]
-pub struct BenchCallbackHandler;
-
-#[async_trait::async_trait]
-impl kameo_child_process::CallbackHandler<BenchCallback> for BenchCallbackHandler {
-    async fn handle(&mut self, cb: BenchCallback) -> Result<BenchCallbackReply, kameo_child_process::error::PythonExecutionError> {
-        tokio::time::sleep(std::time::Duration::from_millis(cb.rust_sleep_ms)).await;
-        Ok(BenchCallbackReply { id: cb.id })
-    }
-}
-
 const POOL_SIZE: usize = 4;
-
-kameo_snake_handler::setup_python_subprocess_system! {
-    actors = {
-        (PythonActor<TestMessage, TestCallbackMessage, PythonExecutionError>, TestMessage, TestCallbackMessage),
-        (PythonActor<TraderMessage, TraderCallbackMessage, PythonExecutionError>, TraderMessage, TraderCallbackMessage),
-        (PythonActor<BenchMessage, BenchCallback, PythonExecutionError>, BenchMessage, BenchCallback),
-    },
-    child_init = {{
-        kameo_child_process::RuntimeConfig {
-            flavor: kameo_child_process::RuntimeFlavor::MultiThread ,
-            worker_threads: Some(8),
-        }
-    }},
-    parent_init = {
-        // Create parent runtime
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("test-main")
-            .enable_all()
-            .build()?;
-
-        let args: Vec<String> = env::args().collect();
-        let run_all = args.len() == 1;
-        let run_sync = run_all || args.iter().any(|a| a == "sync");
-        let run_async = run_all || args.iter().any(|a| a == "async");
-        let run_trader = run_all || args.iter().any(|a| a == "trader");
-        let run_bench = run_all || args.iter().any(|a| a == "bench");
-        if args.iter().any(|a| a == "--help" || a == "-h") {
-            println!("Usage: kameo-snake-testing [sync] [async] [trader] [bench]");
-            println!("  If no args, runs all tests.");
-            return Ok(());
-        }
-
-        runtime.block_on(async {
-            // Use OpenTelemetry + fmt subscriber, respects RUST_LOG/env_filter
-            let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
-                TelemetryExportConfig {
-                    otlp_enabled: true,
-                    stdout_enabled: true,
-                }
-            ).await;
-            tracing::subscriber::set_global_default(subscriber).expect("set global");
-            tracing::info!("Parent runtime initialized");
-
-            let python_path = std::env::current_dir()?
-                .join("crates")
-                .join("kameo-snake-testing")
-                .join("python");
-            let site_packages = "crates/kameo-snake-testing/python/venv/lib/python3.13/site-packages";
-            let python_path_vec = vec![
-                site_packages.to_string(),
-                python_path.to_string_lossy().to_string(),
-            ];
-            if run_sync {
-            run_sync_tests(python_path_vec.clone()).await?;
-            }
-            if run_async {
-            run_async_tests(python_path_vec.clone()).await?;
-            }
-            if run_trader {
-            run_trader_demo(python_path_vec.clone()).await?;
-            }
-            if run_bench {
-                run_bench_throughput_test(python_path_vec.clone()).await?;
-            }
-            Ok::<(), Box<dyn std::error::Error>>(())
-        })?
-    }
-}
 
 #[tracing::instrument]
 async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -353,8 +260,9 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         step = "before_spawn",
         "About to spawn Python child process"
     );
-    let sync_pool = PythonChildProcessBuilder::<TestCallbackMessage>::new(sync_config)
-        .spawn_pool::<TestMessage>(POOL_SIZE)
+    let sync_pool = PythonChildProcessBuilder::<TestCallbackMessage, NoopCallbackHandler<TestCallbackMessage>>::new(sync_config)
+        .with_callback_handler(TestCallbackHandler)
+        .spawn_pool::<TestMessage>(POOL_SIZE, None)
         .await?;
     let sync_ref = sync_pool.get_actor();
     tracing::trace!(
@@ -440,9 +348,9 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/logic_async.py".to_string(),
     };
-    let async_pool = PythonChildProcessBuilder::<TestCallbackMessage>::new(async_config)
+    let async_pool = PythonChildProcessBuilder::<TestCallbackMessage, NoopCallbackHandler<TestCallbackMessage>>::new(async_config)
         .with_callback_handler(TestCallbackHandler)
-        .spawn_pool::<TestMessage>(POOL_SIZE)
+        .spawn_pool::<TestMessage>(POOL_SIZE, None)
         .await?;
     let async_ref = async_pool.get_actor();
 
@@ -558,8 +466,8 @@ async fn run_invalid_config_tests(
 
     let spawn_result = timeout(
         Duration::from_secs(31),
-        PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_module_config)
-            .spawn_pool::<TestMessage>(POOL_SIZE),
+        PythonChildProcessBuilder::<TestCallbackMessage, NoopCallbackHandler<TestCallbackMessage>>::new(invalid_module_config)
+            .spawn_pool::<TestMessage>(POOL_SIZE, None),
     )
     .await;
     match spawn_result {
@@ -579,8 +487,8 @@ async fn run_invalid_config_tests(
     };
     let spawn_result = timeout(
         Duration::from_secs(31),
-        PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_function_config)
-            .spawn_pool::<TestMessage>(POOL_SIZE),
+        PythonChildProcessBuilder::<TestCallbackMessage, NoopCallbackHandler<TestCallbackMessage>>::new(invalid_function_config)
+            .spawn_pool::<TestMessage>(POOL_SIZE, None),
     )
     .await;
     match spawn_result {
@@ -600,8 +508,8 @@ async fn run_invalid_config_tests(
     };
     let spawn_result = timeout(
         Duration::from_secs(32),
-        PythonChildProcessBuilder::<TestCallbackMessage>::new(invalid_path_config)
-            .spawn_pool::<TestMessage>(POOL_SIZE),
+        PythonChildProcessBuilder::<TestCallbackMessage, NoopCallbackHandler<TestCallbackMessage>>::new(invalid_path_config)
+            .spawn_pool::<TestMessage>(POOL_SIZE, None),
     )
     .await;
     match spawn_result {
@@ -622,9 +530,9 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/dspy_trader.py".to_string(),
     };
-    let trader_pool = PythonChildProcessBuilder::<TraderCallbackMessage>::new(trader_config)
-        .with_callback_handler(TraderCallbackHandler)
-        .spawn_pool::<TraderMessage>(POOL_SIZE)
+    let trader_pool = PythonChildProcessBuilder::<TraderCallbackMessage, NoopCallbackHandler<TraderCallbackMessage>>::new(trader_config)
+        .with_callback_handler(TestCallbackHandler)
+        .spawn_pool::<TraderMessage>(POOL_SIZE, None)
         .await?;
     let trader_ref = trader_pool.get_actor();
     let resp = trader_ref
@@ -644,7 +552,7 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
 }
 
 async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    const N: usize = 10;
+    const N: usize = 100;
     const MAX_SLEEP_MS: u64 = 100;
     let mut rng = thread_rng();
     let bench_config = PythonConfig {
@@ -655,9 +563,9 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/bench_async.py".to_string(),
     };
-    let bench_pool = PythonChildProcessBuilder::<BenchCallback>::new(bench_config)
-        .with_callback_handler(BenchCallbackHandler)
-        .spawn_pool::<BenchMessage>(100)
+    let bench_pool = PythonChildProcessBuilder::<BenchCallback, NoopCallbackHandler<BenchCallback>>::new(bench_config)
+        .with_callback_handler(TestCallbackHandler)
+        .spawn_pool::<BenchMessage>(100, None)
         .await?;
     let start = Instant::now();
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -743,4 +651,77 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
     }
     bench_pool.shutdown().await;
     Ok(())
+}
+
+kameo_snake_handler::setup_python_subprocess_system! {
+    actor = (TestMessage, TestCallbackMessage),
+    actor = (TraderMessage, TraderCallbackMessage),
+    actor = (BenchMessage, BenchCallback),
+    child_init = {{
+        kameo_child_process::RuntimeConfig {
+            flavor: kameo_child_process::RuntimeFlavor::MultiThread,
+            worker_threads: Some(8),
+        }
+    }},
+    parent_init = {
+        // Create parent runtime
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("test-main")
+            .enable_all()
+            .build()?;
+
+        // Initialize the callback handle before any tests run
+
+        let args: Vec<String> = env::args().collect();
+        let run_all = args.len() == 1;
+        let run_sync = run_all || args.iter().any(|a| a == "sync");
+        let run_async = run_all || args.iter().any(|a| a == "async");
+        let run_trader = run_all || args.iter().any(|a| a == "trader");
+        let run_bench = run_all || args.iter().any(|a| a == "bench");
+        let run_module = args.iter().any(|a| a == "module");
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            println!("Usage: kameo-snake-testing [sync] [async] [trader] [bench] [module]");
+            println!("  If no args, runs all tests.");
+            return Ok(());
+        }
+
+        runtime.block_on(async {
+            // Use OpenTelemetry + fmt subscriber, respects RUST_LOG/env_filter
+            let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
+                TelemetryExportConfig {
+                    otlp_enabled: true,
+                    stdout_enabled: true,
+                }
+            ).await;
+            tracing::subscriber::set_global_default(subscriber).expect("set global");
+            tracing::info!("Parent runtime initialized");
+
+            let python_path = std::env::current_dir()?
+                .join("crates")
+                .join("kameo-snake-testing")
+                .join("python");
+            let site_packages = "crates/kameo-snake-testing/python/venv/lib/python3.13/site-packages";
+            let python_path_vec = vec![
+                site_packages.to_string(),
+                python_path.to_string_lossy().to_string(),
+            ];
+            if run_sync {
+                run_sync_tests(python_path_vec.clone()).await?;
+            }
+            if run_async {
+                run_async_tests(python_path_vec.clone()).await?;
+            }
+            if run_trader {
+                run_trader_demo(python_path_vec.clone()).await?;
+            }
+            if run_bench {
+                run_bench_throughput_test(python_path_vec.clone()).await?;
+            }
+            if run_module {
+                run_invalid_config_tests(python_path_vec.clone()).await?;
+            }
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?
+    }
 }
