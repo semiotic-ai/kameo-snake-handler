@@ -70,24 +70,6 @@ pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessIpcBackendError
     }
 }
 
-pub trait ProtocolError: std::fmt::Debug + Send + Sync + 'static {
-    fn protocol(msg: String) -> Self;
-    fn handshake_failed(msg: String) -> Self;
-    fn connection_closed() -> Self;
-}
-
-impl ProtocolError for SubprocessIpcBackendIpcError {
-    fn protocol(msg: String) -> Self {
-        Self::Protocol(msg)
-    }
-    fn handshake_failed(msg: String) -> Self {
-        Self::HandshakeFailed(msg)
-    }
-    fn connection_closed() -> Self {
-        Self::ConnectionClosed
-    }
-}
-
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, Encode, Decode, Clone)]
 pub enum PythonExecutionError {
     #[error("Python module '{module}' not found: {message}")]
@@ -172,22 +154,6 @@ impl From<serde_json::Error> for PythonExecutionError {
     fn from(err: serde_json::Error) -> Self {
         PythonExecutionError::SerializationError {
             message: err.to_string(),
-        }
-    }
-}
-
-impl crate::error::ProtocolError for PythonExecutionError {
-    fn protocol(msg: String) -> Self {
-        PythonExecutionError::ExecutionError { message: msg }
-    }
-    fn handshake_failed(msg: String) -> Self {
-        PythonExecutionError::ExecutionError {
-            message: format!("Handshake failed: {msg}"),
-        }
-    }
-    fn connection_closed() -> Self {
-        PythonExecutionError::ExecutionError {
-            message: "Connection closed".to_string(),
         }
     }
 }

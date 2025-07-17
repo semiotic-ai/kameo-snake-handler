@@ -23,7 +23,7 @@ impl Default for ParentActorLoopConfig {
 pub struct PythonChildProcessActorPool<M>
 where
     M: kameo_child_process::KameoChildProcessMessage + Send + Sync + 'static,
-    <M as kameo_child_process::KameoChildProcessMessage>::Reply: serde::Serialize
+    <M as kameo_child_process::KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
         + bincode::Encode
         + bincode::Decode<()> 
@@ -42,7 +42,7 @@ where
 impl<M> PythonChildProcessActorPool<M>
 where
     M: kameo_child_process::KameoChildProcessMessage + Send + Sync + 'static,
-    <M as kameo_child_process::KameoChildProcessMessage>::Reply: serde::Serialize
+    <M as kameo_child_process::KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
         + bincode::Encode
         + bincode::Decode<()> 
@@ -139,7 +139,7 @@ where
     ) -> std::io::Result<PythonChildProcessActorPool<M>>
     where
         M: KameoChildProcessMessage + Send + Sync + 'static,
-        <M as KameoChildProcessMessage>::Reply: serde::Serialize
+        <M as KameoChildProcessMessage>::Ok: serde::Serialize
             + for<'de> serde::Deserialize<'de>
             + bincode::Encode
             + bincode::Decode<()> 

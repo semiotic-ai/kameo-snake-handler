@@ -116,7 +116,7 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
-    type Reply = kameo::reply::DelegatedReply<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>>;
+    type Reply = kameo::reply::DelegatedReply<Result<M::Ok, PythonExecutionError>>;
     #[tracing::instrument(skip(self, ctx, message), fields(actor_type = "PythonActor", message_type = std::any::type_name::<M>()), parent = tracing::Span::current())]
     #[allow(refining_impl_trait)]
     fn handle(
@@ -196,14 +196,13 @@ impl<M> ChildProcessMessageHandler<M> for PythonMessageHandler
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
 {
-    type Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>;
-    async fn handle_child_message(&mut self, msg: M) -> Self::Reply {
+    async fn handle_child_message(&mut self, msg: M) -> Result<M::Ok, PythonExecutionError> {
         self.handle_child_message_impl(msg).await
     }
 }
 
 impl PythonMessageHandler {
-    pub async fn handle_child_message_impl<M>(&self, message: M) -> Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>
+    pub async fn handle_child_message_impl<M>(&self, message: M) -> Result<M::Ok, PythonExecutionError>
     where
         M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
     {

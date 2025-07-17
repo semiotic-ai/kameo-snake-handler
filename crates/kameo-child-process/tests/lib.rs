@@ -35,7 +35,7 @@ impl kameo_child_process::callback::CallbackHandler<DummyMsg> for DummyHandler {
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 struct DummyParentMsg(u64);
 impl kameo_child_process::KameoChildProcessMessage for DummyParentMsg {
-    type Reply = u64;
+    type Ok = u64;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -90,7 +90,7 @@ async fn test_single_callback_message() {
 
 // Implement KameoChildProcessMessage for DummyMsg so it can be used with setup_test_ipc_pair
 impl kameo_child_process::KameoChildProcessMessage for DummyMsg {
-    type Reply = ();
+    type Ok = ();
 }
 
 // Helper to create a UnixStream pair, perform handshake, and return ready-to-use sockets
@@ -115,9 +115,8 @@ async fn test_parent_child_ipc() {
     #[derive(Clone)]
     struct DummyChildHandler;
     #[async_trait::async_trait]
-    impl ChildProcessMessageHandler<DummyParentMsg> for DummyChildHandler {
-        type Reply = Result<u64, kameo_child_process::error::PythonExecutionError>;
-        async fn handle_child_message(&mut self, msg: DummyParentMsg) -> Self::Reply {
+    impl kameo_child_process::ChildProcessMessageHandler<DummyParentMsg> for DummyChildHandler {
+        async fn handle_child_message(&mut self, msg: DummyParentMsg) -> Result<u64, kameo_child_process::error::PythonExecutionError> {
             tracing::info!(?msg, "DummyChildHandler received message");
             Ok(msg.0 + 100)
         }
@@ -201,15 +200,14 @@ async fn test_child_process_exits_on_parent_disconnect() {
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
     struct DummyMsg;
     impl KameoChildProcessMessage for DummyMsg {
-        type Reply = ();
+        type Ok = ();
     }
 
     #[derive(Clone)]
     struct DummyHandler;
     #[async_trait::async_trait]
     impl kameo_child_process::ChildProcessMessageHandler<DummyMsg> for DummyHandler {
-        type Reply = Result<(), kameo_child_process::error::PythonExecutionError>;
-        async fn handle_child_message(&mut self, _msg: DummyMsg) -> Self::Reply {
+        async fn handle_child_message(&mut self, _msg: DummyMsg) -> Result<(), kameo_child_process::error::PythonExecutionError> {
             Ok(())
         }
     }

@@ -82,20 +82,9 @@ pub enum TestResponse {
         total_currency: u32,
         bonus_currency: u32,
     },
-    Error {
-        error: String,
-    },
     CallbackRoundtripResult {
         value: u32,
     },
-}
-
-impl ErrorReply for TestResponse {
-    fn from_error(err: PythonExecutionError) -> Self {
-        TestResponse::Error {
-            error: err.to_string(),
-        }
-    }
 }
 
 impl Reply for TestResponse {
@@ -103,27 +92,15 @@ impl Reply for TestResponse {
     type Error = TestError;
     type Value = Self;
 
-    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> {
-        match self {
-            TestResponse::Error { error } => Err(TestError::PythonError(error)),
-            _ => Ok(self),
-        }
-    }
+    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> { Ok(self) }
 
-    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> {
-        match self {
-            TestResponse::Error { error } => Some(Box::new(TestError::PythonError(error))),
-            _ => None,
-        }
-    }
+    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> { None }
 
-    fn into_value(self) -> Self::Value {
-        self
-    }
+    fn into_value(self) -> Self::Value { self }
 }
 
 impl KameoChildProcessMessage for TestMessage {
-    type Reply = TestResponse;
+    type Ok = TestResponse;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -181,15 +158,6 @@ pub enum TraderMessage {
 #[derive(Debug, Serialize, Deserialize, Clone, Decode, Encode)]
 pub enum TraderResponse {
     OrderResult { result: String },
-    Error { error: String },
-}
-
-impl ErrorReply for TraderResponse {
-    fn from_error(err: PythonExecutionError) -> Self {
-        TraderResponse::Error {
-            error: err.to_string(),
-        }
-    }
 }
 
 impl Reply for TraderResponse {
@@ -197,27 +165,15 @@ impl Reply for TraderResponse {
     type Error = TestError;
     type Value = Self;
 
-    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> {
-        match self {
-            TraderResponse::Error { error } => Err(TestError::PythonError(error)),
-            _ => Ok(self),
-        }
-    }
+    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> { Ok(self) }
 
-    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> {
-        match self {
-            TraderResponse::Error { error } => Some(Box::new(TestError::PythonError(error))),
-            _ => None,
-        }
-    }
+    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> { None }
 
-    fn into_value(self) -> Self::Value {
-        self
-    }
+    fn into_value(self) -> Self::Value { self }
 }
 
 impl KameoChildProcessMessage for TraderMessage {
-    type Reply = TraderResponse;
+    type Ok = TraderResponse;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -232,8 +188,29 @@ pub struct BenchMessage {
     pub rust_sleep_ms: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Decode, Encode)]
+pub enum BenchResponse {
+    Power { power: u32 },
+    CategoryBonus { bonus: u32 },
+    CompetitionResult { victory: bool },
+    RewardResult { total_currency: u32, bonus_currency: u32 },
+    CallbackRoundtripResult { value: u32 },
+}
+
+impl Reply for BenchResponse {
+    type Ok = Self;
+    type Error = TestError;
+    type Value = Self;
+
+    fn to_result(self) -> Result<Self::Ok, <Self as Reply>::Error> { Ok(self) }
+
+    fn into_any_err(self) -> Option<Box<dyn kameo::reply::ReplyError>> { None }
+
+    fn into_value(self) -> Self::Value { self }
+}
+
 impl KameoChildProcessMessage for BenchMessage {
-    type Reply = BenchCallbackReply;
+    type Ok = BenchResponse;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
