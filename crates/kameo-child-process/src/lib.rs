@@ -123,7 +123,9 @@ impl<R> ReplySlot<R> {
     }
     pub async fn set_and_notify(&mut self, value: R) {
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(value);
+            if sender.send(value).is_err() {
+                tracing::error!(event = "reply_slot", error = "Failed to send reply, receiver dropped", "Reply channel closed");
+            }
         }
     }
     pub async fn wait(mut self) -> Option<R> {
@@ -138,7 +140,9 @@ impl<R> ReplySlot<R> {
 impl<R> ReplySlot<Result<R, PythonExecutionError>> {
     pub fn try_set_err(&mut self, err: PythonExecutionError) {
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Err(err));
+            if sender.send(Err(err)).is_err() {
+                tracing::error!(event = "reply_slot", error = "Failed to send error reply, receiver dropped", "Error reply channel closed");
+            }
         }
     }
 }
@@ -279,7 +283,9 @@ where
                                         tracing::warn!(event = "reader_task", in_flight_len, "EOF received with pending in-flight requests, waking all with error");
                                         in_flight_reader.0.retain(|_corr_id, slot| {
                                             if let Some(sender) = slot.sender.take() {
-                                                let _ = sender.send(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited (EOF)".to_string() }));
+                                                if sender.send(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited (EOF)".to_string() })).is_err() {
+                                                    tracing::error!(event = "reader_task", error = "Failed to send EOF error to waiting task", "Failed to notify waiting task about EOF");
+                                                }
                                             }
                                             false
                                         });
@@ -296,7 +302,9 @@ where
             // On exit, drain in_flight and send error to all pending
             in_flight_reader.0.retain(|_corr_id, slot| {
                 if let Some(sender) = slot.sender.take() {
-                    let _ = sender.send(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() }));
+                    if sender.send(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() })).is_err() {
+                        tracing::error!(event = "reader_task", error = "Failed to send shutdown error to waiting task", "Failed to notify waiting task about shutdown");
+                    }
                 }
                 false
             });
@@ -354,7 +362,9 @@ where
             let lock_start = Instant::now();
             if let Some((_, mut slot)) = self.in_flight.0.remove(&correlation_id) {
                 if let Some(sender) = slot.sender.take() {
-                    let _ = sender.send(Err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") }));
+                    if sender.send(Err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") })).is_err() {
+                        tracing::error!(event = "parent_send", step = "error_notify_failed", correlation_id, "Failed to notify waiting task about send error");
+                    }
                 }
             }
             let remove_duration = lock_start.elapsed();
@@ -510,7 +520,9 @@ where
                                         let ctrl = Control::Real(reply_envelope);
                                         match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
                                             Ok(reply_bytes) => {
-                                                let _ = reply_tx.send((correlation_id, reply_bytes));
+                                                if reply_tx.send((correlation_id, reply_bytes)).is_err() {
+                                                    tracing::error!(event = "child_ipc", step = "send_error", correlation_id, "Failed to send reply to writer task, channel closed");
+                                                }
                                             },
                                             Err(e) => {
                                                 tracing::error!(event = "bincode_encode_error", correlation_id = correlation_id, error = ?e, "Failed to encode reply envelope");

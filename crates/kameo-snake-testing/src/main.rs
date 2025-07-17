@@ -538,7 +538,7 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
 
 async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 10000;
-    const MAX_SLEEP_MS: u64 = 100;
+    const MAX_SLEEP_MS: u64 = 10;
     let mut rng = thread_rng();
     let bench_config = PythonConfig {
         python_path: python_path.clone(),
@@ -577,6 +577,7 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
         }));
     }
     while let Some(res) = handles.next().await {
+        tracing::info!(?res, "Bench result");
         match res {
             Ok((Ok(_), latency)) => latencies.push(latency),
             Ok((Err(e), _)) => eprintln!("Bench error: {e}"),

@@ -13,4 +13,5 @@ async def handle_bench_message(message):
     await kameo.callback_handle(cb)
     end = time.time()
     print(f"[PYTHON ASYNC] END   id={msg_id} t={end:.6f} dt={end-start:.3f}")
-    return {'id': message['id'], 'status': 'done'} 
+    # Return a valid BenchResponse variant for Rust
+    return {"CallbackRoundtripResult": {"value": message["id"]}} 
