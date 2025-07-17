@@ -33,8 +33,6 @@ pub enum TestError {
     UnknownCategory(String),
     #[error("Invalid power level: {0}")]
     InvalidPower(String),
-    #[error("Python error: {0}")]
-    PythonError(String),
 }
 
 /// Message types that can be sent to Python subprocess
