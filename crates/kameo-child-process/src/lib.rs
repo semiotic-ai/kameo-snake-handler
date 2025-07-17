@@ -12,6 +12,7 @@ use kameo::prelude::*;
 use opentelemetry::global;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use std::io;
 use std::marker::PhantomData;
 use std::process::Stdio;
@@ -21,10 +22,12 @@ use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio::time::Duration;
 use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use std::collections::HashMap;
 use tracing_futures::Instrument;
 use std::sync::atomic::AtomicU64;
 use tracing::{trace, error};
+use std::time::Instant;
+use dashmap::DashMap;
+use tokio::sync::oneshot;
 pub mod error;
 pub use error::PythonExecutionError;
 
@@ -114,29 +117,64 @@ pub struct WriteRequest<M> {
     pub ctrl: Control<M>,
 }
 
-/// A slot for a reply: an Arc containing a Mutex for the reply and a Notify for wakeup.
-pub type ReplySlot<R> = Arc<(TokioMutex<Option<R>>, Notify)>;
+pub type CorrelationId = u64;
+pub struct ReplySlot<R> {
+    sender: Option<oneshot::Sender<R>>,
+    receiver: Option<oneshot::Receiver<R>>,
+}
 
-/// Newtype for the in-flight map: an Arc<Mutex<HashMap<u64, R>>>
-#[derive(Debug)]
-pub struct InFlightMap<R>(pub Arc<TokioMutex<HashMap<u64, R>>>);
+impl<R> ReplySlot<R> {
+    pub fn new() -> Self {
+        let (sender, receiver) = oneshot::channel();
+        Self { sender: Some(sender), receiver: Some(receiver) }
+    }
+    pub async fn set_and_notify(&mut self, value: R) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(value);
+        }
+    }
+    pub async fn wait(mut self) -> Option<R> {
+        if let Some(receiver) = self.receiver.take() {
+            receiver.await.ok()
+        } else {
+            None
+        }
+    }
+}
 
-impl<R> Clone for InFlightMap<R> {
+impl<R> ReplySlot<Result<R, PythonExecutionError>> {
+    pub fn try_set_err(&mut self, err: PythonExecutionError) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err(err));
+        }
+    }
+}
+
+impl<R> Default for ReplySlot<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct InFlightMap<OkType>(pub Arc<DashMap<CorrelationId, ReplySlot<OkType>>>);
+
+impl<OkType> Clone for InFlightMap<OkType> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<R> InFlightMap<R> {
+impl<OkType> InFlightMap<OkType> {
     pub fn new() -> Self {
-        Self(Arc::new(TokioMutex::new(HashMap::new())))
-    }
-    pub fn as_inner(&self) -> &Arc<TokioMutex<HashMap<u64, R>>> {
-        &self.0
+        Self(Arc::new(DashMap::new()))
     }
 }
 
-// Remove ShutdownHandle struct and all uses
+impl<R> Default for InFlightMap<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Encapsulates a full-duplex UnixStream for protocol artefacts, enforcing correct split/unsplit usage.
 pub struct DuplexUnixStream {
@@ -150,11 +188,14 @@ impl DuplexUnixStream {
     pub fn into_split(self) -> (tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf) {
         self.inner.into_split()
     }
-    pub fn as_ref(&self) -> &tokio::net::UnixStream {
-        &self.inner
-    }
     pub fn into_inner(self) -> tokio::net::UnixStream {
         self.inner
+    }
+}
+
+impl AsRef<tokio::net::UnixStream> for DuplexUnixStream {
+    fn as_ref(&self) -> &tokio::net::UnixStream {
+        &self.inner
     }
 }
 
@@ -163,7 +204,7 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
 {
     write_tx: tokio::sync::mpsc::UnboundedSender<WriteRequest<M>>,
-    in_flight: InFlightMap<ReplySlot<Result<M::Reply, PythonExecutionError>>>,
+    in_flight: InFlightMap<Result<M::Reply, PythonExecutionError>>,
     next_id: AtomicU64,
     cancellation_token: tokio_util::sync::CancellationToken,
     _phantom: std::marker::PhantomData<M>,
@@ -179,18 +220,15 @@ where
         Self::new(read_half, write_half)
     }
 
-    /// Canonical constructor: wire up the backend from the read and write halves of a UnixStream.
-    /// Used in both production (builder) and tests. This is the only public constructor.
     pub fn new(
         read_half: tokio::net::unix::OwnedReadHalf,
         write_half: tokio::net::unix::OwnedWriteHalf,
     ) -> Arc<Self> {
         use tokio::sync::mpsc::unbounded_channel;
-        use crate::ReplySlot;
         use crate::error::PythonExecutionError;
         use std::sync::Arc;
         let (write_tx, mut write_rx) = unbounded_channel::<WriteRequest<M>>();
-        let in_flight: InFlightMap<ReplySlot<Result<M::Reply, PythonExecutionError>>> = InFlightMap::new();
+        let in_flight: InFlightMap<Result<M::Reply, PythonExecutionError>> = InFlightMap::new();
         let in_flight_reader = in_flight.clone();
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let cancellation_token_writer = cancellation_token.clone();
@@ -200,39 +238,59 @@ where
             let mut writer = crate::framing::LengthPrefixedWrite::new(write_half);
             loop {
                 tokio::select! {
-                    _ = cancellation_token_writer.cancelled() => break,
+                    _ = cancellation_token_writer.cancelled() => {
+                        tracing::info!(event = "writer_task", "Writer task received shutdown signal, exiting");
+                        break;
+                    }
                     Some(write_req) = write_rx.recv() => {
                         if writer.write_msg(&write_req.ctrl).await.is_err() {
+                            tracing::error!(event = "writer_task", error = "Failed to write message, breaking");
                             break;
                         }
                     }
+                    else => break,
                 }
             }
+            tracing::info!(event = "writer_task", "Writer task exiting");
         });
         // Reader task
         tokio::spawn(async move {
             let mut reader = crate::framing::LengthPrefixedRead::new(read_half);
             loop {
                 tokio::select! {
-                    _ = cancellation_token_reader.cancelled() => break,
+                    _ = cancellation_token_reader.cancelled() => {
+                        tracing::info!(event = "reader_task", "Reader task received shutdown signal, exiting");
+                        break;
+                    }
                     result = reader.read_msg::<Control<Result<M::Reply, PythonExecutionError>>>() => {
                         match result {
                             Ok(ctrl) => {
                                 if let Control::Real(envelope) = ctrl {
                                     let correlation_id = envelope.correlation_id;
-                                    let reply = envelope.inner;
-                                    let mut in_flight = in_flight_reader.as_inner().lock().await;
-                                    if let Some(slot) = in_flight.remove(&correlation_id) {
-                                        let (reply_mutex, notify) = &*slot;
-                                        let mut guard = reply_mutex.lock().await;
-                                        *guard = Some(reply);
-                                        drop(guard);
-                                        notify.notify_one();
-                                        trace!(event = "parent_in_flight", action = "notify", correlation_id, in_flight_len = in_flight.len(), "Notified reply slot in parent in_flight");
+                                    let lock_start = Instant::now();
+                                    if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
+                                        let remove_duration = lock_start.elapsed();
+                                        trace!(event = "parent_in_flight", action = "remove", duration_ms = remove_duration.as_millis(), correlation_id, in_flight_len = in_flight_reader.0.len(), "Removed from parent in_flight in reader");
+                                        slot.set_and_notify(envelope.inner).await;
+                                        trace!(event = "parent_in_flight", action = "notify", correlation_id, in_flight_len = in_flight_reader.0.len(), "Notified reply slot in parent in_flight");
                                     }
                                 }
                             }
                             Err(e) => {
+                                use std::io::ErrorKind;
+                                if e.kind() == ErrorKind::UnexpectedEof {
+                                    let in_flight_len = in_flight_reader.0.len();
+                                    if in_flight_len == 0 {
+                                        tracing::info!(event = "reader_task", "EOF received, no in-flight requests, clean shutdown");
+                                    } else {
+                                        tracing::warn!(event = "reader_task", in_flight_len, "EOF received with pending in-flight requests, waking all with error");
+                                        in_flight_reader.0.retain(|_corr_id, slot| {
+                                            slot.try_set_err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited (EOF)".to_string() });
+                                            false
+                                        });
+                                    }
+                                    break;
+                                }
                                 error!(event = "parent_read_error", error = ?e, "Parent reader task error, exiting");
                                 break;
                             }
@@ -240,6 +298,12 @@ where
                     }
                 }
             }
+            // On exit, drain in_flight and send error to all pending
+            in_flight_reader.0.retain(|_corr_id, slot| {
+                slot.try_set_err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() });
+                false
+            });
+            tracing::info!(event = "reader_task", "Reader task exiting and drained in_flight");
         });
         Arc::new(Self {
             write_tx,
@@ -282,34 +346,35 @@ where
             correlation_id,
             ctrl,
         };
-        let notify: ReplySlot<Result<M::Reply, PythonExecutionError>> = Arc::new((TokioMutex::new(None), Notify::new()));
+        let reply_slot: ReplySlot<Result<M::Reply, PythonExecutionError>> = ReplySlot::new();
         {
-            let mut in_flight = self.in_flight.as_inner().lock().await;
-            in_flight.insert(correlation_id, notify.clone());
-            trace!(event = "parent_in_flight", action = "insert", in_flight_len = in_flight.len(), correlation_id, ?span_id, "Inserted into parent in_flight");
+            let lock_start = Instant::now();
+            self.in_flight.0.insert(correlation_id, reply_slot);
+            let insert_duration = lock_start.elapsed(); // Since no lock, but keep for consistency
+            trace!(event = "parent_in_flight", action = "insert", duration_ms = insert_duration.as_millis(), in_flight_len = self.in_flight.0.len(), correlation_id, ?span_id, "Inserted into parent in_flight");
         }
         if let Err(e) = self.write_tx.send(write_req) {
-            let mut in_flight = self.in_flight.as_inner().lock().await;
-            in_flight.remove(&correlation_id);
+            let lock_start = Instant::now();
+            if let Some((_, mut slot)) = self.in_flight.0.remove(&correlation_id) {
+                slot.try_set_err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") });
+            }
+            let remove_duration = lock_start.elapsed();
+            trace!(event = "parent_in_flight", action = "remove", duration_ms = remove_duration.as_millis(), correlation_id, "Removed from parent in_flight on send fail");
             trace!(event = "parent_send", step = "send_failed", correlation_id, error = ?e, "Failed to send write request");
             return Err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") });
         }
         trace!(event = "parent_send", step = "sent", correlation_id, ?span_id, "Sent write request to writer task");
-        let notify_strong = notify.clone();
-        let (reply_mutex, notify) = &*notify_strong;
-        trace!(event = "parent_send", step = "before_notify", correlation_id, ?span_id, "Waiting for notify");
-        notify.notified().await;
-        trace!(event = "parent_send", step = "after_notify", correlation_id, ?span_id, "Notified, checking reply");
-        let mut guard = reply_mutex.lock().await;
-        match guard.take() {
-            Some(res) => {
-                trace!(event = "parent_send", step = "reply_received", correlation_id, ?span_id, ?res, "Received reply via notify");
-                res
+        // Await the reply by reference, do not remove from map here
+        let mut slot = self.in_flight.0.get_mut(&correlation_id)
+            .expect("ReplySlot must exist in in_flight map");
+        let receiver = slot.receiver.take();
+        drop(slot); // Release the lock before awaiting
+        match receiver {
+            Some(receiver) => match receiver.await {
+                Ok(res) => res,
+                Err(_) => Err(PythonExecutionError::ExecutionError { message: "Reply missing after notify".to_string() }),
             },
-            None => {
-                tracing::error!(event = "parent_send", step = "reply_missing", correlation_id, ?span_id, "Reply missing after notify");
-                Err(PythonExecutionError::ExecutionError { message: "Reply missing after notify".to_string() })
-            }
+            None => Err(PythonExecutionError::ExecutionError { message: "Reply slot already taken".to_string() }),
         }
     }
 }
@@ -502,7 +567,7 @@ where
         // Split the request_conn into read and write halves
         let (read_half, write_half) = request_conn.into_split();
         let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<WriteRequest<M>>();
-        let in_flight: InFlightMap<ReplySlot<Result<M::Reply, PythonExecutionError>>> = InFlightMap::new();
+        let in_flight: InFlightMap<Result<M::Reply, PythonExecutionError>> = InFlightMap::new();
         let in_flight_writer = in_flight.clone();
         let in_flight_reader = in_flight.clone();
         // Create shutdown handle and notifier before spawning tasks
@@ -525,8 +590,7 @@ where
                         };
                         if let Err(e) = writer.write_msg(&req.ctrl).await {
                             tracing::error!(event = "writer_task", error = ?e, correlation_id = req.correlation_id, "Failed to write message, removing from in_flight and breaking");
-                            let mut in_flight = in_flight_writer.as_inner().lock().await;
-                            in_flight.remove(&req.correlation_id);
+                            in_flight_writer.0.remove(&req.correlation_id);
                             break;
                         }
                     }
@@ -539,7 +603,10 @@ where
             let mut reader = crate::framing::LengthPrefixedRead::new(read_half);
             loop {
                 tokio::select! {
-                    _ = cancellation_token_reader.cancelled() => break,
+                    _ = cancellation_token_reader.cancelled() => {
+                        tracing::info!(event = "reader_task", "Reader task received shutdown signal, exiting");
+                        break;
+                    }
                     result = reader.read_msg() => {
                         let ctrl: Control<Result<M::Reply, PythonExecutionError>> = match result {
                             Ok(msg) => msg,
@@ -550,15 +617,9 @@ where
                         };
                         match ctrl {
                             Control::Real(envelope) => {
-                                let entry = {
-                                    let mut in_flight = in_flight_reader.as_inner().lock().await;
-                                    in_flight.remove(&envelope.correlation_id)
-                                };
-                                if let Some(entry) = entry {
-                                    let (reply_mutex, notify) = &*entry;
-                                    let mut guard = reply_mutex.lock().await;
-                                    *guard = Some(envelope.inner);
-                                    notify.notify_waiters();
+                                let entry = in_flight_reader.0.remove(&envelope.correlation_id);
+                                if let Some((_, mut slot)) = entry {
+                                    slot.set_and_notify(envelope.inner).await;
                                 }
                             }
                             Control::Handshake => continue,
@@ -567,13 +628,10 @@ where
                 }
             }
             // On exit, drain in_flight and send error to all pending
-            let mut in_flight = in_flight_reader.as_inner().lock().await;
-            for (_corr_id, slot) in in_flight.drain() {
-                let (reply_mutex, notify) = &*slot;
-                let mut guard = reply_mutex.lock().await;
-                *guard = Some(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() }));
-                notify.notify_waiters();
-            }
+            in_flight_reader.0.retain(|_corr_id, slot| {
+                slot.try_set_err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() });
+                false
+            });
             tracing::info!(event = "reader_task", "Reader task exiting and drained in_flight");
         });
         let backend = Arc::new(SubprocessIpcBackend::<M> {
@@ -587,6 +645,17 @@ where
     }
 }
 
+impl<A, M> Default for ChildProcessBuilder<A, M>
+where
+    A: kameo::message::Message<M> + ConcurrentMessage<M> + Send + Sync + Actor + 'static,
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+    <A as ConcurrentMessage<M>>::ProtocolReply: Serialize + for<'de> Deserialize<'de> + Send + Encode + Decode<()> + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Trait for message handlers in the child process (no Context, no actor system)
 #[async_trait]
 pub trait ChildProcessMessageHandler<Msg> {
@@ -595,10 +664,10 @@ pub trait ChildProcessMessageHandler<Msg> {
 }
 
 /// Run the IPC handler loop in the child process. No ActorRef, no Clone, no spawn, just handle messages.
-#[derive(Debug)]
+#[derive(Debug,Error)]
 pub enum ChildProcessLoopError {
+    #[error("IO error: {0}")]
     Io(std::io::Error),
-    ChildProcessClosedCleanly,
 }
 
 impl From<std::io::Error> for ChildProcessLoopError {
@@ -607,34 +676,28 @@ impl From<std::io::Error> for ChildProcessLoopError {
     }
 }
 
-// Helper to read the next message from the socket
-async fn read_next_message<M>(conn: &mut tokio::net::UnixStream) -> Option<(u64, Vec<u8>)>
-where
-    M: KameoChildProcessMessage + Send + 'static,
-{
+// Replace the entire read_next_message function with the corrected version without decoding
+async fn read_next_message(conn: &mut tokio::net::UnixStream) -> Result<Option<Vec<u8>>, io::Error> {
     tracing::trace!(event = "child_read", step = "before_len", "About to read length prefix");
     let mut len_buf = [0u8; 4];
-    if let Err(_) = conn.read_exact(&mut len_buf).await {
-        return None;
+    match conn.read_exact(&mut len_buf).await {
+        Ok(_) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            tracing::trace!(event = "child_read", step = "clean_eof", "Clean EOF detected on length read");
+            return Ok(None);
+        }
+        Err(e) => {
+            tracing::trace!(event = "child_read", step = "error", error = ?e);
+            return Err(e);
+        }
     }
     let msg_len = u32::from_le_bytes(len_buf) as usize;
     tracing::trace!(event = "child_read", step = "after_len", ?len_buf, msg_len, "Read length prefix");
     tracing::trace!(event = "child_read", step = "before_msg", msg_len, "About to read message of len {}", msg_len);
     let mut msg_buf = vec![0u8; msg_len];
-    let n = match conn.read_exact(&mut msg_buf).await {
-        Ok(n) => n,
-        Err(_) => return None,
-    };
-    tracing::trace!(event = "child_read", step = "after_msg", n, "Read {} bytes for message", n);
-    // Decode the Control<M> envelope to extract correlation_id
-    let ctrl: Control<M> = match bincode::decode_from_slice(&msg_buf[..], bincode::config::standard()) {
-        Ok((ctrl, _)) => ctrl,
-        Err(_) => return None,
-    };
-    match ctrl {
-        Control::Real(envelope) => Some((envelope.correlation_id, msg_buf)),
-        Control::Handshake => None,
-    }
+    conn.read_exact(&mut msg_buf).await?;
+    tracing::trace!(event = "child_read", step = "after_msg", len = msg_buf.len(), "Read message");
+    Ok(Some(msg_buf))
 }
 
 /// Configuration for the child actor loop concurrency
@@ -663,86 +726,121 @@ where
     use futures::stream::{FuturesUnordered, StreamExt};
     let config = config.unwrap_or_default();
     let mut in_flight = FuturesUnordered::new();
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
-    let shutdown = false;
+    // Make reply_tx Option and drop it on shutdown
+    let (reply_tx_inner, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+    let mut reply_tx = Some(reply_tx_inner);
+    let mut shutdown = false;
     loop {
         tracing::trace!(event = "child_loop", step = "enter", in_flight = in_flight.len(), shutdown = shutdown, "Entering child actor loop select");
         let in_flight_len = in_flight.len();
-        tokio::select! {
-            biased;
-            // Prioritize reading new messages if under concurrency limit
-            Some((correlation_id, msg)) = async {
-                if !shutdown && in_flight_len < config.max_concurrency {
-                    read_next_message::<M>(&mut conn).await
-                } else {
-                    None
-                }
-            } => {
-                tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..], "Read message from parent");
-                let ctrl: Control<M> = match bincode::decode_from_slice(&msg[..], bincode::config::standard()) {
-                    Ok((ctrl, _)) => {
-                        tracing::trace!(event = "bincode_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
-                        ctrl
-                    },
-                    Err(e) => {
-                        tracing::error!(event = "bincode_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
-                        return Ok(());
-                    }
-                };
-            match ctrl {
-                Control::Handshake => {
-                        tracing::debug!(event = "child_ipc", step = "handshake", "Received handshake from parent");
-                    }
-                    Control::Real(envelope) => {
-                        let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
-                            propagator.extract(&envelope.context.0)
-                        });
-                        let span = tracing::info_span!("child_message_handler", event = "message", handler = "child", process_role = "child");
-                        span.set_parent(parent_cx);
-                        let mut handler = handler.clone();
-                        let reply_tx = reply_tx.clone();
-                        let fut = async move {
-                            let reply = handler.handle_child_message(envelope.inner).await;
-                            tracing::trace!(event = "child_ipc", step = "after_handle", ?reply, correlation_id = correlation_id, "Got reply from handle_child_message");
-                            let reply_envelope = MultiplexEnvelope {
-                                correlation_id,
-                                inner: reply,
-                                context: Default::default(),
-                            };
-                            let ctrl = Control::Real(reply_envelope);
-                            match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
-                                Ok(reply_bytes) => {
-                                    let _ = reply_tx.send((correlation_id, reply_bytes));
+        if !shutdown {
+            tokio::select! {
+                biased;
+                read_res = read_next_message(&mut *conn) => {
+                    match read_res {
+                        Ok(Some(msg)) => {
+                            tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..std::cmp::min(100, msg.len())], "Read message from parent");
+                            let ctrl: Control<M> = match bincode::decode_from_slice(&msg[..], bincode::config::standard()) {
+                                Ok((ctrl, _)) => {
+                                    tracing::trace!(event = "bincode_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
+                                    ctrl
                                 },
-                        Err(e) => {
-                                    tracing::error!(event = "bincode_encode_error", correlation_id = correlation_id, error = ?e, "Failed to encode reply envelope");
+                                Err(e) => {
+                                    tracing::error!(event = "bincode_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
+                                    continue;
                                 }
+                            };
+                            match ctrl {
+                                Control::Handshake => {
+                                    tracing::debug!(event = "child_ipc", step = "handshake", "Received handshake from parent");
+                                }
+                                Control::Real(envelope) => {
+                                    let correlation_id = envelope.correlation_id;
+                                    let parent_cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+                                        propagator.extract(&envelope.context.0)
+                                    });
+                                    let span = tracing::info_span!("child_message_handler", event = "message", handler = "child", process_role = "child");
+                                    span.set_parent(parent_cx);
+                                    let mut handler = handler.clone();
+                                    let reply_tx = reply_tx.as_ref().unwrap().clone();
+                                    let fut = async move {
+                                        let reply = handler.handle_child_message(envelope.inner).await;
+                                        tracing::trace!(event = "child_ipc", step = "after_handle", ?reply, correlation_id = correlation_id, "Got reply from handle_child_message");
+                                        let reply_envelope = MultiplexEnvelope {
+                                            correlation_id,
+                                            inner: reply,
+                                            context: Default::default(),
+                                        };
+                                        let ctrl = Control::Real(reply_envelope);
+                                        match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
+                                            Ok(reply_bytes) => {
+                                                let _ = reply_tx.send((correlation_id, reply_bytes));
+                                            },
+                                            Err(e) => {
+                                                tracing::error!(event = "bincode_encode_error", correlation_id = correlation_id, error = ?e, "Failed to encode reply envelope");
+                                            }
+                                        }
+                                    };
+                                    in_flight.push(fut.instrument(span));
+                                    tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(), "Pushed to child in_flight");
+                                }
+                            }
                         }
-                    };
-                        in_flight.push(fut);
-                        tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(), "Pushed to child in_flight");
+                        Ok(None) => {
+                            tracing::trace!(event = "child_loop", step = "clean_shutdown", "Clean shutdown (EOF) detected, setting shutdown=true");
+                            shutdown = true;
+                            reply_tx.take();  // Drop the sender to close the channel
+                        }
+                        Err(e) => {
+                            tracing::error!(event = "child_loop", step = "read_error", error=?e, "Error reading message, exiting loop");
+                            return Err(ChildProcessLoopError::Io(e));
+                        }
                     }
                 }
+                Some(_) = in_flight.next() => {
+                    tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
+                }
+                Some((correlation_id, reply_bytes)) = reply_rx.recv() => {
+                    if let Err(e) = conn.write_all(&(reply_bytes.len() as u32).to_le_bytes()).await {
+                        tracing::error!(event = "child_ipc", step = "write_len_error", correlation_id, error = %e, "Failed to write reply length to parent");
+                        break;
+                    }
+                    if let Err(e) = conn.write_all(&reply_bytes).await {
+                        tracing::error!(event = "child_ipc", step = "write_reply_error", correlation_id, error = %e, "Failed to write reply to parent");
+                        break;
+                    }
+                    tracing::trace!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
+                }
             }
-            Some(_) = in_flight.next() => {
-                tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
-            }
-            Some((correlation_id, reply_bytes)) = reply_rx.recv() => {
-                if let Err(e) = conn.write_all(&(reply_bytes.len() as u32).to_le_bytes()).await {
-                    tracing::error!(event = "child_ipc", step = "write_len_error", correlation_id, error = %e, "Failed to write reply length to parent");
+        } else {
+            tokio::select! {
+                biased;
+                Some(_) = in_flight.next() => {
+                    tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
+                }
+                maybe_reply = reply_rx.recv() => {
+                    if let Some((correlation_id, reply_bytes)) = maybe_reply {
+                        if let Err(e) = conn.write_all(&(reply_bytes.len() as u32).to_le_bytes()).await {
+                            tracing::error!(event = "child_ipc", step = "write_len_error", correlation_id, error = %e, "Failed to write reply length to parent");
+                            break;
+                        }
+                        if let Err(e) = conn.write_all(&reply_bytes).await {
+                            tracing::error!(event = "child_ipc", step = "write_reply_error", correlation_id, error = %e, "Failed to write reply to parent");
+                            break;
+                        }
+                        tracing::trace!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
+                    } else {
+                        tracing::trace!(event = "child_loop", step = "reply_channel_closed", "Reply channel closed");
+                    }
+                }
+                else => {
                     break;
                 }
-                if let Err(e) = conn.write_all(&reply_bytes).await {
-                    tracing::error!(event = "child_ipc", step = "write_reply_error", correlation_id, error = %e, "Failed to write reply to parent");
-                break;
-                }
-                tracing::trace!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
             }
-            else => {
-                if shutdown && in_flight.is_empty() && reply_rx.is_empty() {
+        }
+
+        if shutdown && in_flight.is_empty() && reply_rx.is_empty() {
             break;
-                }
-            }
         }
     }
     Ok(())
@@ -750,8 +848,6 @@ where
 
 /// Prelude module for commonly used items
 pub mod prelude {
-    // pub use crate::child_process_main; // REMOVED: no longer exists
-    // pub use crate::child_process_main_with_runtime; // REMOVED: python/handler actors must provide their own entrypoint
     pub use crate::ChildProcessBuilder;
     pub use tokio::runtime;
 }
@@ -845,18 +941,16 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
 {
     type Error = PythonExecutionError;
-    fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move { Ok(()) }
+    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), Self::Error> {
+        Ok(())
     }
-    fn on_stop(
+    async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            tracing::error!(status = "stopped", actor_type = "SubprocessIpcActor", ?reason);
-            Ok(())
-        }
+    ) -> Result<(), Self::Error> {
+        tracing::error!(status = "stopped", actor_type = "SubprocessIpcActor", ?reason);
+        Ok(())
     }
 }
 
@@ -916,7 +1010,7 @@ where
         H: ChildProcessMessageHandler<M, Reply = Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>> + Send + Clone + 'static,
         M::Reply: serde::Serialize + bincode::Encode + std::fmt::Debug + Sync + Send + 'static,
     {
-        use crate::framing::{LengthPrefixedRead, LengthPrefixedWrite};
+        
         use crate::{MultiplexEnvelope, Control};
         
         tracing::debug!(event = "child_ipc", step = "start", "SubprocessIpcChild run started");

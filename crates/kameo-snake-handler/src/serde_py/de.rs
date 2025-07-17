@@ -16,6 +16,12 @@ impl From<PyErr> for Error {
     }
 }
 
+impl From<pyo3::DowncastError<'_, '_>> for Error {
+    fn from(e: pyo3::DowncastError<'_, '_>) -> Self {
+        Error::Deserialization(e.to_string())
+    }
+}
+
 /// Convert a Python object to a Rust value
 #[instrument(skip(obj))]
 pub fn from_pyobject<'py, T>(obj: &Bound<'py, PyAny>) -> Result<T>
@@ -69,40 +75,30 @@ where
         V: Visitor<'de>,
     {
         if self.input.is_none() {
-            return visitor.visit_unit();
-        } else if self.input.is_instance_of::<PyBool>() {
-            visitor.visit_bool(bool::extract_bound(&self.input)?)
-        } else if self.input.is_instance_of::<PyInt>() {
-            visitor.visit_i64(i64::extract_bound(&self.input)?)
-        } else if self.input.is_instance_of::<PyFloat>() {
-            visitor.visit_f64(f64::extract_bound(&self.input)?)
-        } else if self.input.is_instance_of::<PyString>() {
-            visitor.visit_string(String::extract_bound(&self.input)?)
-        } else if self.input.is_instance_of::<PyList>() {
-            let list = self
-                .input
-                .downcast::<PyList>()
-                .map_err(|_| Error::Deserialization("expected list".to_string()))?;
-            visitor.visit_seq(SeqDeserializer {
-                seq: list.clone(),
-                idx: 0,
-            })
-        } else if self.input.is_instance_of::<PyDict>() {
-            let dict = self
-                .input
-                .downcast::<PyDict>()
-                .map_err(|_| Error::Deserialization("expected dict".to_string()))?;
-            let keys = dict.keys().iter().map(|k| k.clone()).collect::<Vec<_>>();
-            visitor.visit_map(MapDeserializer {
-                map: dict.clone(),
-                keys,
-                current_idx: 0,
-            })
+            visitor.visit_unit()
         } else {
-            Err(Error::Deserialization(format!(
-                "unsupported Python type: {}",
-                self.input.get_type().name()?
-            )))
+            let input = &self.input;
+            if input.is_instance_of::<PyBool>() {
+                visitor.visit_bool(bool::extract_bound(input)?)
+            } else if input.is_instance_of::<PyInt>() {
+                visitor.visit_i64(i64::extract_bound(input)?)
+            } else if input.is_instance_of::<PyFloat>() {
+                visitor.visit_f64(f64::extract_bound(input)?)
+            } else if input.is_instance_of::<PyString>() {
+                visitor.visit_string(String::extract_bound(input)?)
+            } else if input.is_instance_of::<PyList>() {
+                let list = input.downcast::<PyList>()?;
+                visitor.visit_seq(SeqDeserializer { seq: list.clone(), idx: 0 })
+            } else if input.is_instance_of::<PyDict>() {
+                let dict = input.downcast::<PyDict>()?;
+                let mut keys = Vec::new();
+                for k in dict.keys().iter() {
+                    keys.push(k.clone());
+                }
+                visitor.visit_map(MapDeserializer { map: dict.clone(), keys, current_idx: 0 })
+            } else {
+                Err(Error::Deserialization(format!("unsupported Python type: {}", input.get_type().name()?)))
+            }
         }
     }
 
@@ -317,7 +313,10 @@ where
             .input
             .downcast::<PyDict>()
             .map_err(|_| Error::Deserialization("expected dict".to_string()))?;
-        let keys = dict.keys().iter().map(|k| k.clone()).collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        for k in dict.keys().iter() {
+            keys.push(k.clone());
+        }
 
         visitor.visit_map(MapDeserializer {
             map: dict.clone(),
@@ -533,7 +532,10 @@ where
             .ok_or_else(|| Error::Deserialization("empty dict for enum variant".to_string()))?;
 
         if let Ok(dict) = value.downcast::<PyDict>() {
-            let keys = dict.keys().iter().map(|k| k.clone()).collect::<Vec<_>>();
+            let mut keys = Vec::new();
+            for k in dict.keys().iter() {
+                keys.push(k.clone());
+            }
             visitor.visit_map(MapDeserializer {
                 map: dict.clone(),
                 keys,

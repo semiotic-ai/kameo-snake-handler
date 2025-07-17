@@ -6,26 +6,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use opentelemetry::{Context as OTelContext};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex as TokioMutex, oneshot};
-use tracing::{error, instrument, Instrument};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio::sync::Notify;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio::time::timeout as tokio_timeout;
 use tracing::trace;
+use tracing::{error, instrument};
+use serde::Deserialize;
 
 use crate::TracingContext;
 use crate::error::PythonExecutionError;
 use crate::framing::{LengthPrefixedRead, LengthPrefixedWrite};
+use crate::InFlightMap;
+use crate::ReplySlot;
 
 #[derive(Debug, Error)]
 pub enum CallbackError {
@@ -99,18 +93,14 @@ pub type CallbackHandle<C> = std::sync::Arc<dyn CallbackHandler<C>>;
 /// Multiplexed callback protocol artefact for child processes.
 /// Owns the callback socket, maintains in-flight map, and implements CallbackHandler<C>.
 /// This is the only production callback handler for child processes.
-pub struct CallbackIpcChild<C>
-where
-    C: Send + Sync + Encode + Decode<()> + 'static,
-{
+pub struct CallbackIpcChild<C> {
+    pub in_flight: InFlightMap<Result<(), PythonExecutionError>>,
     write_tx: tokio::sync::mpsc::UnboundedSender<CallbackWriteRequest<C>>,
-    in_flight: crate::InFlightMap<crate::ReplySlot<Result<(), PythonExecutionError>>>,
     next_id: std::sync::atomic::AtomicU64,
     cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 struct CallbackWriteRequest<C> {
-    correlation_id: u64,
     envelope: CallbackEnvelope<C>,
 }
 
@@ -128,7 +118,7 @@ where
     ) -> std::sync::Arc<Self> {
         use tokio::sync::mpsc::unbounded_channel;
         let (write_tx, mut write_rx) = unbounded_channel::<CallbackWriteRequest<C>>();
-        let in_flight: crate::InFlightMap<crate::ReplySlot<Result<(), PythonExecutionError>>> = crate::InFlightMap::new();
+        let in_flight = InFlightMap::new();
         let in_flight_reader = in_flight.clone();
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let cancellation_token_writer = cancellation_token.clone();
@@ -158,14 +148,8 @@ where
                         match result {
                             Ok(env) => {
                                 let correlation_id = env.correlation_id;
-                                let reply = env.inner;
-                                let mut in_flight = in_flight_reader.as_inner().lock().await;
-                                if let Some(slot) = in_flight.remove(&correlation_id) {
-                                    let (reply_mutex, notify) = &*slot;
-                                    let mut guard = reply_mutex.lock().await;
-                                    *guard = Some(reply);
-                                    drop(guard);
-                                    notify.notify_one();
+                                if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
+                                    slot.set_and_notify(env.inner).await;
                                 }
                             }
                             Err(e) => {
@@ -181,10 +165,15 @@ where
                     }
                 }
             }
+            // After the reader loop, drain in_flight with error, signalling that the child process has exited
+            in_flight_reader.0.retain(|_corr_id, slot| {
+                slot.try_set_err(PythonExecutionError::ExecutionError { message: "Callback reply loop exited (EOF)".to_string() });
+                false
+            });
         });
         std::sync::Arc::new(Self {
-            write_tx,
             in_flight,
+            write_tx,
             next_id: std::sync::atomic::AtomicU64::new(1),
             cancellation_token,
         })
@@ -209,27 +198,23 @@ where
             inner: callback,
             context: TracingContext::default(),
         };
-        let write_req = CallbackWriteRequest { correlation_id, envelope };
-        let notify: crate::ReplySlot<Result<(), PythonExecutionError>> = std::sync::Arc::new((TokioMutex::new(None), Notify::new()));
-        {
-            let mut in_flight = self.in_flight.as_inner().lock().await;
-            in_flight.insert(correlation_id, notify.clone());
-        }
+        let write_req = CallbackWriteRequest { envelope };
+        let reply_slot: ReplySlot<Result<(), PythonExecutionError>> = ReplySlot::new();
+        self.in_flight.0.insert(correlation_id, reply_slot);
         if let Err(e) = self.write_tx.send(write_req) {
-            let mut in_flight = self.in_flight.as_inner().lock().await;
-            in_flight.remove(&correlation_id);
+            self.in_flight.0.remove(&correlation_id);
             return Err(PythonExecutionError::ExecutionError { message: format!("Failed to send callback write request: {e}") });
         }
-        let notify_strong = notify.clone();
-        let (reply_mutex, notify) = &*notify_strong;
-        notify.notified().await;
-        let mut guard = reply_mutex.lock().await;
-        match guard.take() {
-            Some(res) => res,
-            None => {
-                error!(event = "callback_ipc_child", step = "reply_missing", correlation_id, "Reply missing after notify");
-                Err(PythonExecutionError::ExecutionError { message: "Reply missing after notify".to_string() })
-            }
+        let mut slot = self.in_flight.0.get_mut(&correlation_id)
+            .expect("ReplySlot must exist in in_flight map");
+        let receiver = slot.receiver.take();
+        drop(slot);
+        match receiver {
+            Some(receiver) => match receiver.await {
+                Ok(res) => res,
+                Err(_) => Err(PythonExecutionError::ExecutionError { message: "Reply missing after notify".to_string() }),
+            },
+            None => Err(PythonExecutionError::ExecutionError { message: "Reply slot already taken".to_string() }),
         }
     }
 }
@@ -251,7 +236,6 @@ where
     M: Send + Sync + Decode<()> + 'static,
     H: CallbackHandler<M> + Clone + Send + Sync + 'static,
 {
-    /// Canonical constructor: splits the DuplexUnixStream and returns (receiver, connection)
     pub fn from_duplex(duplex: crate::DuplexUnixStream, handler: H) -> Self {
         let (read_half, write_half) = duplex.into_inner().into_split();
         let cancellation_token = CancellationToken::new();
@@ -271,7 +255,7 @@ where
     }
     #[instrument(skip(self), fields(message_type = std::any::type_name::<M>()))]
     pub async fn run(self) -> Result<(), CallbackError> {
-        let CallbackReceiver { mut read_half, mut write_half, handler, cancellation_token, _phantom } = self;
+        let CallbackReceiver { read_half, write_half, handler, cancellation_token, _phantom } = self;
         tracing::debug!(event = "callback_receiver", step = "start", "CallbackReceiver started, waiting for callback messages");
         let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<M>>();
         let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<Result<(), PythonExecutionError>>>();

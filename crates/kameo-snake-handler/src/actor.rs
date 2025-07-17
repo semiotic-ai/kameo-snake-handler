@@ -2,8 +2,7 @@ use kameo_child_process::error::PythonExecutionError;
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use kameo::actor::{Actor, ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, PanicError};
+use kameo::actor::Actor;
 use kameo::message::Message;
 use kameo_child_process::ChildProcessMessageHandler;
 use kameo_child_process::{
@@ -11,10 +10,11 @@ use kameo_child_process::{
 };
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::ops::ControlFlow;
 use tracing::instrument;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::future::Future;
 
 /// Configuration for Python subprocess
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -87,41 +87,26 @@ where
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
     type Error = PythonExecutionError;
-
-    #[instrument(skip(self, _actor_ref), fields(actor_type = "PythonActor"), parent = tracing::Span::current())]
-    fn on_start(
-        &mut self,
-        _actor_ref: ActorRef<Self>,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
+    #[allow(refining_impl_trait)]
+    fn on_start(&mut self, _actor_ref: kameo::actor::ActorRef<Self>) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(async move {
             tracing::info!(status = "started", actor_type = "PythonActor");
             Ok(())
-        }
+        })
     }
-
-    #[instrument(skip(self, _actor_ref, reason), fields(actor_type = "PythonActor"), parent = tracing::Span::current())]
-    fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        reason: ActorStopReason,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
+    #[allow(refining_impl_trait)]
+    fn on_stop(&mut self, _actor_ref: kameo::actor::WeakActorRef<Self>, reason: kameo::error::ActorStopReason) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+        Box::pin(async move {
             tracing::error!(status = "stopped", actor_type = "PythonActor", ?reason);
             Ok(())
-        }
+        })
     }
-
-    #[instrument(skip(self, _actor_ref, err), fields(actor_type = "PythonActor"), parent = tracing::Span::current())]
-    fn on_panic(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        err: PanicError,
-    ) -> impl std::future::Future<Output = Result<ControlFlow<ActorStopReason>, Self::Error>> + Send
-    {
-        async move {
+    #[allow(refining_impl_trait)]
+    fn on_panic(&mut self, _actor_ref: kameo::actor::WeakActorRef<Self>, err: kameo::error::PanicError) -> Pin<Box<dyn Future<Output = Result<std::ops::ControlFlow<kameo::error::ActorStopReason>, Self::Error>> + Send>> {
+        Box::pin(async move {
             tracing::error!(status = "panicked", actor_type = "PythonActor", ?err);
-            Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
-        }
+            Ok(std::ops::ControlFlow::Continue(()))
+        })
     }
 }
 
@@ -133,11 +118,12 @@ where
 {
     type Reply = kameo::reply::DelegatedReply<Result<<M as KameoChildProcessMessage>::Reply, PythonExecutionError>>;
     #[tracing::instrument(skip(self, ctx, message), fields(actor_type = "PythonActor", message_type = std::any::type_name::<M>()), parent = tracing::Span::current())]
+    #[allow(refining_impl_trait)]
     fn handle(
         &mut self,
         message: M,
         ctx: &mut kameo::message::Context<Self, Self::Reply>,
-    ) -> impl std::future::Future<Output = Self::Reply> + Send {
+    ) -> Pin<Box<dyn Future<Output = Self::Reply> + Send>> {
         let handler = self.handler.clone();
         let (delegated, reply_sender) = ctx.reply_sender();
         let concurrent_tasks = self.concurrent_tasks.clone();
@@ -154,7 +140,7 @@ where
         } else {
             tracing::warn!("No reply sender available for message (fire-and-forget)");
         }
-        async move { delegated }
+        Box::pin(async move { delegated })
     }
 }
 
@@ -195,12 +181,12 @@ where
     tracing::info!("running child actor loop");
     match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn, config).await {
         Ok(()) => {
-            tracing::info!("Child process exited cleanly.");
+            tracing::info!("Child process exited cleanly (no process::exit). Returning from child_process_main_with_python_actor.");
             Ok(())
         }
         Err(e) => {
-            tracing::error!(error = ?e, "Child process IO error");
-            Err(format!("{:?}", e).into())
+            tracing::error!(error = ?e, "Child process IO error (no process::exit). Returning error from child_process_main_with_python_actor.");
+            Err(Box::new(e))
         }
     }
 }
@@ -274,7 +260,7 @@ impl PythonMessageHandler {
             tracing::debug!(event = "python_call", step = "after_async_call", function = %function_name, "Async Python call succeeded");
             let rust_result = Python::with_gil(|py| {
                 let bound = py_output.bind(py);
-                crate::serde_py::from_pyobject(&bound).map_err(|e| {
+                crate::serde_py::from_pyobject(bound).map_err(|e| {
                     PythonExecutionError::DeserializationError {
                         message: e.to_string(),
                     }

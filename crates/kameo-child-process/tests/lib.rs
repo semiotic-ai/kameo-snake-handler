@@ -158,7 +158,7 @@ async fn test_callback_protocol_full_duplex() {
         // test body
         use kameo_child_process::callback::{CallbackReceiver, CallbackIpcChild, CallbackHandler};
         use kameo_child_process::DuplexUnixStream;
-        use std::sync::Arc;
+        
         #[derive(Clone)]
         struct ParentHandler;
         #[async_trait::async_trait]
@@ -187,4 +187,43 @@ async fn test_callback_protocol_full_duplex() {
         token.cancel();
         receiver_task.await.unwrap();
     }).await.expect("Test timed out");
+}
+
+// Refactor to use in-process simulation
+#[tokio::test]
+async fn test_child_process_exits_on_parent_disconnect() {
+    use kameo_child_process::{KameoChildProcessMessage, run_child_actor_loop, DuplexUnixStream};
+    use tokio::net::UnixStream;
+    use std::time::Duration;
+    use tokio::time::timeout;
+    init_tracing();
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
+    struct DummyMsg;
+    impl KameoChildProcessMessage for DummyMsg {
+        type Reply = ();
+    }
+
+    #[derive(Clone)]
+    struct DummyHandler;
+    #[async_trait::async_trait]
+    impl kameo_child_process::ChildProcessMessageHandler<DummyMsg> for DummyHandler {
+        type Reply = Result<(), kameo_child_process::error::PythonExecutionError>;
+        async fn handle_child_message(&mut self, _msg: DummyMsg) -> Self::Reply {
+            Ok(())
+        }
+    }
+
+    let (parent_stream, child_stream) = UnixStream::pair().expect("Failed to create UnixStream pair");
+    let child_conn = Box::new(child_stream);
+    let child_task = tokio::spawn(async move {
+        run_child_actor_loop(DummyHandler, child_conn, None).await
+    });
+
+    // Simulate parent disconnect by dropping parent_stream
+    drop(parent_stream);
+
+    // Wait for child to exit
+    let result = timeout(Duration::from_secs(5), child_task).await.expect("timeout").expect("join");
+    assert!(result.is_ok(), "Child did not exit cleanly on parent disconnect");
 }

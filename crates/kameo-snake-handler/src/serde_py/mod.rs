@@ -549,14 +549,14 @@ mod tests {
         #[test]
         fn test_all_primitives_roundtrip(test_struct in all_primitives_strategy()) {
             let py_obj = Python::with_gil(|py| to_pyobject(py, &test_struct).unwrap());
-            let roundtrip = Python::with_gil(|py| from_pyobject(&py_obj.bind(py)).unwrap());
+            let roundtrip = Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
             prop_assert_eq!(test_struct, roundtrip)
         }
 
         #[test]
         fn test_edge_cases_roundtrip(test_struct in edge_case_strategy()) {
             let py_obj = Python::with_gil(|py| to_pyobject(py, &test_struct).unwrap());
-            let roundtrip = Python::with_gil(|py| from_pyobject(&py_obj.bind(py)).unwrap());
+            let roundtrip = Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
             prop_assert_eq!(test_struct, roundtrip)
         }
 
@@ -564,7 +564,7 @@ mod tests {
         fn test_complex_enum_roundtrip(value in complex_enum_strategy()) {
             Python::with_gil(|py| {
                 let py_obj = to_pyobject(py, &value).unwrap();
-                let roundtrip: ComplexEnum = from_pyobject(&py_obj.bind(py)).unwrap();
+                let roundtrip: ComplexEnum = from_pyobject(py_obj.bind(py)).unwrap();
                 assert_eq!(value, roundtrip);
             });
         }
@@ -573,7 +573,7 @@ mod tests {
         fn test_async_struct_roundtrip(value in async_test_struct_strategy()) {
             Python::with_gil(|py| {
                 let py_obj = to_pyobject(py, &value).unwrap();
-                let roundtrip: AsyncTestStruct = from_pyobject(&py_obj.bind(py)).unwrap();
+                let roundtrip: AsyncTestStruct = from_pyobject(py_obj.bind(py)).unwrap();
                 assert_eq!(value, roundtrip);
             });
         }
@@ -601,7 +601,7 @@ mod tests {
             let value = make_recursive_enum(depth);
             Python::with_gil(|py| {
                 let py_obj = to_pyobject(py, &value).unwrap();
-                let roundtrip: RecursiveEnum = from_pyobject(&py_obj.bind(py)).unwrap();
+                let roundtrip: RecursiveEnum = from_pyobject(py_obj.bind(py)).unwrap();
                 assert_eq!(value, roundtrip);
             });
         }

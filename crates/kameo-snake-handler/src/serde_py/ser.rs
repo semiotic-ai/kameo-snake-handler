@@ -12,7 +12,7 @@ use super::Error;
 use super::Result;
 
 /// Convert a Rust value to a Python object
-pub fn to_pyobject<'py, T>(py: Python<'py>, value: &T) -> Result<PyObject>
+pub fn to_pyobject<T>(py: Python<'_>, value: &T) -> Result<PyObject>
 where
     T: Serialize,
 {
@@ -98,13 +98,10 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
     }
 
     fn serialize_none(self) -> Result<Self::Ok> {
-        Ok(self.py.None().into())
+        Ok(self.py.None())
     }
 
-    fn serialize_some<T: ?Sized>(self, value: &T) -> Result<Self::Ok>
-    where
-        T: Serialize,
-    {
+    fn serialize_some<T: ?Sized + Serialize>(self, value: &T) -> Result<Self::Ok> {
         value.serialize(self)
     }
 
@@ -125,23 +122,17 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
         Ok(variant.into_bound_py_any(self.py)?.into())
     }
 
-    fn serialize_newtype_struct<T: ?Sized>(self, _name: &'static str, value: &T) -> Result<Self::Ok>
-    where
-        T: Serialize,
-    {
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(self, _name: &'static str, value: &T) -> Result<Self::Ok> {
         value.serialize(self)
     }
 
-    fn serialize_newtype_variant<T: ?Sized>(
+    fn serialize_newtype_variant<T: ?Sized + Serialize>(
         self,
         _name: &'static str,
         _variant_index: u32,
         variant: &'static str,
         value: &T,
-    ) -> Result<Self::Ok>
-    where
-        T: Serialize,
-    {
+    ) -> Result<Self::Ok> {
         let dict = PyDict::new(self.py);
         dict.set_item(variant, value.serialize(Self::new(self.py))?)?;
         Ok(dict.into_bound_py_any(self.py)?.into())
@@ -150,7 +141,7 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
     fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq> {
         Ok(PythonSeqSerializer {
             py: self.py,
-            list: PyList::empty(self.py).into(),
+            list: PyList::empty(self.py),
             next_key: None,
         })
     }
@@ -187,7 +178,7 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
         let dict = PyDict::new(self.py);
         Ok(PythonMapSerializer {
             py: self.py,
-            dict: dict.into(),
+            dict,
             next_key: None,
         })
     }
@@ -215,20 +206,17 @@ impl<'py> PythonSeqSerializer<'py> {
     fn new(py: Python<'py>) -> Result<Self> {
         Ok(Self {
             py,
-            list: PyList::empty(py).into(),
+            list: PyList::empty(py),
             next_key: None,
         })
     }
 }
 
-impl<'py> SerializeSeq for PythonSeqSerializer<'py> {
+impl SerializeSeq for PythonSeqSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         let element = value.serialize(PythonSerializer::new(self.py))?;
         self.list.append(element)?;
         Ok(())
@@ -245,7 +233,7 @@ impl<'py> SerializeSeq for PythonSeqSerializer<'py> {
     }
 }
 
-impl<'py> SerializeTuple for PythonSeqSerializer<'py> {
+impl SerializeTuple for PythonSeqSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
@@ -261,14 +249,11 @@ impl<'py> SerializeTuple for PythonSeqSerializer<'py> {
     }
 }
 
-impl<'py> SerializeTupleStruct for PythonSeqSerializer<'py> {
+impl SerializeTupleStruct for PythonSeqSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         SerializeSeq::serialize_element(self, value)
     }
 
@@ -277,7 +262,7 @@ impl<'py> SerializeTupleStruct for PythonSeqSerializer<'py> {
     }
 }
 
-impl<'py> SerializeTupleVariant for PythonSeqSerializer<'py> {
+impl SerializeTupleVariant for PythonSeqSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
@@ -308,20 +293,17 @@ impl<'py> PythonMapSerializer<'py> {
     fn new(py: Python<'py>) -> Result<Self> {
         Ok(Self {
             py,
-            dict: PyDict::new(py).into(),
+            dict: PyDict::new(py),
             next_key: None,
         })
     }
 }
 
-impl<'py> SerializeMap for PythonMapSerializer<'py> {
+impl SerializeMap for PythonMapSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_key<T: ?Sized>(&mut self, key: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<()> {
         self.next_key = Some(
             key.serialize(PythonSerializer::new(self.py))?
                 .extract(self.py)
@@ -330,10 +312,7 @@ impl<'py> SerializeMap for PythonMapSerializer<'py> {
         Ok(())
     }
 
-    fn serialize_value<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         let key = self
             .next_key
             .take()
@@ -354,14 +333,11 @@ impl<'py> SerializeMap for PythonMapSerializer<'py> {
     }
 }
 
-impl<'py> SerializeStruct for PythonMapSerializer<'py> {
+impl SerializeStruct for PythonMapSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<()> {
         let value = value.serialize(PythonSerializer::new(self.py))?;
         self.dict.set_item(key, value).map_err(|e| {
             Error::Serialization(format!("failed to set struct field '{}': {}", key, e))
@@ -378,14 +354,11 @@ impl<'py> SerializeStruct for PythonMapSerializer<'py> {
     }
 }
 
-impl<'py> SerializeStructVariant for PythonMapSerializer<'py> {
+impl SerializeStructVariant for PythonMapSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized>(&mut self, key: &'static str, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<()> {
         let value = value.serialize(PythonSerializer::new(self.py))?;
         self.dict.set_item(key, value).map_err(|e| {
             Error::Serialization(format!("failed to set variant field '{}': {}", key, e))

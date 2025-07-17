@@ -22,7 +22,6 @@ use kameo_child_process::error::PythonExecutionError;
 use kameo_child_process::callback::{CallbackHandler, NoopCallbackHandler};
 use pyo3::prelude::*;
 use pyo3::pyfunction;
-use pyo3::types::{PyAny, PyModule};
 
 
 /// Custom error type for logic operations
@@ -155,6 +154,20 @@ impl CallbackHandler<TraderCallbackMessage> for TestCallbackHandler {
 impl CallbackHandler<BenchCallback> for TestCallbackHandler {
     async fn handle(&self, callback: BenchCallback) -> Result<(), PythonExecutionError> {
         tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "TestCallbackHandler received bench callback");
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct CountingCallbackHandler {
+    counter: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl CallbackHandler<BenchCallback> for CountingCallbackHandler {
+    async fn handle(&self, callback: BenchCallback) -> Result<(), PythonExecutionError> {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "CountingCallbackHandler received bench callback");
+        tokio::time::sleep(Duration::from_millis(callback.rust_sleep_ms)).await;
         Ok(())
     }
 }
@@ -334,7 +347,6 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         "SYNC Test 6 failed: got {:?}",
         resp
     );
-    sync_pool.shutdown().await;
     Ok(())
 }
 
@@ -446,7 +458,6 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
             resp
         );
     }
-    async_pool.shutdown().await;
     Ok(())
 }
 
@@ -547,12 +558,11 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         "Trader demo failed: got {:?}",
         resp
     );
-    trader_pool.shutdown().await;
     Ok(())
 }
 
 async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    const N: usize = 100;
+    const N: usize = 10000;
     const MAX_SLEEP_MS: u64 = 100;
     let mut rng = thread_rng();
     let bench_config = PythonConfig {
@@ -563,9 +573,11 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
         is_async: true,
         module_path: "crates/kameo-snake-testing/python/bench_async.py".to_string(),
     };
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_handler = CountingCallbackHandler { counter: callback_count.clone() };
     let bench_pool = PythonChildProcessBuilder::<BenchCallback, NoopCallbackHandler<BenchCallback>>::new(bench_config)
-        .with_callback_handler(TestCallbackHandler)
-        .spawn_pool::<BenchMessage>(100, None)
+        .with_callback_handler(callback_handler)
+        .spawn_pool::<BenchMessage>(1000, None)
         .await?;
     let start = Instant::now();
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -597,6 +609,7 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
         }
     }
     let elapsed = start.elapsed();
+    let callbacks = callback_count.load(Ordering::SeqCst);
     let max_conc = max_concurrency.load(Ordering::SeqCst);
     let total = latencies.len();
     let mean = latencies.iter().map(|d| d.as_secs_f64()).sum::<f64>() / total as f64;
@@ -635,6 +648,9 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
     writeln!(table,   "┃ Latency min               ┃ {:>9.3} ms         ┃", min*1000.0).unwrap();
     writeln!(table,   "┃ Latency mean              ┃ {:>9.3} ms         ┃", mean*1000.0).unwrap();
     writeln!(table,   "┃ Latency max               ┃ {:>9.3} ms         ┃", max*1000.0).unwrap();
+    writeln!(table,   "┃ Total callbacks           ┃ {:>9}              ┃", callbacks).unwrap();
+    let callback_throughput = if elapsed.as_secs_f64() > 0.0 { callbacks as f64 / elapsed.as_secs_f64() } else { 0.0 };
+    writeln!(table,   "┃ Callback throughput       ┃ {:>9.1} cb/sec      ┃", callback_throughput).unwrap();
     writeln!(table,   "┣━━━━━━━━━━━━━━━━━━━━━━━━━━━╋━━━━━━━━━━━━━━━━━━━━━━━┫").unwrap();
     writeln!(table,   "┃ Latency histogram         ┃                       ┃").unwrap();
     writeln!(table,   "┃   < 20 ms                 ┃ {:>5}                ┃", buckets[0]).unwrap();
@@ -649,7 +665,6 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
     } else {
         println!("{}\n⚠️  Throughput is below target!", table);
     }
-    bench_pool.shutdown().await;
     Ok(())
 }
 

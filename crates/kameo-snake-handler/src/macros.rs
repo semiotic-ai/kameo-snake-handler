@@ -91,11 +91,23 @@ macro_rules! setup_python_subprocess_system {
                             debug!(function = %config.function_name, "Located Python function");
                             let actor = kameo_snake_handler::PythonActor::<$msg, $callback>::new(config, function);
                             let async_block = async move {
-                                let request_conn = kameo_child_process::child_request().await.expect("child_request failed");
-                                let callback_conn = *kameo_child_process::child_callback().await.expect("child_callback handshake failed");
+                                let request_conn = match kameo_child_process::child_request().await {
+                                    Ok(conn) => conn,
+                                    Err(e) => {
+                                        tracing::info!(error = ?e, "Parent disconnected (request connect failed), exiting cleanly");
+                                        return Ok(());
+                                    }
+                                };
+                                let callback_conn = match kameo_child_process::child_callback().await {
+                                    Ok(conn) => conn,
+                                    Err(e) => {
+                                        tracing::info!(error = ?e, "Parent disconnected (callback connect failed), exiting cleanly");
+                                        return Ok(());
+                                    }
+                                };
                                 tracing::debug!("Setting callback handle glue for child process: {}", stringify!($callback));
                                 set_callback_handle_glue(
-                                    CallbackIpcChild::<$callback>::from_duplex(DuplexUnixStream::new(callback_conn))
+                                    CallbackIpcChild::<$callback>::from_duplex(DuplexUnixStream::new(*callback_conn))
                                         as Arc<dyn CallbackHandler<$callback>>
                                 );
                                 tracing::debug!("Set callback handle glue for {}", stringify!($callback));

@@ -54,5 +54,4 @@ impl<W: AsyncWrite + Unpin> LengthPrefixedWrite<W> {
     }
 }
 
-// Optional: type alias for full-duplex
 pub type LengthPrefixedStream<S> = (LengthPrefixedRead<S>, LengthPrefixedWrite<S>); 

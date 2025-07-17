@@ -6,9 +6,7 @@ use std::time::Duration;
 
 /// Builder for a Python child process
 /// NOTE: For PythonActor, use the macro-based entrypoint (setup_python_subprocess_system!). This builder is not supported for PythonActor.
-/// NOTE: SubprocessParentActor is only valid as an in-process actor with DelegatedReply. If used as a protocol boundary, use the serializable reply type and the original actor.
-
-/// Configuration for the parent actor loop concurrency
+/// NOTE: SubprocessParentActor is only valid as an in-process actor with DelegatedReply. If used as a child process actor, it will panic.
 pub struct ParentActorLoopConfig {
     pub max_concurrency: usize,
 }

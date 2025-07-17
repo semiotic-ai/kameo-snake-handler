@@ -48,16 +48,18 @@ where
 
 #[instrument(fields(pid= std::process::id(), actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()), parent = tracing::Span::current())]
 pub async fn child_request() -> std::io::Result<Box<UnixStream>> {
-    let req_env = std::env::var("KAMEO_REQUEST_SOCKET");
-    let socket_path = req_env.expect("KAMEO_REQUEST_SOCKET must be set");
-    let stream = UnixStream::connect(socket_path).await?;
+    let socket_path = std::env::var("KAMEO_REQUEST_SOCKET").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "KAMEO_REQUEST_SOCKET not set")
+    })?;
+    let stream = UnixStream::connect(&socket_path).await?;
     Ok(Box::new(stream))
 }
 
 #[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()), parent = tracing::Span::current())]
 pub async fn child_callback() -> std::io::Result<Box<UnixStream>> {
-    let cb_env = std::env::var("KAMEO_CALLBACK_SOCKET");
-    let socket_path = cb_env.expect("KAMEO_CALLBACK_SOCKET must be set");
-    let stream = UnixStream::connect(socket_path).await?;
+    let socket_path = std::env::var("KAMEO_CALLBACK_SOCKET").map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "KAMEO_CALLBACK_SOCKET not set")
+    })?;
+    let stream = UnixStream::connect(&socket_path).await?;
     Ok(Box::new(stream))
 }
