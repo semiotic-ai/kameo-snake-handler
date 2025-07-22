@@ -16,8 +16,11 @@ bincode = { workspace = true }
 futures = { workspace = true }
 kameo = { workspace = true }
 kameo_macros = { workspace = true }
+metrics = "0.24"
 nix = { workspace = true }
 opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -37,4 +40,5 @@ dashmap = "6.1.0"
 proptest = { workspace = true }
 tokio-test = "0.4"
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 

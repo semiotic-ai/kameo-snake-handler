@@ -12,20 +12,24 @@ futures = { workspace = true }
 kameo = { workspace = true }
 kameo-child-process = { path = "../kameo-child-process" }
 kameo_macros = { workspace = true }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.12"
+metrics-exporter-opentelemetry = "0.1.0"
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-stdout = { workspace = true }
-tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true }
 pyo3 = { version = "0.25.1", features = ["auto-initialize"] }
 pyo3-async-runtimes = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "1.0"
+thiserror = { workspace = true }
 tokio = { workspace = true }
-tracing = "0.1"
+tracing = { workspace = true }
 tracing-futures = "0.2"
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 once_cell = "1.19"
 
 

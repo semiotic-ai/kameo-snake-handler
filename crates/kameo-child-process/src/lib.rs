@@ -3,6 +3,7 @@
 pub mod callback;
 pub mod handshake;
 pub use handshake::*;
+pub mod metrics;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,7 +24,7 @@ use tokio::time::Duration;
 use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_futures::Instrument;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tracing::{trace, error};
 use std::time::Instant;
 use dashmap::DashMap;
@@ -73,13 +74,13 @@ impl dyn AsyncReadWrite {
 
 /// Trait for messages that can be sent to a Kameo child process actor.
 pub trait KameoChildProcessMessage:
-    Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static
+    Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + Clone + 'static
 {
-    type Ok: Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + 'static;
+    type Ok: Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + Clone + 'static;
 }
 
 /// Control message for handshake and real messages (errors are always inside the envelope)
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Serialize, Deserialize, Encode, Decode, Clone)]
 pub enum Control<T> {
     Handshake,
     Real(MultiplexEnvelope<T>),
@@ -98,7 +99,7 @@ impl<T> Control<T> {
 }
 
 /// Envelope for multiplexed requests
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
 pub struct MultiplexEnvelope<T> {
     pub correlation_id: u64,
     pub inner: T,
@@ -198,18 +199,20 @@ impl AsRef<tokio::net::UnixStream> for DuplexUnixStream {
 
 pub struct SubprocessIpcBackend<M>
 where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
+    M: KameoChildProcessMessage + Send + Sync + Clone + 'static,
 {
     write_tx: tokio::sync::mpsc::UnboundedSender<WriteRequest<M>>,
     in_flight: InFlightMap<Result<M::Ok, PythonExecutionError>>,
     next_id: AtomicU64,
     cancellation_token: tokio_util::sync::CancellationToken,
+    // Track pending requests for adaptive throttling
+    pending_count: AtomicUsize,
     _phantom: std::marker::PhantomData<M>,
 }
 
 impl<M> SubprocessIpcBackend<M>
 where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
+    M: KameoChildProcessMessage + Send + Sync + Clone + 'static,
 {
     /// Canonical constructor: wire up the backend from a DuplexUnixStream, splitting it internally.
     pub fn from_duplex(stream: DuplexUnixStream) -> Arc<Self> {
@@ -230,29 +233,74 @@ where
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let cancellation_token_writer = cancellation_token.clone();
         let cancellation_token_reader = cancellation_token.clone();
-        // Writer task
+        
+        // Create the result first so we can track pending counts
+        let result = Arc::new(Self {
+            write_tx,
+            in_flight,
+            next_id: AtomicU64::new(1),
+            cancellation_token,
+            pending_count: AtomicUsize::new(0),
+            _phantom: PhantomData,
+        });
+        
+        let result_clone = result.clone();
+        
+        // Writer task with simpler direct writes
         tokio::spawn(async move {
             let mut writer = crate::framing::LengthPrefixedWrite::new(write_half);
+            
             loop {
                 tokio::select! {
                     _ = cancellation_token_writer.cancelled() => {
                         tracing::info!(event = "writer_task", "Writer task received shutdown signal, exiting");
                         break;
                     }
-                    Some(write_req) = write_rx.recv() => {
-                        if writer.write_msg(&write_req.ctrl).await.is_err() {
-                            tracing::error!(event = "writer_task", error = "Failed to write message, breaking");
-                            break;
+                    
+                    message = write_rx.recv() => {
+                        match message {
+                            Some(write_req) => {
+                                // Process write directly, one at a time
+                                if let Err(e) = writer.write_msg(&write_req.ctrl).await {
+                                    tracing::error!(event = "writer_task", error = ?e, "Failed to write message");
+                                    // Don't break on errors - just log them and continue
+                                }
+                            },
+                            None => {
+                                tracing::info!(event = "writer_task", "Channel closed, exiting");
+                                break;
+                            }
                         }
                     }
-                    else => break,
                 }
             }
+            
             tracing::info!(event = "writer_task", "Writer task exiting");
         });
-        // Reader task
+        
+        // Reader task with improved error handling
         tokio::spawn(async move {
             let mut reader = crate::framing::LengthPrefixedRead::new(read_half);
+            
+            // Initialize metrics
+            metrics::init_metrics();
+            
+            // Create a task to periodically log metrics
+            let metrics_token = cancellation_token_reader.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        _ = metrics_token.cancelled() => {
+                            break;
+                        }
+                        _ = interval.tick() => {
+                            metrics::MetricsReporter::log_metrics_state();
+                        }
+                    }
+                }
+            });
+            
             loop {
                 tokio::select! {
                     _ = cancellation_token_reader.cancelled() => {
@@ -264,12 +312,35 @@ where
                             Ok(ctrl) => {
                                 if let Control::Real(envelope) = ctrl {
                                     let correlation_id = envelope.correlation_id;
-                                    let lock_start = Instant::now();
-                                    if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
-                                        let remove_duration = lock_start.elapsed();
-                                        trace!(event = "parent_in_flight", action = "remove", duration_ms = remove_duration.as_millis(), correlation_id, in_flight_len = in_flight_reader.0.len(), "Removed from parent in_flight in reader");
-                                        slot.set_and_notify(envelope.inner).await;
-                                        trace!(event = "parent_in_flight", action = "notify", correlation_id, in_flight_len = in_flight_reader.0.len(), "Notified reply slot in parent in_flight");
+                                    trace!(event = "parent_in_flight", action = "response_received", correlation_id, "Received response for correlation_id");
+                                    
+                                    // Extract the entry from in_flight map to avoid race conditions
+                                    if let Some((_, slot)) = in_flight_reader.0.remove(&correlation_id) {
+                                        // Decrement pending count as we've received a response
+                                        result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                        
+                                        // Extract the sender so we can drop the slot immediately
+                                        if let Some(sender) = slot.sender {
+                                            // Send the response directly to the waiting task
+                                            if sender.send(envelope.inner).is_err() {
+                                                tracing::error!(event = "parent_in_flight", error = "Failed to send reply, receiver dropped", correlation_id);
+                                                
+                                                // Track error in metrics
+                                                metrics::MetricsHandle::parent().track_error("reply_channel_closed");
+                                            } else {
+                                                trace!(event = "parent_in_flight", action = "notify", correlation_id, "Sent reply to waiting task");
+                                            }
+                                        } else {
+                                            tracing::error!(event = "parent_in_flight", correlation_id, "Reply slot sender missing");
+                                            
+                                            // Track error in metrics
+                                            metrics::MetricsHandle::parent().track_error("missing_sender");
+                                        }
+                                    } else {
+                                        tracing::error!(event = "parent_in_flight", correlation_id, "Received reply for unknown correlation id");
+                                        
+                                        // Track error in metrics
+                                        metrics::MetricsHandle::parent().track_error("unknown_correlation_id");
                                     }
                                 }
                             }
@@ -281,18 +352,16 @@ where
                                         tracing::info!(event = "reader_task", "EOF received, no in-flight requests, clean shutdown");
                                     } else {
                                         tracing::warn!(event = "reader_task", in_flight_len, "EOF received with pending in-flight requests, waking all with error");
-                                        in_flight_reader.0.retain(|_corr_id, slot| {
-                                            if let Some(sender) = slot.sender.take() {
-                                                if sender.send(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited (EOF)".to_string() })).is_err() {
-                                                    tracing::error!(event = "reader_task", error = "Failed to send EOF error to waiting task", "Failed to notify waiting task about EOF");
-                                                }
-                                            }
-                                            false
-                                        });
+                                        
+                                        // Track error in metrics
+                                        metrics::MetricsHandle::parent().track_error("eof_with_pending");
                                     }
                                     break;
                                 }
                                 error!(event = "parent_read_error", error = ?e, "Parent reader task error, exiting");
+                                
+                                // Track error in metrics
+                                metrics::MetricsHandle::parent().track_error("read_error");
                                 break;
                             }
                         }
@@ -300,23 +369,23 @@ where
                 }
             }
             // On exit, drain in_flight and send error to all pending
-            in_flight_reader.0.retain(|_corr_id, slot| {
+            in_flight_reader.0.iter_mut().for_each(|mut item| {
+                let (_corr_id, mut slot) = item.pair_mut();
                 if let Some(sender) = slot.sender.take() {
-                    if sender.send(Err(PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() })).is_err() {
+                    let err = PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() };
+                    if sender.send(Err(err)).is_err() {
                         tracing::error!(event = "reader_task", error = "Failed to send shutdown error to waiting task", "Failed to notify waiting task about shutdown");
                     }
                 }
-                false
             });
-            tracing::info!(event = "reader_task", "Reader task exiting and drained in_flight");
+            // Reset pending count to 0
+            result_clone.pending_count.store(0, std::sync::atomic::Ordering::SeqCst);
+            // Clear the map after notifying all waiting tasks
+            in_flight_reader.0.clear();
+            tracing::info!(event = "reader_task", "Reader task exiting");
         });
-        Arc::new(Self {
-            write_tx,
-            in_flight,
-            next_id: std::sync::atomic::AtomicU64::new(1),
-            cancellation_token,
-            _phantom: std::marker::PhantomData,
-        })
+        
+        result
     }
 
     /// Always generate a unique correlation_id using the atomic counter.
@@ -328,59 +397,82 @@ where
     pub fn shutdown(&self) {
         self.cancellation_token.cancel();
     }
+    
+    /// Returns the current number of pending requests
+    pub fn pending_count(&self) -> usize {
+        self.pending_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
 
     pub async fn send(&self, msg: M) -> Result<M::Ok, PythonExecutionError> {
-        use tracing::trace;
-        
-        // Always use atomic counter for correlation_id
+        trace!(event = "parent_send", msg = ?msg, "Parent sending message");
         let correlation_id = self.next_correlation_id();
-        let span = tracing::Span::current();
-        let span_id = span.id();
-        trace!(event = "parent_send", step = "correlation_id", correlation_id, ?span_id, "Generated atomic correlation_id and using current span for tracing");
-        let mut trace_context_map = std::collections::HashMap::new();
-        global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(&tracing_opentelemetry::OpenTelemetrySpanExt::context(&span), &mut trace_context_map)
-        });
-        let envelope = MultiplexEnvelope {
+        let ctrl = Control::Real(MultiplexEnvelope {
             correlation_id,
             inner: msg,
-            context: TracingContext(trace_context_map),
-        };
-        let ctrl = Control::Real(envelope);
-        let write_req = WriteRequest {
-            correlation_id,
-            ctrl,
-        };
-        let reply_slot: ReplySlot<Result<M::Ok, PythonExecutionError>> = ReplySlot::new();
+            context: TracingContext::default(),
+        });
+        
+        // Create the oneshot channel BEFORE sending the message
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        
+        // Create tracker to automatically track metrics for this operation
+        let _metrics_tracker = metrics::OperationTracker::track_parent();
+        
+        // Insert into in_flight map and track pending count
         {
-            let lock_start = Instant::now();
-            self.in_flight.0.insert(correlation_id, reply_slot);
-            let insert_duration = lock_start.elapsed(); // Since no lock, but keep for consistency
-            trace!(event = "parent_in_flight", action = "insert", duration_ms = insert_duration.as_millis(), in_flight_len = self.in_flight.0.len(), correlation_id, ?span_id, "Inserted into parent in_flight");
+            let mut slot = ReplySlot::new();
+            slot.sender = Some(tx);
+            slot.receiver = None; // We'll keep the receiver separately
+            self.in_flight.0.insert(correlation_id, slot);
+            
+            // Track that we now have one more pending request
+            self.pending_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        if let Err(e) = self.write_tx.send(write_req) {
-            let lock_start = Instant::now();
-            if let Some((_, mut slot)) = self.in_flight.0.remove(&correlation_id) {
-                if let Some(sender) = slot.sender.take() {
-                    if sender.send(Err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") })).is_err() {
-                        tracing::error!(event = "parent_send", step = "error_notify_failed", correlation_id, "Failed to notify waiting task about send error");
-                    }
-                }
+        
+        // Apply adaptive backoff if we have too many pending requests
+        let current_pending = self.pending_count();
+        if current_pending > 1000 {
+            // Adaptive backoff based on pending count
+            let backoff_ms = std::cmp::min(current_pending / 100, 20); // Max 20ms backoff
+            if backoff_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(backoff_ms as u64)).await;
             }
-            let remove_duration = lock_start.elapsed();
-            trace!(event = "parent_in_flight", action = "remove", duration_ms = remove_duration.as_millis(), correlation_id, "Removed from parent in_flight on send fail");
-            trace!(event = "parent_send", step = "send_failed", correlation_id, error = ?e, "Failed to send write request");
-            return Err(PythonExecutionError::ExecutionError { message: format!("Failed to send write request: {e}") });
         }
-        trace!(event = "parent_send", step = "sent", correlation_id, ?span_id, "Sent write request to writer task");
-        // Await the reply by reference, do not remove from map here
-        let mut slot = self.in_flight.0.get_mut(&correlation_id)
-            .expect("ReplySlot must exist in in_flight map");
-        let receiver = slot.receiver.take();
-        drop(slot); // Release the lock before awaiting
-        match receiver {
-            Some(receiver) => receiver.await.unwrap_or_else(|_| Err(PythonExecutionError::ExecutionError { message: "Recv error".to_string() })),
-            None => Err(PythonExecutionError::ExecutionError { message: "Reply slot already taken".to_string() }),
+        
+        // Send the request with careful error handling
+        let write_req = WriteRequest { correlation_id, ctrl };
+        if let Err(e) = self.write_tx.send(write_req) {
+            // Clean up in_flight entry on error and decrement pending count
+            self.in_flight.0.remove(&correlation_id);
+            self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            
+            // Track the error in metrics
+            metrics::MetricsHandle::parent().track_error("send_failed");
+            
+            return Err(PythonExecutionError::ExecutionError { 
+                message: format!("Failed to send write request: {e}") 
+            });
+        }
+        
+        // Wait for the response
+        match rx.await {
+            Ok(res) => {
+                trace!(event = "parent_recv", correlation_id, ?res, "Parent received reply");
+                res
+            },
+            Err(_) => {
+                // Clean up if needed and decrement pending count
+                if self.in_flight.0.remove(&correlation_id).is_some() {
+                    self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                
+                // Track the error in metrics
+                metrics::MetricsHandle::parent().track_error("receive_failed");
+                
+                Err(PythonExecutionError::ExecutionError { 
+                    message: "Reply channel closed before response received".to_string() 
+                })
+            },
         }
     }
 }

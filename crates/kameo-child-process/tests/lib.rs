@@ -21,7 +21,9 @@ fn init_tracing() {
 use kameo_child_process::framing::{LengthPrefixedRead, LengthPrefixedWrite};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-struct DummyMsg(u64);
+struct DummyMsg {
+    id: u64
+}
 
 #[derive(Clone)]
 struct DummyHandler;
@@ -33,9 +35,22 @@ impl kameo_child_process::callback::CallbackHandler<DummyMsg> for DummyHandler {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
-struct DummyParentMsg(u64);
+struct DummyParentMsg {
+    id: u64
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+struct DummyParentOk {
+    id: u64
+}
+
 impl kameo_child_process::KameoChildProcessMessage for DummyParentMsg {
-    type Ok = u64;
+    type Ok = DummyParentOk;
+}
+
+// Implement KameoChildProcessMessage for DummyMsg so it can be used with setup_test_ipc_pair
+impl kameo_child_process::KameoChildProcessMessage for DummyMsg {
+    type Ok = ();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -60,7 +75,7 @@ async fn test_single_callback_message() {
             let mut writer = LengthPrefixedWrite::new(write_half);
             let envelope = kameo_child_process::callback::CallbackEnvelope {
                 correlation_id: 1,
-                inner: DummyMsg(42),
+                inner: DummyMsg { id: 42 },
                 context: Default::default(),
             };
             trace!(event = "test_child", step = "send_callback", correlation_id = 1, "Child sending callback envelope");
@@ -88,11 +103,6 @@ async fn test_single_callback_message() {
     }).await.expect("Test timed out");
 }
 
-// Implement KameoChildProcessMessage for DummyMsg so it can be used with setup_test_ipc_pair
-impl kameo_child_process::KameoChildProcessMessage for DummyMsg {
-    type Ok = ();
-}
-
 // Helper to create a UnixStream pair, perform handshake, and return ready-to-use sockets
 pub async fn setup_test_ipc_pair<M>() -> (tokio::net::UnixStream, tokio::net::UnixStream)
 where
@@ -103,89 +113,201 @@ where
     (parent_stream, child_stream)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_parent_child_ipc() {
     trace!(event = "test_start", name = "test_parent_child_ipc", "Starting test");
     init_tracing();
+    
+    // Initialize metrics
+    kameo_child_process::metrics::init_metrics();
+    
     use kameo_child_process::SubprocessIpcBackend;
     use kameo_child_process::{SubprocessIpcChild, ChildProcessMessageHandler, DuplexUnixStream};
     use tokio::time::timeout;
     use std::time::Duration;
+    use futures::future::join_all;
+    use std::sync::Arc;
 
+    // Start a task to log metrics periodically
+    let metrics_task = tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        for _ in 0..90 {  // Log for up to 3 minutes max
+            interval.tick().await;
+            kameo_child_process::metrics::MetricsReporter::log_metrics_state();
+        }
+    });
+    
     #[derive(Clone)]
     struct DummyChildHandler;
     #[async_trait::async_trait]
     impl kameo_child_process::ChildProcessMessageHandler<DummyParentMsg> for DummyChildHandler {
-        async fn handle_child_message(&mut self, msg: DummyParentMsg) -> Result<u64, kameo_child_process::error::PythonExecutionError> {
-            tracing::info!(?msg, "DummyChildHandler received message");
-            Ok(msg.0 + 100)
+        async fn handle_child_message(&mut self, msg: DummyParentMsg) -> Result<DummyParentOk, kameo_child_process::error::PythonExecutionError> {
+            trace!(event = "handler", id = msg.id, "Handling message in child");
+            Ok(DummyParentOk { id: msg.id })
         }
     }
-
-    // Use helper to get handshake-complete sockets
-    let (parent_stream, child_stream) = setup_test_ipc_pair::<DummyParentMsg>().await;
-    let backend = SubprocessIpcBackend::<DummyParentMsg>::from_duplex(DuplexUnixStream::new(parent_stream));
-    let child = SubprocessIpcChild::<DummyParentMsg>::from_duplex(DuplexUnixStream::new(child_stream));
+    
+    let (parent_stream, child_stream) = tokio::net::UnixStream::pair().unwrap();
+    let p = kameo_child_process::DuplexUnixStream::new(parent_stream);
+    let c = kameo_child_process::DuplexUnixStream::new(child_stream);
+    
+    let child_handler = DummyChildHandler;
+    let backend = SubprocessIpcBackend::<DummyParentMsg>::from_duplex(p);
+    
     let child_task = tokio::spawn(async move {
-        tracing::info!("Child about to run");
-        let result = child.run(DummyChildHandler).await;
-        tracing::info!(?result, "Child finished running");
-        result
+        let child = SubprocessIpcChild::<DummyParentMsg>::from_duplex(c);
+        child.run(child_handler).await
     });
-
-    // Yield to ensure the child task is polled before parent sends
-    tokio::task::yield_now().await;
-
-    tracing::info!("Parent about to send message");
-    let reply = timeout(Duration::from_secs(2), backend.send(DummyParentMsg(123))).await;
-    tracing::info!(?reply, "Parent got reply or timeout");
-    let reply = reply.expect("timeout").expect("reply");
-    assert_eq!(reply, 223);
+    
+    // Run many concurrent requests
+    let requests = 10_000;
+    let futures = (0..requests).map(|i| {
+        let backend = backend.clone();
+        async move {
+            let msg = DummyParentMsg { id: i };
+            let result = backend.send(msg).await;
+            trace!(event = "parent_test", id = i, ?result, "Got result");
+            result
+        }
+    }).collect::<Vec<_>>();
+    
+    let results = timeout(Duration::from_secs(120), join_all(futures)).await
+        .expect("test timed out");
+    
+    for (i, result) in results.into_iter().enumerate() {
+        assert!(result.is_ok(), "Request {} failed: {:?}", i, result);
+        let ok = result.unwrap();
+        assert_eq!(ok.id, i as u64, "Result has wrong id");
+    }
+    
+    // Shutdown and wait for child task
     backend.shutdown();
-    let child_result = child_task.await;
-    tracing::info!(?child_result, "Child task join result");
-    if let Err(e) = child_result {
-        panic!("Child task panicked: {:?}", e);
+    match timeout(Duration::from_secs(5), child_task).await {
+        Ok(res) => {
+            trace!(event = "test_shutdown", ?res, "Child task completed");
+            res.expect("child task panicked").expect("child task returned error");
+        },
+        Err(_) => {
+            panic!("Child task failed to shut down in time");
+        }
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_callback_protocol_full_duplex() {
     trace!(event = "test_start", name = "test_callback_protocol_full_duplex", "Starting test");
     init_tracing();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    
+    // Initialize metrics
+    kameo_child_process::metrics::init_metrics();
+    
+    tokio::time::timeout(Duration::from_secs(180), async {
+        tracing::info!("Test started - setting up callback protocol test");
         // test body
         use kameo_child_process::callback::{CallbackReceiver, CallbackIpcChild, CallbackHandler};
         use kameo_child_process::DuplexUnixStream;
+        use futures::future::join_all;
+        use futures::stream::{self, StreamExt};
+        
+        // Start a task to log metrics periodically
+        let metrics_task = tokio::spawn(async {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            for _ in 0..90 {  // Log for up to 3 minutes max
+                interval.tick().await;
+                kameo_child_process::metrics::MetricsReporter::log_metrics_state();
+            }
+        });
         
         #[derive(Clone)]
         struct ParentHandler;
         #[async_trait::async_trait]
         impl CallbackHandler<DummyMsg> for ParentHandler {
             async fn handle(&self, cb: DummyMsg) -> Result<(), kameo_child_process::error::PythonExecutionError> {
-                tracing::info!(?cb, "ParentHandler received callback");
+                trace!(event = "parent_handler", id = cb.id, "Parent handling callback");
                 Ok(())
             }
         }
-        let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
-        let parent_duplex = DuplexUnixStream::new(sock1);
-        let child_duplex = DuplexUnixStream::new(sock2);
-        let receiver = CallbackReceiver::<DummyMsg, ParentHandler>::from_duplex(parent_duplex, ParentHandler);
-        let child_ipc = CallbackIpcChild::<DummyMsg>::from_duplex(child_duplex);
-        let token = receiver.cancellation_token();
+        
+        tracing::info!("Creating socket pair");
+        // Create the sockets
+        let (parent_stream, child_stream) = tokio::net::UnixStream::pair().unwrap();
+        let parent_socket = kameo_child_process::DuplexUnixStream::new(parent_stream);
+        let child_socket = kameo_child_process::DuplexUnixStream::new(child_stream);
+        
+        tracing::info!("Setting up child IPC");
+        // Set up child side
+        let child_ipc = CallbackIpcChild::<DummyMsg>::from_duplex(child_socket);
+        
+        tracing::info!("Setting up parent receiver");
+        // Set up parent side
+        let parent_handler = ParentHandler;
+        let receiver = CallbackReceiver::from_duplex(parent_socket, parent_handler);
+        
+        tracing::info!("Spawning receiver task");
+        // Spawn parent receiver task
         let receiver_task = tokio::spawn(async move {
-            receiver.run().await.unwrap();
+            tracing::info!("Receiver task started");
+            let result = receiver.run().await;
+            tracing::info!("Receiver task completed with result: {:?}", result);
+            result
         });
-        let child_task = tokio::spawn(async move {
-            let result = child_ipc.handle(DummyMsg(42)).await;
-            tracing::info!(?result, "Child got reply");
-            assert!(result.is_ok());
-            child_ipc.shutdown();
-        });
-        child_task.await.unwrap();
-        token.cancel();
-        receiver_task.await.unwrap();
-    }).await.expect("Test timed out");
+        
+        tracing::info!("Starting to process callbacks");
+        // Run 10k callbacks for debugging purposes
+        let total_callbacks = 10_000;
+        let batch_size = 500;
+        let mut all_results = vec![];
+        
+        for batch_start in (0..total_callbacks).step_by(batch_size) {
+            let end = std::cmp::min(batch_start + batch_size, total_callbacks);
+            tracing::info!("Processing batch {}-{}", batch_start, end);
+            
+            let futures = (batch_start..end).map(|i| {
+                let child_ipc = child_ipc.clone();
+                async move {
+                    tracing::info!("Starting callback {}", i);
+                    let msg = DummyMsg { id: i as u64 };
+                    let result = child_ipc.handle(msg).await;
+                    tracing::info!("Completed callback {} with result: {:?}", i, result);
+                    result
+                }
+            });
+            
+            tracing::info!("Collecting batch futures");
+            // Process this batch with controlled concurrency using buffer_unordered
+            let batch_results: Vec<_> = stream::iter(futures)
+                .buffer_unordered(100) // Process 100 at a time within each batch
+                .collect()
+                .await;
+            
+            tracing::info!("Batch completed, got {} results", batch_results.len());
+            all_results.extend(batch_results);
+        }
+        
+        tracing::info!("All batches processed, checking results");
+        for (i, result) in all_results.into_iter().enumerate() {
+            assert!(result.is_ok(), "Callback {} failed: {:?}", i, result);
+        }
+        
+        // Shutdown receiver
+        tracing::info!("Shutting down child IPC");
+        child_ipc.shutdown();
+        
+        // Wait for receiver to complete
+        tracing::info!("Waiting for receiver task");
+        match tokio::time::timeout(Duration::from_secs(5), receiver_task).await {
+            Ok(res) => {
+                tracing::info!("Receiver task completed: {:?}", res);
+                let _ = res.expect("receiver task join error"); // Propagate any errors
+            },
+            Err(_) => {
+                tracing::error!("Receiver task timed out");
+                panic!("Receiver task failed to shut down in time");
+            }
+        }
+        
+        tracing::info!("Test completed successfully");
+    }).await.expect("test timeout");
 }
 
 // Refactor to use in-process simulation

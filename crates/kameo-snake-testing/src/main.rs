@@ -683,6 +683,7 @@ kameo_snake_handler::setup_python_subprocess_system! {
                 TelemetryExportConfig {
                     otlp_enabled: true,
                     stdout_enabled: true,
+                    metrics_enabled: true,
                 }
             ).await;
             tracing::subscriber::set_global_default(subscriber).expect("set global");
