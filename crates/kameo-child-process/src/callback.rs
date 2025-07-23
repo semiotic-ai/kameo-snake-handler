@@ -196,7 +196,7 @@ where
             }
             // After the reader loop, drain in_flight with error, signalling that the child process has exited
             in_flight_reader.0.iter_mut().for_each(|mut item| {
-                let (_, mut slot) = item.pair_mut();
+                let (_, slot) = item.pair_mut();
                 if let Some(sender) = slot.sender.take() {
                     let err = PythonExecutionError::ExecutionError { message: "Callback reply loop exited (EOF)".to_string() };
                     if sender.send(Err(err)).is_err() {

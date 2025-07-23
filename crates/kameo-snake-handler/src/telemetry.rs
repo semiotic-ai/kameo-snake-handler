@@ -1,12 +1,11 @@
 // OpenTelemetry OTLP setup: protocol and endpoint are now fully driven by OTEL_* env vars.
-// Do NOT call .with_tonic() or .with_http() so the builder honors the env protocol.
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::{
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::SdkMeterProvider,
     trace::SdkTracerProvider, 
     Resource,
+    propagation::TraceContextPropagator,
 };
 use tracing_subscriber::{layer::SubscriberExt, Registry};
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -93,6 +92,11 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
 
     tracing::warn!("setup_otel_layer_async CALLED!");
     global::set_tracer_provider(tracer_provider.clone());
+    
+    // Set the global propagator for distributed tracing
+    let propagator = TraceContextPropagator::new();
+    global::set_text_map_propagator(propagator);
+    
     let tracer = tracer_provider.tracer("rust_trace_exporter");
     let otel_layer = OpenTelemetryLayer::new(tracer);
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -108,51 +112,12 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
         .with(EnvFilter::from_default_env());
 
     // Initialize metrics if enabled
-    let mut meter_provider = None;
-    if config.metrics_enabled {
-        tracing::info!("Initializing OpenTelemetry metrics with OTLP exporter");
-        
-        // Create a metrics exporter - this will automatically use OTEL_* environment variables
-        let exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .build()
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to create OTLP gRPC metrics exporter");
-                e
-            })
-            .expect("Failed to create OTLP metrics exporter");
-        
-        // Create a periodic reader with the exporter
-        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-            .with_interval(std::time::Duration::from_secs(5))
-            .build();
-        
-        // Build the meter provider with the reader
-        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(reader)
-            .with_resource(Resource::builder().build())
-            .build();
-        
-        // Set the global meter provider
-        global::set_meter_provider(provider.clone());
-        
-        // Store the provider in the guard for proper shutdown
-        meter_provider = Some(provider);
-        
-        // Get a meter from the global provider
-        let meter = opentelemetry::global::meter("kameo-snake-handler");
-        
-        // Set up the metrics-exporter-opentelemetry bridge
-        // This will connect the metrics crate to the OpenTelemetry SDK
-        let recorder = metrics_exporter_opentelemetry::Recorder::with_meter(meter);
-        
-        // Install the recorder
-        if let Err(err) = metrics::set_global_recorder(recorder) {
-            tracing::error!(error = %err, "Failed to install metrics-exporter-opentelemetry recorder");
-        } else {
-            tracing::info!("OTLP metrics exporter and metrics-opentelemetry bridge configured");
-        }
-    }
+    let meter_provider = if config.metrics_enabled {
+        // Setup metrics and get the provider for shutdown
+        Some(setup_metrics())
+    } else {
+        None
+    };
 
     (subscriber, OtelGuard { tracer_provider, meter_provider })
 }
@@ -186,38 +151,75 @@ pub fn setup_otel_layer_with_config(config: TelemetryExportConfig) -> impl traci
         .build();
 
     let tracer = tracer_provider.tracer("rust_trace_exporter");
-    global::set_tracer_provider(tracer_provider.clone());
+    global::set_tracer_provider(tracer_provider);
+    
+    // Set the global propagator for distributed tracing
+    let propagator = TraceContextPropagator::new();
+    global::set_text_map_propagator(propagator);
     
     // Initialize metrics if enabled
     if config.metrics_enabled {
-        tracing::info!("Initializing OpenTelemetry metrics with OTLP exporter");
-        
-        // Create a metrics exporter - this will automatically use OTEL_* environment variables
-        let exporter = opentelemetry_otlp::MetricExporter::builder()
-            .with_tonic()
-            .build()
-            .map_err(|e| {
-                tracing::error!(error = %e, "Failed to create OTLP gRPC metrics exporter");
-                e
-            })
-            .expect("Failed to create OTLP metrics exporter");
-        
-        // Create a periodic reader with the exporter
-        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-            .with_interval(std::time::Duration::from_secs(5))
-            .build();
-        
-        // Build the meter provider with the reader
-        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-            .with_reader(reader)
-            .with_resource(Resource::builder().build())
-            .build();
-            
-        // Set the global meter provider
-        global::set_meter_provider(provider);
-        
-        tracing::info!("OTLP metrics exporter configured using environment variables");
+        // Setup metrics and discard the provider since we don't need to handle shutdown
+        // in the sync case (the process will handle it)
+        let _ = setup_metrics();
     }
     
     tracing_opentelemetry::layer().with_tracer(tracer)
+}
+
+/// Initialize OpenTelemetry metrics with OTLP exporter.
+/// 
+/// This function sets up the OpenTelemetry metrics pipeline:
+/// 1. Creates an OTLP metrics exporter using environment variables for configuration
+/// 2. Sets up a periodic reader to collect and export metrics
+/// 3. Configures the global meter provider
+/// 4. Bridges the metrics crate with OpenTelemetry using metrics-exporter-opentelemetry
+///
+/// Environment variables that affect the configuration:
+/// - OTEL_EXPORTER_OTLP_ENDPOINT: The endpoint to send metrics to (default: http://localhost:4317)
+/// - OTEL_EXPORTER_OTLP_PROTOCOL: The protocol to use (grpc or http/protobuf, default: grpc)
+/// 
+/// Returns the SdkMeterProvider for proper shutdown handling.
+fn setup_metrics() -> SdkMeterProvider {
+    tracing::info!("Initializing OpenTelemetry metrics with OTLP exporter");
+    
+    // Create a metrics exporter - this will automatically use OTEL_* environment variables
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic() // Default to gRPC, environment variables will override if needed
+        .build()
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to create OTLP metrics exporter");
+            e
+        })
+        .expect("Failed to create OTLP metrics exporter");
+    
+    // Create a periodic reader with the exporter
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_secs(5))
+        .build();
+    
+    // Build the meter provider with the reader
+    let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(Resource::builder().build())
+        .build();
+        
+    // Set the global meter provider
+    global::set_meter_provider(provider.clone());
+    
+    // Get a meter from the global provider
+    let meter = global::meter("kameo-snake-handler");
+    
+    // Set up the metrics-exporter-opentelemetry bridge
+    // This will connect the metrics crate to the OpenTelemetry SDK
+    let recorder = metrics_exporter_opentelemetry::Recorder::with_meter(meter);
+    
+    // Install the recorder
+    if let Err(err) = metrics::set_global_recorder(recorder) {
+        tracing::error!(error = %err, "Failed to install metrics-exporter-opentelemetry recorder");
+    } else {
+        tracing::info!("OTLP metrics exporter and metrics-opentelemetry bridge configured");
+    }
+    
+    provider
 }

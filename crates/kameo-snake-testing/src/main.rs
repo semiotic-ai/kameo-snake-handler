@@ -4,7 +4,6 @@ use kameo_child_process::KameoChildProcessMessage;
 use kameo_snake_handler::prelude::*;
 use kameo_snake_handler::telemetry::build_subscriber_with_otel_and_fmt_async_with_config;
 use kameo_snake_handler::telemetry::TelemetryExportConfig;
-use kameo_snake_handler::ErrorReply;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -20,7 +19,6 @@ use std::fmt::Write as _;
 use futures::stream::StreamExt;
 use kameo_child_process::error::PythonExecutionError;
 use kameo_child_process::callback::{CallbackHandler, NoopCallbackHandler};
-use pyo3::prelude::*;
 use pyo3::pyfunction;
 
 
@@ -235,6 +233,10 @@ const POOL_SIZE: usize = 4;
 
 #[tracing::instrument]
 async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    // Create a root span for the sync test to ensure proper trace context
+    let test_span = tracing::info_span!("sync-test-run");
+    let _test_guard = test_span.enter();
+    
     let sync_config = PythonConfig {
         python_path: python_path.clone(),
         module_name: "logic".to_string(),
@@ -327,6 +329,18 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
 
 async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     info!("==== ASYNC FLOW ====");
+    
+    // Create a root span for the async test to ensure proper trace context
+    let test_span = tracing::info_span!("async-test-run");
+    let _test_guard = test_span.enter();
+    
+    // Debug: Verify the test span is active
+    tracing::debug!(
+        event = "test_span_debug",
+        span_id = ?test_span.id(),
+        "Test span created and entered"
+    );
+    
     let async_config = PythonConfig {
         python_path: python_path.clone(),
         module_name: "logic_async".to_string(),

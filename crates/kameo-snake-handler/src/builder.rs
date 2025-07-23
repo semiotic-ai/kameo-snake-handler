@@ -85,7 +85,6 @@ where
     C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
 {
     /// Creates a new builder with the given Python configuration.
-    #[tracing::instrument]
     pub fn new(python_config: crate::PythonConfig) -> Self {
         let mut python_config = python_config.clone();
         // Always set PYTHONPATH from python_path

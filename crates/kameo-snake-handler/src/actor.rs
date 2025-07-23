@@ -174,6 +174,18 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
+    // Set up telemetry for child process
+    use crate::telemetry::{build_subscriber_with_otel_and_fmt_async_with_config, TelemetryExportConfig};
+    let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
+        TelemetryExportConfig {
+            otlp_enabled: true,
+            stdout_enabled: true,
+            metrics_enabled: true,
+        }
+    ).await;
+    tracing::subscriber::set_global_default(subscriber).expect("set global");
+    tracing::info!("Child process telemetry initialized");
+    
     use kameo_child_process::{perform_handshake, run_child_actor_loop};
     tracing::info!("child_process_main_with_python_actor: about to handshake");
     let mut conn = request_conn;

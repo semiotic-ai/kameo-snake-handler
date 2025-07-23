@@ -122,11 +122,11 @@ async fn test_parent_child_ipc() {
     kameo_child_process::metrics::init_metrics();
     
     use kameo_child_process::SubprocessIpcBackend;
-    use kameo_child_process::{SubprocessIpcChild, ChildProcessMessageHandler, DuplexUnixStream};
+    use kameo_child_process::SubprocessIpcChild;
     use tokio::time::timeout;
     use std::time::Duration;
     use futures::future::join_all;
-    use std::sync::Arc;
+    
 
     // Start a task to log metrics periodically
     let metrics_task = tokio::spawn(async {
@@ -205,8 +205,8 @@ async fn test_callback_protocol_full_duplex() {
         tracing::info!("Test started - setting up callback protocol test");
         // test body
         use kameo_child_process::callback::{CallbackReceiver, CallbackIpcChild, CallbackHandler};
-        use kameo_child_process::DuplexUnixStream;
-        use futures::future::join_all;
+        
+        
         use futures::stream::{self, StreamExt};
         
         // Start a task to log metrics periodically
@@ -313,7 +313,7 @@ async fn test_callback_protocol_full_duplex() {
 // Refactor to use in-process simulation
 #[tokio::test]
 async fn test_child_process_exits_on_parent_disconnect() {
-    use kameo_child_process::{KameoChildProcessMessage, run_child_actor_loop, DuplexUnixStream};
+    use kameo_child_process::{KameoChildProcessMessage, run_child_actor_loop};
     use tokio::net::UnixStream;
     use std::time::Duration;
     use tokio::time::timeout;

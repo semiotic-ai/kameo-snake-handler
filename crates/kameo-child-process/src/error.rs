@@ -100,6 +100,8 @@ pub enum PythonExecutionError {
     CallError { function: String, message: String },
     #[error("Failed to convert between Python and Rust types: {message}")]
     ConversionError { message: String },
+    #[error("Child process terminated unexpectedly")]
+    ChildProcessTerminated,
 }
 
 #[cfg(feature = "python")]
