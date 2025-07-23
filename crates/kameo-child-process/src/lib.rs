@@ -164,7 +164,7 @@ pub struct MultiplexEnvelope<T> {
 
 pub struct WriteRequest<M> {
     pub correlation_id: u64,
-    pub ctrl: Control<M>,
+    pub envelope: MultiplexEnvelope<M>,
 }
 
 pub type CorrelationId = u64;
@@ -317,7 +317,7 @@ where
                         match message {
                             Some(write_req) => {
                                 // Process write directly, one at a time
-                                if let Err(e) = writer.write_msg(&write_req.ctrl).await {
+                                if let Err(e) = writer.write_msg(&write_req.envelope).await {
                                     tracing::error!(event = "writer_task", error = ?e, "Failed to write message");
                                     // Don't break on errors - just log them and continue
                                 }
@@ -495,8 +495,7 @@ where
         let send_future = async move {
             trace!(event = "send_start", correlation_id = correlation_id, message_type = msg_type, "Starting IPC send");
             
-            let ctrl = Control::Real(envelope);
-            let write_req = WriteRequest { correlation_id, ctrl };
+            let write_req = WriteRequest { correlation_id, envelope };
             if let Err(e) = self.write_tx.send(write_req) {
                 self.in_flight.0.remove(&correlation_id);
                 self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1069,27 +1068,25 @@ where
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => break,
-            result = reader.read_msg::<Control<M>>() => {
-                let ctrl: Control<M> = match result {
-                    Ok(c) => {
-                        trace!(event = "child_reader", step = "read_msg", is_handshake = c.is_handshake(), "Read control message");
-                        c
+            result = reader.read_msg::<MultiplexEnvelope<M>>() => {
+                let envelope: MultiplexEnvelope<M> = match result {
+                    Ok(env) => {
+                        trace!(event = "child_reader", step = "read_msg", correlation_id = env.correlation_id, "Read message envelope");
+                        env
                     },
                     Err(e) => {
                         trace!(event = "child_reader", step = "read_error", error = ?e, "Reader error");
                         break;
                     }
                 };
-                if let Control::Real(env) = ctrl {
-                    let correlation_id = env.correlation_id;
-                    
-                    tracing::debug!(event = "message_received", correlation_id = correlation_id, "Child received message");
-                    
-                    if let Err(e) = tx.send(env) {
-                        error!(event = "message_forward_failed", correlation_id, error = %e, "Failed to forward message to handler");
-                    } else {
-                        trace!(event = "message_forwarded", correlation_id, "Message forwarded to handler");
-                    }
+                let correlation_id = envelope.correlation_id;
+                
+                tracing::debug!(event = "message_received", correlation_id = correlation_id, "Child received message");
+                
+                if let Err(e) = tx.send(envelope) {
+                    error!(event = "message_forward_failed", correlation_id, error = %e, "Failed to forward message to handler");
+                } else {
+                    trace!(event = "message_forwarded", correlation_id, "Message forwarded to handler");
                 }
             }
         }

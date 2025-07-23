@@ -7,14 +7,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
-use serde::Serialize;
 use thiserror::Error;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 use tracing::{error, instrument};
-use serde::Deserialize;
 
 use crate::TracingContext;
 use crate::error::PythonExecutionError;
@@ -34,12 +32,8 @@ pub enum CallbackError {
     ConnectionClosed,
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
-pub struct CallbackEnvelope<T> {
-    pub correlation_id: u64,
-    pub inner: T,
-    pub context: TracingContext,
-}
+// Use the unified MultiplexEnvelope instead of duplicating the structure
+pub use crate::MultiplexEnvelope as CallbackEnvelope;
 
 #[async_trait]
 pub trait CallbackHandler<C>: Send + Sync + 'static {
