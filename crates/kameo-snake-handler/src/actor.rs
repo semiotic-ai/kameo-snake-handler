@@ -11,6 +11,7 @@ use kameo_child_process::{
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
+use tracing_futures::Instrument;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::pin::Pin;
@@ -214,108 +215,149 @@ where
 }
 
 impl PythonMessageHandler {
+    #[instrument(
+        skip(self, message),
+        name = "python_message_handler",
+        fields(
+            message_type = std::any::type_name::<M>(),
+            function_name = %self.config.function_name,
+            is_async = %self.config.is_async
+        )
+    )]
     pub async fn handle_child_message_impl<M>(&self, message: M) -> Result<M::Ok, PythonExecutionError>
     where
         M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
     {
-        tracing::debug!("Calling stored Python function for message: {:?}", message);
+        tracing::debug!("Processing Python message: {:?}", message);
         use pyo3::prelude::*;
         use pyo3_async_runtimes::tokio::into_future;
-        tracing::debug!(event = "python_call", step = "start", ?message, "handle_child_message entry");
+        
         let is_async = self.config.is_async;
         let function_name = self.config.function_name.clone();
         let py_function = Python::with_gil(|py| self.py_function.clone_ref(py));
-        let py_msg = Python::with_gil(|py| crate::serde_py::to_pyobject(py, &message));
+        
+        // Serialize Rust message to Python object
+        let py_msg = {
+            let serialize_span = tracing::info_span!(
+                "python_serialize_message",
+                message_type = std::any::type_name::<M>()
+            );
+            async {
+                Python::with_gil(|py| crate::serde_py::to_pyobject(py, &message))
+            }.instrument(serialize_span).await
+        };
+        
         let py_msg = match py_msg {
             Ok(obj) => obj,
             Err(e) => {
-                tracing::error!(event = "python_call", step = "serialize_error", error = %e, "Failed to serialize Rust message to Python");
+                tracing::error!(event = "serialize_error", error = %e, "Failed to serialize Rust message to Python");
                 return Err(PythonExecutionError::SerializationError {
                     message: e.to_string(),
                 })
             }
         };
-        if is_async {
-            tracing::debug!(event = "python_call", step = "before_async_call", function = %function_name, "About to call async Python function");
-            let fut_result = Python::with_gil(|py| {
-                let py_func = py_function.bind(py);
-                let coro = match py_func.call1((py_msg,)) {
-                    Ok(coro) => coro,
+        let py_output = if is_async {
+            // Async Python function call
+            let async_call_span = tracing::info_span!(
+                "python_async_call",
+                function_name = %function_name
+            );
+            
+            async {
+                tracing::debug!("Calling async Python function: {}", function_name);
+                let fut_result = Python::with_gil(|py| {
+                    let py_func = py_function.bind(py);
+                    let coro = match py_func.call1((py_msg,)) {
+                        Ok(coro) => coro,
+                        Err(e) => {
+                            tracing::error!(event = "call_error", function = %function_name, error = %e, "Failed to call async Python function");
+                            return Err(PythonExecutionError::CallError {
+                                function: function_name.clone(),
+                                message: e.to_string(),
+                            })
+                        }
+                    };
+                    match into_future(coro) {
+                        Ok(fut) => Ok(fut),
+                        Err(e) => {
+                            tracing::error!(event = "into_future_error", function = %function_name, error = %e, "Failed to convert to future");
+                            Err(PythonExecutionError::from(e))
+                        },
+                    }
+                });
+                let fut = match fut_result {
+                    Ok(fut) => fut,
+                    Err(e) => return Err(e),
+                };
+                let result = match fut.await {
+                    Ok(obj) => obj,
                     Err(e) => {
-                        tracing::error!(event = "python_call", step = "call_error", function = %function_name, error = %e, "Failed to call async Python function");
-                        return Err(PythonExecutionError::CallError {
-                            function: function_name.clone(),
-                            message: e.to_string(),
-                        })
+                        tracing::error!(event = "await_error", function = %function_name, error = %e, "Async Python call failed");
+                        return Err(PythonExecutionError::from(e));
                     }
                 };
-                match into_future(coro) {
-                    Ok(fut) => Ok(fut),
-                    Err(e) => {
-                        tracing::error!(event = "python_call", step = "into_future_error", function = %function_name, error = %e, "Failed to convert to future");
-                        Err(PythonExecutionError::from(e))
-                    },
-                }
-            });
-            let fut = match fut_result {
-                Ok(fut) => fut,
-                Err(e) => return Err(e),
-            };
-            let py_output = match fut.await {
-                Ok(obj) => obj,
-                Err(e) => {
-                    tracing::error!(event = "python_call", step = "await_error", function = %function_name, error = %e, "Async Python call failed");
-                    return Err(PythonExecutionError::from(e));
-                }
-            };
-            tracing::debug!(event = "python_call", step = "after_async_call", function = %function_name, "Async Python call succeeded");
-            let rust_result = Python::with_gil(|py| {
-                let bound = py_output.bind(py);
-                crate::serde_py::from_pyobject(bound).map_err(|e| {
-                    PythonExecutionError::DeserializationError {
-                        message: e.to_string(),
-                    }
-                })
-            });
-            match rust_result {
-                Ok(reply) => {
-                    tracing::debug!(event = "python_call", step = "deserialize_ok", function = %function_name, ?reply, "Deserialized Python result to Rust");
-                    Ok(reply)
-                },
-                Err(e) => {
-                    tracing::error!(event = "python_call", step = "deserialize_error", function = %function_name, error = %e, "Failed to deserialize Python result");
-                    Err(e)
-                },
-            }
+                tracing::debug!("Async Python call succeeded: {}", function_name);
+                Ok(result)
+            }.instrument(async_call_span).await?
         } else {
-            tracing::debug!(event = "python_call", step = "before_sync_call", function = %function_name, "About to call sync Python function");
-            let rust_result = Python::with_gil(|py| {
-                let py_func = py_function.bind(py);
-                match py_func.call1((py_msg,)) {
-                    Ok(result) => crate::serde_py::from_pyobject(&result).map_err(|e| {
+            // Sync Python function call
+            let sync_call_span = tracing::info_span!(
+                "python_sync_call",
+                function_name = %function_name
+            );
+            
+            async {
+                tracing::debug!("Calling sync Python function: {}", function_name);
+                let result = Python::with_gil(|py| {
+                    let py_func = py_function.bind(py);
+                    match py_func.call1((py_msg,)) {
+                        Ok(result) => Ok(result.into()),
+                        Err(e) => {
+                            tracing::error!(event = "call_error", function = %function_name, error = %e, "Failed to call sync Python function");
+                            Err(PythonExecutionError::CallError {
+                                function: function_name.clone(),
+                                message: e.to_string(),
+                            })
+                        },
+                    }
+                });
+                
+                let result = match result {
+                    Ok(obj) => obj,
+                    Err(e) => return Err(e),
+                };
+                tracing::debug!("Sync Python call succeeded: {}", function_name);
+                Ok(result)
+            }.instrument(sync_call_span).await?
+        };
+        
+        // Deserialize Python result to Rust
+        let rust_result = {
+            let deserialize_span = tracing::info_span!(
+                "python_deserialize_result",
+                result_type = std::any::type_name::<M::Ok>()
+            );
+            async {
+                Python::with_gil(|py| {
+                    let bound = py_output.bind(py);
+                    crate::serde_py::from_pyobject(bound).map_err(|e| {
                         PythonExecutionError::DeserializationError {
                             message: e.to_string(),
                         }
-                    }),
-                    Err(e) => {
-                        tracing::error!(event = "python_call", step = "call_error", function = %function_name, error = %e, "Failed to call sync Python function");
-                        Err(PythonExecutionError::CallError {
-                        function: function_name.clone(),
-                        message: e.to_string(),
-                        })
-                    },
-                }
-            });
-            match rust_result {
-                Ok(reply) => {
-                    tracing::debug!(event = "python_call", step = "deserialize_ok", function = %function_name, ?reply, "Deserialized Python result to Rust");
-                    Ok(reply)
-                },
-                Err(e) => {
-                    tracing::error!(event = "python_call", step = "deserialize_error", function = %function_name, error = %e, "Failed to deserialize Python result");
-                    Err(e)
-                },
-            }
+                    })
+                })
+            }.instrument(deserialize_span).await
+        };
+        
+        match rust_result {
+            Ok(reply) => {
+                tracing::debug!(event = "deserialize_success", ?reply, "Deserialized Python result to Rust");
+                Ok(reply)
+            },
+            Err(e) => {
+                tracing::error!(event = "deserialize_error", error = %e, "Failed to deserialize Python result");
+                Err(e)
+            },
         }
     }
 }

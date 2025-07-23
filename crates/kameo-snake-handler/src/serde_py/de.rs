@@ -23,7 +23,12 @@ impl From<pyo3::DowncastError<'_, '_>> for Error {
 }
 
 /// Convert a Python object to a Rust value
-#[instrument(skip(obj))]
+#[instrument(
+    skip(obj),
+    level = "trace",
+    name = "python_deserialize",
+    fields(target_type = std::any::type_name::<T>())
+)]
 pub fn from_pyobject<'py, T>(obj: &Bound<'py, PyAny>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -31,11 +36,11 @@ where
     let deserializer = PythonDeserializer { input: obj.clone() };
     match T::deserialize(deserializer) {
         Ok(value) => {
-            trace!(status = "success");
+            trace!(status = "success", target_type = std::any::type_name::<T>());
             Ok(value)
         }
         Err(e) => {
-            error!(status = "failure", error = %e);
+            error!(status = "failure", error = %e, target_type = std::any::type_name::<T>());
             Err(e)
         }
     }

@@ -21,21 +21,17 @@ use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::prelude::*;
-use opentelemetry::global;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use std::io;
 use std::marker::PhantomData;
-use std::process::Stdio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex as TokioMutex, Notify};
 use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_futures::Instrument;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tracing::{trace, error};
-use std::time::Instant;
 use dashmap::DashMap;
 use tokio::sync::oneshot;
 pub mod error;
@@ -430,7 +426,7 @@ where
             }
             // On exit, drain in_flight and send error to all pending
             in_flight_reader.0.iter_mut().for_each(|mut item| {
-                let (_corr_id, mut slot) = item.pair_mut();
+                let (_corr_id, slot) = item.pair_mut();
                 if let Some(sender) = slot.sender.take() {
                     let err = PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() };
                     if sender.send(Err(err)).is_err() {
@@ -466,26 +462,12 @@ where
     pub async fn send(&self, msg: M) -> Result<M::Ok, PythonExecutionError> {
         let correlation_id = self.next_correlation_id();
         let msg_type = std::any::type_name::<M>();
-        let reply_type = std::any::type_name::<M::Ok>();
         
         // Create the root ipc-message span that will encompass the entire IPC operation
-        let ipc_message_span = tracing::info_span!(
-            "ipc-message",
-            correlation_id = correlation_id,
-            message_type = msg_type,
-            messaging.system = "ipc",
-            messaging.operation = "request"
-        );
+        let ipc_message_span = tracing_utils::create_root_ipc_message_span(correlation_id, msg_type);
         
         // Create the ipc-parent-send span as a child of the ipc-message span
-        let send_span = tracing::info_span!(
-            parent: &ipc_message_span,
-            "ipc-parent-send",
-            correlation_id = correlation_id,
-            message_type = msg_type,
-            messaging.system = "ipc",
-            messaging.operation = "send"
-        );
+        let send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
         
         // Create the oneshot channel BEFORE sending the message
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -499,9 +481,9 @@ where
             self.pending_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         
-        // Create the envelope with the ipc-message span context (not the current span)
+        // Create the envelope with the ipc-parent-send span context
         let envelope = {
-            let _ipc_guard = ipc_message_span.enter();
+            let _send_guard = send_span.enter();
             MultiplexEnvelope {
                 correlation_id,
                 inner: msg,
@@ -654,7 +636,7 @@ where
     let _none_guard = none_span.enter();
     tracing::debug!(event = "run_child_actor_loop", step = "start", "run_child_actor_loop started");
     use futures::stream::{FuturesUnordered, StreamExt};
-    let config = config.unwrap_or_default();
+    let _config = config.unwrap_or_default();
     let mut in_flight = FuturesUnordered::new();
 
     // Make reply_tx Option and drop it on shutdown
@@ -705,18 +687,13 @@ where
                                     
                                     // Use encapsulated span lifecycle management
                                     let msg_type = std::any::type_name::<M>();
-                                    let reply_type = std::any::type_name::<M::Ok>();
                                     
                                     // Create ipc-child-receive span as a child of the root ipc-message span
-                                    let receive_span = tracing::info_span!(
-                                        "ipc-child-receive",
-                                        correlation_id = correlation_id,
-                                        message_type = msg_type,
-                                        messaging.system = "ipc",
-                                        messaging.operation = "receive",
-                                        messaging.source_kind = "queue"
+                                    let receive_span = tracing_utils::create_ipc_child_receive_span(
+                                        correlation_id,
+                                        msg_type,
+                                        parent_cx.clone(),
                                     );
-                                    receive_span.set_parent(parent_cx.clone());
                                     
                                     // Create the message processing future and instrument it with the span
                                     let process_future = async move {
@@ -748,7 +725,6 @@ where
                                     };
                                     
                                     // Instrument the future with the receive_span
-                                    use tracing_futures::Instrument;
                                     in_flight.push(process_future.instrument(receive_span));
                                     tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(), 
                                         correlation_id = correlation_id, "Pushed message future to child in_flight");
@@ -989,16 +965,25 @@ where
                     maybe_envelope = rx.recv() => {
                         trace!(event = "child_ipc", step = "handler_pool_recv", got = maybe_envelope.is_some(), "Handler pool received from rx");
                         if let Some(envelope) = maybe_envelope {
-                            trace!(event = "child_ipc", step = "handling", correlation_id = envelope.correlation_id, "Spawning handler task");
                             let correlation_id = envelope.correlation_id;
+                            trace!(event = "child_ipc", step = "handling", correlation_id = correlation_id, "Spawning handler task");
                             let mut handler = handler.clone();
                             let writer = writer.clone();
                             tokio::spawn(async move {
                                 // Extract OTEL context from the received message
                                 let parent_cx = envelope.context.extract_parent();
-                                let correlation_id = envelope.correlation_id;
-                                let msg_type = std::any::type_name::<M>();
-                                let short_type = msg_type.split("::").last().unwrap_or(msg_type);
+                                
+                                // Create ipc-child-receive span as a child of the root ipc-message span
+                                let receive_span = tracing::info_span!(
+                                    "ipc-child-receive",
+                                    correlation_id = correlation_id,
+                                    message_type = std::any::type_name::<M>(),
+                                    messaging.system = "ipc",
+                                    messaging.operation = "receive",
+                                    messaging.source_kind = "queue"
+                                );
+                                receive_span.set_parent(parent_cx.clone());
+                                let _receive_guard = receive_span.enter();
                                 
                                 // Create process span
                                 let process_span = tracing::info_span!(
@@ -1097,28 +1082,14 @@ where
                 };
                 if let Control::Real(env) = ctrl {
                     let correlation_id = env.correlation_id;
-                    let parent_cx = env.context.extract_parent();
                     
                     tracing::debug!(event = "message_received", correlation_id = correlation_id, "Child received message");
-                    
-                    // Create receive span
-                    let receive_span = tracing::info_span!(
-                        "ipc-child-receive",
-                        correlation_id = correlation_id,
-                        message_type = std::any::type_name::<M>(),
-                        otel.kind = "consumer"
-                    );
-                    receive_span.set_parent(parent_cx.clone());
-                    let _receive_guard = receive_span.enter();
                     
                     if let Err(e) = tx.send(env) {
                         error!(event = "message_forward_failed", correlation_id, error = %e, "Failed to forward message to handler");
                     } else {
                         trace!(event = "message_forwarded", correlation_id, "Message forwarded to handler");
                     }
-                    
-                    // Drop receive guard to end the span
-                    drop(_receive_guard);
                 }
             }
         }

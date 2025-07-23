@@ -7,16 +7,32 @@ use serde::ser::{
     Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple,
     SerializeTupleStruct, SerializeTupleVariant,
 };
+use tracing::{error, instrument, trace};
 
 use super::Error;
 use super::Result;
 
 /// Convert a Rust value to a Python object
+#[instrument(
+    skip(py, value),
+    level = "trace",
+    name = "python_serialize",
+    fields(source_type = std::any::type_name::<T>())
+)]
 pub fn to_pyobject<T>(py: Python<'_>, value: &T) -> Result<PyObject>
 where
     T: Serialize,
 {
-    value.serialize(PythonSerializer::new(py))
+    match value.serialize(PythonSerializer::new(py)) {
+        Ok(result) => {
+            trace!(status = "success", source_type = std::any::type_name::<T>());
+            Ok(result)
+        }
+        Err(e) => {
+            error!(status = "failure", error = %e, source_type = std::any::type_name::<T>());
+            Err(e)
+        }
+    }
 }
 
 pub struct PythonSerializer<'py> {

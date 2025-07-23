@@ -30,6 +30,84 @@ pub fn create_isolated_trace_context() -> OtelContext {
     opentelemetry::Context::new()
 }
 
+/// Create a root ipc-message span that encompasses the entire IPC operation.
+/// 
+/// This span serves as the root for both send and receive operations,
+/// providing correlation between parent and child processes.
+/// 
+/// # Arguments
+/// * `correlation_id` - Unique identifier for this message
+/// * `message_type` - Type name of the message being processed
+/// 
+/// # Returns
+/// A span that can be used with .instrument() or entered directly
+pub fn create_root_ipc_message_span(
+    correlation_id: u64,
+    message_type: &'static str,
+) -> tracing::Span {
+    info_span!(
+        "ipc-message",
+        correlation_id = correlation_id,
+        message_type = message_type,
+        messaging.system = "ipc",
+        messaging.operation = "request"
+    )
+}
+
+/// Create an ipc-parent-send span as a child of the root ipc-message span.
+/// 
+/// This span represents the parent process sending a message to the child.
+/// 
+/// # Arguments
+/// * `correlation_id` - Unique identifier for this message
+/// * `message_type` - Type name of the message being sent
+/// * `parent_span` - The root ipc-message span to use as parent
+/// 
+/// # Returns
+/// A span that can be used with .instrument()
+pub fn create_ipc_parent_send_span(
+    correlation_id: u64,
+    message_type: &'static str,
+    parent_span: &tracing::Span,
+) -> tracing::Span {
+    info_span!(
+        parent: parent_span,
+        "ipc-parent-send",
+        correlation_id = correlation_id,
+        message_type = message_type,
+        messaging.system = "ipc",
+        messaging.operation = "send"
+    )
+}
+
+/// Create an ipc-child-receive span as a child of the root ipc-message span.
+/// 
+/// This span represents the child process receiving a message from the parent.
+/// 
+/// # Arguments
+/// * `correlation_id` - Unique identifier for this message
+/// * `message_type` - Type name of the message being received
+/// * `parent_cx` - OTEL context extracted from the envelope
+/// 
+/// # Returns
+/// A span that can be used with .instrument()
+pub fn create_ipc_child_receive_span(
+    correlation_id: u64,
+    message_type: &'static str,
+    parent_cx: OtelContext,
+) -> tracing::Span {
+    let span = info_span!(
+        "ipc-child-receive",
+        correlation_id = correlation_id,
+        message_type = message_type,
+        messaging.system = "ipc",
+        messaging.operation = "receive",
+        messaging.source_kind = "queue"
+    );
+    span.set_parent(parent_cx);
+    span
+}
+
 /// Create an ipc-message span with a parent context (for child process message handling)
 pub fn start_ipc_message_span(
     correlation_id: u64,
