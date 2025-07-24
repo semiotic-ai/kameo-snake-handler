@@ -87,7 +87,8 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
     }
 
     let tracer_provider = provider_builder
-        .with_resource(Resource::builder().build())
+        .with_resource(Resource::builder()
+            .build())
         .build();
 
     tracing::warn!("setup_otel_layer_async CALLED!");

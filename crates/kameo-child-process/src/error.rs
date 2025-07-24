@@ -102,6 +102,15 @@ pub enum PythonExecutionError {
     ConversionError { message: String },
     #[error("Child process terminated unexpectedly")]
     ChildProcessTerminated,
+    #[error("OpenTelemetry dependency error: missing packages {missing_packages:?} in Python paths {python_paths:?}")]
+    OtelDependencyError { 
+        missing_packages: Vec<String>,
+        python_paths: Vec<String>,
+    },
+    #[error("OpenTelemetry functionality error: {details}")]
+    OtelFunctionalityError { 
+        details: String,
+    },
 }
 
 #[cfg(feature = "python")]

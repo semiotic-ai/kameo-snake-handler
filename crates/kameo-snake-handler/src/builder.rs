@@ -69,22 +69,93 @@ where
     }
 }
 
-pub struct PythonChildProcessBuilder<C, H>
+/// Builder for spawning Python child processes with unified streaming support.
+/// 
+/// This builder provides a fluent interface for configuring and spawning Python subprocesses
+/// that can handle both synchronous and streaming messages. It manages the entire lifecycle
+/// of Python subprocesses, including environment setup, process spawning, and actor pool creation.
+/// 
+/// ## Builder Features
+/// 
+/// - **Python Configuration**: Environment setup, paths, and module configuration
+/// - **Callback Handling**: Configurable callback message handling
+/// - **Process Management**: Automatic subprocess lifecycle management
+/// - **Actor Pool Creation**: Spawn multiple actors for load balancing
+/// - **Streaming Support**: Full support for the unified streaming protocol
+/// 
+/// ## Generic Parameters
+/// 
+/// - `M`: Main message type for request/response communication
+/// - `C`: Callback message type for bidirectional communication
+/// - `H`: Callback handler type (defaults to `NoopCallbackHandler<C>`)
+/// 
+/// ## Usage Example
+/// 
+/// ```rust
+/// // Create builder with Python configuration
+/// let pool = PythonChildProcessBuilder::<MyMessage, MyCallback>::new(config)
+///     .with_callback_handler(MyCallbackHandler)
+///     .log_level(Level::DEBUG)
+///     .spawn_pool(4, None)
+///     .await?;
+/// 
+/// // Use the actor pool
+/// let actor = pool.get_actor();
+/// let response = actor.ask(MyMessage { data: "hello" }).await?;
+/// 
+/// // Send streaming message
+/// let stream = actor.send_stream(MyMessage { data: "stream" }).await?;
+/// while let Some(item) = stream.next().await {
+///     println!("Response: {:?}", item?);
+/// }
+/// ```
+/// 
+/// ## Process Lifecycle
+/// 
+/// 1. **Configuration**: Set up Python environment and module paths
+/// 2. **Spawning**: Create Python subprocess with proper IPC setup
+/// 3. **Handshake**: Establish communication protocol
+/// 4. **Actor Pool**: Create multiple actors for concurrent processing
+/// 5. **Communication**: Handle both sync and streaming messages
+/// 6. **Shutdown**: Graceful cleanup of processes and resources
+pub struct PythonChildProcessBuilder<M, C, H = NoopCallbackHandler<C>>
 where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+    <M as KameoChildProcessMessage>::Ok: serde::Serialize
+        + for<'de> serde::Deserialize<'de>
+        + bincode::Encode
+        + bincode::Decode<()> 
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
     C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
     H: CallbackHandler<C> + Clone + Send + Sync + 'static,
 {
+    /// Python configuration for subprocess setup
     python_config: crate::PythonConfig,
+    /// Logging level for the subprocess
     log_level: Level,
+    /// Handler for callback messages
     callback_handler: H,
-    _phantom: std::marker::PhantomData<C>,
+    /// Phantom data for message and callback types
+    _phantom: std::marker::PhantomData<(M, C)>,
 }
 
-impl<C> PythonChildProcessBuilder<C, NoopCallbackHandler<C>>
+impl<M, C> PythonChildProcessBuilder<M, C, NoopCallbackHandler<C>>
 where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+    <M as KameoChildProcessMessage>::Ok: serde::Serialize
+        + for<'de> serde::Deserialize<'de>
+        + bincode::Encode
+        + bincode::Decode<()> 
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
     C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
 {
-    /// Creates a new builder with the given Python configuration.
+    /// Creates a new builder with the given Python configuration and message types.
     pub fn new(python_config: crate::PythonConfig) -> Self {
         let mut python_config = python_config.clone();
         // Always set PYTHONPATH from python_path
@@ -108,13 +179,22 @@ where
     }
 }
 
-impl<C, H> PythonChildProcessBuilder<C, H>
+impl<M, C, H> PythonChildProcessBuilder<M, C, H>
 where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+    <M as KameoChildProcessMessage>::Ok: serde::Serialize
+        + for<'de> serde::Deserialize<'de>
+        + bincode::Encode
+        + bincode::Decode<()> 
+        + std::fmt::Debug
+        + Send
+        + Sync
+        + 'static,
     C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
     H: CallbackHandler<C> + Clone + Send + Sync + 'static,
 {
-    /// Sets the log level for the child process.
-    pub fn with_callback_handler<T>(self, handler: T) -> PythonChildProcessBuilder<C, T>
+    /// Sets the callback handler.
+    pub fn with_callback_handler<T>(self, handler: T) -> PythonChildProcessBuilder<M, C, T>
     where
         T: CallbackHandler<C> + Clone + Send + Sync + 'static,
     {
@@ -131,21 +211,11 @@ where
         self
     }
 
-    pub async fn spawn_pool<M>(
+    pub async fn spawn_pool(
         self,
         pool_size: usize,
         parent_config: Option<ParentActorLoopConfig>,
     ) -> std::io::Result<PythonChildProcessActorPool<M>>
-    where
-        M: KameoChildProcessMessage + Send + Sync + 'static,
-        <M as KameoChildProcessMessage>::Ok: serde::Serialize
-            + for<'de> serde::Deserialize<'de>
-            + bincode::Encode
-            + bincode::Decode<()> 
-            + std::fmt::Debug
-            + Send
-            + Sync
-            + 'static,
     {
         use kameo_child_process::spawn_subprocess_ipc_actor;
         use kameo_child_process::callback::CallbackReceiver;
@@ -173,6 +243,24 @@ where
         cmd.env_remove("PYTHONPATH");
         for (key, value) in self.python_config.env_vars.iter() {
             cmd.env(key, value);
+        }
+        
+        // Add OTEL environment variables if propagation is enabled
+        if self.python_config.enable_otel_propagation {
+            // Set OTEL environment variables for Python subprocess
+            cmd.env("OTEL_TRACES_EXPORTER", "otlp");
+            cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317");
+            cmd.env("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc");
+            // Set service name to match Rust process
+            cmd.env("OTEL_SERVICE_NAME", "kameo-snake");
+            cmd.env("OTEL_TRACES_SAMPLER", "always_on");
+            cmd.env("OTEL_TRACES_SAMPLER_ARG", "1.0");
+            
+            // Set Python-specific OTEL environment variables
+            cmd.env("PYTHONPATH", format!("{}:{}", 
+                std::env::var("PYTHONPATH").unwrap_or_default(),
+                std::env::current_dir()?.join("crates/kameo-snake-testing/python").to_string_lossy()
+            ));
         }
         cmd.env("KAMEO_CHILD_ACTOR", actor_name);
         cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());

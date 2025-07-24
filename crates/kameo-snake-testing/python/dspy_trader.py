@@ -5,7 +5,26 @@ import asyncio
 import os
 import logging
 import threading
-mlflow.dspy.autolog()
+import mlflow
+
+# Configure MLflow for OTEL integration
+mlflow.set_experiment("dspy-otel-integration")
+
+# Defer DSPy autologging setup until after OTEL context is established
+# This will be called from the handle_message function
+def setup_dspy_autologging():
+    # Enable MLflow DSPy autologging with OTEL
+    mlflow.dspy.autolog(
+        log_traces=True,
+        log_traces_from_compile=False,
+        log_traces_from_eval=True,
+        log_compiles=False,
+        log_evals=False,
+        disable=False,
+        silent=False
+    )
+    print("[DEBUG] DSPy autologging configured with OTEL context")
+
 logging.getLogger("mlflow").setLevel(logging.DEBUG)
 
 # --- Kameo message types matching Rust enums ---
@@ -34,9 +53,13 @@ import dspy
 async def order_item_tool(item: str, currency: int) -> str:
     import kameo
     print(f"[DEBUG] order_item TOOL called with item={item}, currency={currency}")
+    
+    # Set callback attributes on the tool span
     callback_result = await kameo.callback_handle({"value": currency})
     print(f"[DEBUG] order_item TOOL got callback_result={callback_result}")
-    return f"Order for {item} ({currency} units) complete: callback returned {callback_result}"
+    
+    result = f"Order for {item} ({currency} units) complete: callback returned {callback_result}"
+    return result
 
 order_item = dspy.Tool(order_item_tool)
 
@@ -66,11 +89,14 @@ class TraderAgent(dspy.Module):
 
     async def forward(self, message):
         print(f"[DEBUG] TraderAgent.forward ENTRY: message={message}")
+        
         if self.react_agent is None:
             return {"Error": {"error": "ReAct agent not initialized"}}
+            
         if "OrderDetails" in message:
             item = message["OrderDetails"].get("item")
             currency = message["OrderDetails"].get("currency")
+            
             try:
                 result = await self.react_agent.aforward(item=item, currency=currency)
                 print(f"[DEBUG] TraderAgent ReAct result: {result}")
@@ -85,11 +111,22 @@ class TraderAgent(dspy.Module):
             return {"Error": {"error": f"Unknown message: {message}"}}
 
 async def handle_message(message):
-    print(f"[DEBUG] handle_message ENTRY: thread={{threading.get_ident()}} message={{message}}")
+    # Call deferred DSPy autologging setup
+    setup_dspy_autologging()
+    print("[DEBUG] DSPy autologging configured with OTEL context")
+    
+    # Process the message
+    print(f"[DEBUG] handle_message ENTRY: thread={threading.get_ident()} message={message}")
+    
+    # Instantiate the trader agent
     agent = TraderAgent()
-    return await agent.forward(message)
+    
+    # Process the message
+    result = await agent.forward(message)
+    
+    print(f"[DEBUG] handle_message EXIT: result={result}")
+    
+    return result
+    
 
-# if __name__ == "__main__":
-#     main()
 
-print("[DEBUG] MODULE LOADED:", __name__, "sys.path:", __import__('sys').path) 

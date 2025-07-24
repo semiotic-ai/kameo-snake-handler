@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
+use serde::Serialize;
 use thiserror::Error;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 use tracing::{error, instrument};
+
+use serde::Deserialize;
 
 use crate::TracingContext;
 use crate::error::PythonExecutionError;
@@ -32,8 +35,12 @@ pub enum CallbackError {
     ConnectionClosed,
 }
 
-// Use the unified MultiplexEnvelope instead of duplicating the structure
-pub use crate::MultiplexEnvelope as CallbackEnvelope;
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct CallbackEnvelope<T> {
+    pub correlation_id: u64,
+    pub inner: T,
+    pub context: TracingContext,
+}
 
 #[async_trait]
 pub trait CallbackHandler<C>: Send + Sync + 'static {
@@ -86,7 +93,7 @@ where
 pub type CallbackHandle<C> = std::sync::Arc<dyn CallbackHandler<C>>;
 
 /// Multiplexed callback protocol artefact for child processes.
-/// Owns the callback socket, maintains in-flight map, and implements CallbackHandler<C>.
+/// Owns the callback socket, maintains in-flight map, and implements `CallbackHandler<C>`.
 /// This is the only production callback handler for child processes.
 pub struct CallbackIpcChild<C> {
     pub in_flight: InFlightMap<Result<(), PythonExecutionError>>,
@@ -158,16 +165,18 @@ where
                             Ok(env) => {
                                 let correlation_id = env.correlation_id;
                                 // Extract the entry from in_flight map to avoid race conditions
-                                if let Some((_, slot)) = in_flight_reader.0.remove(&correlation_id) {
+                                if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
                                     // Track that we're processing one less in-flight request
                                     result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                     
                                     // Extract the sender so we can drop the slot immediately
-                                    if let Some(sender) = slot.sender {
+                                    if let Some(sender) = &slot.stream_sender {
                                         // Send the response directly to the waiting task
-                                        if sender.send(env.inner).is_err() {
+                                        if sender.send(Ok(env.inner)).is_err() {
                                             tracing::error!(event = "callback_ipc_child_read", correlation_id, "Failed to send reply, receiver dropped");
                                         }
+                                        // Close the stream after sending
+                                        slot.close_stream();
                                     } else {
                                         tracing::error!(event = "callback_ipc_child_read", correlation_id, "Reply slot sender missing");
                                     }
@@ -191,7 +200,7 @@ where
             // After the reader loop, drain in_flight with error, signalling that the child process has exited
             in_flight_reader.0.iter_mut().for_each(|mut item| {
                 let (_, slot) = item.pair_mut();
-                if let Some(sender) = slot.sender.take() {
+                if let Some(sender) = slot.stream_sender.take() {
                     let err = PythonExecutionError::ExecutionError { message: "Callback reply loop exited (EOF)".to_string() };
                     if sender.send(Err(err)).is_err() {
                         tracing::error!(event = "callback_ipc_child_read", error = "Failed to send EOF error to waiting task", "Failed to notify waiting task about EOF");
@@ -226,6 +235,7 @@ where
 {
     async fn handle(&self, callback: C) -> Result<(), PythonExecutionError> {
         let correlation_id = self.next_correlation_id();
+        
         let envelope = CallbackEnvelope {
             correlation_id,
             inner: callback,
@@ -233,7 +243,7 @@ where
         };
         
         // Create the reply slot BEFORE sending the message to prevent race conditions
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         
         // Create tracker to automatically track metrics for this operation
         let _metrics_tracker = crate::metrics::OperationTracker::track_callback();
@@ -241,8 +251,8 @@ where
         // Insert into in_flight map and track pending count
         {
             let mut slot = ReplySlot::new();
-            slot.sender = Some(tx);
-            slot.receiver = None; // We'll keep the receiver separately
+            slot.stream_sender = Some(tx);
+            slot.stream_receiver = None; // We'll keep the receiver separately
             self.in_flight.0.insert(correlation_id, slot);
             
             // Track that we now have one more in-flight request
@@ -275,21 +285,13 @@ where
         }
         
         // Wait for the response
-        match rx.await {
-            Ok(res) => res,
-            Err(_) => {
-                // Clean up if needed and decrement pending count
-                if self.in_flight.0.remove(&correlation_id).is_some() {
-                    self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                
-                // Track the error in metrics
-                crate::metrics::MetricsHandle::callback().track_error("receive_failed");
-                
-                Err(PythonExecutionError::ExecutionError { 
-                    message: "Reply channel closed before response received".to_string() 
-                })
-            },
+        match rx.recv().await {
+            Some(Ok(Ok(()))) => Ok(()),
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(e)) => Err(e),
+            None => Err(PythonExecutionError::ExecutionError { 
+                message: "Callback channel closed without response".to_string() 
+            }),
         }
     }
 }
@@ -447,11 +449,13 @@ where
                                     // Create a metrics tracker for this handler operation
                                     let _metrics_tracker = crate::metrics::OperationTracker::track_callback();
                                     
+                                    // Handle the callback without creating a span
                                     let result = handler.handle(msg).await;
+                                    
                                     let reply_envelope = CallbackEnvelope {
                                         correlation_id,
                                         inner: result,
-                                        context: Default::default(),
+                                        context: envelope.context,
                                     };
                                     if let Err(e) = reply_tx.send(reply_envelope) {
                                         tracing::error!(event = "callback_receiver", task = "handler_task", step = "send_error", 

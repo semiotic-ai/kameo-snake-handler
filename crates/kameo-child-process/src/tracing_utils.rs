@@ -94,7 +94,7 @@ pub fn create_ipc_parent_send_span(
 pub fn create_ipc_child_receive_span(
     correlation_id: u64,
     message_type: &'static str,
-    parent_cx: OtelContext,
+    parent_cx: OtelContext, // Now this is the ipc-message context
 ) -> tracing::Span {
     let span = info_span!(
         "ipc-child-receive",
@@ -104,6 +104,7 @@ pub fn create_ipc_child_receive_span(
         messaging.operation = "receive",
         messaging.source_kind = "queue"
     );
+    // Set parent to ipc-message context - this makes it a sibling of ipc-parent-send
     span.set_parent(parent_cx);
     span
 }
@@ -296,6 +297,22 @@ pub fn create_message_span_with_parent(
     );
     span.set_parent(parent_cx);
     span
+}
+
+/// Create a callback handle span.
+/// 
+/// This span represents the handling of a callback message.
+/// 
+/// # Arguments
+/// * `correlation_id` - Unique identifier for this callback
+/// 
+/// # Returns
+/// A span that can be used with .instrument()
+pub fn create_callback_handle_span(correlation_id: u64) -> tracing::Span {
+    info_span!(
+        "handle",
+        correlation_id = correlation_id,
+    )
 }
 
 /// Encapsulated message processing span lifecycle.

@@ -16,6 +16,7 @@ macro_rules! setup_python_subprocess_system {
                         use pyo3_async_runtimes::tokio::future_into_py;
                         use kameo_child_process::callback::{CallbackIpcChild, CallbackHandler};
                         use kameo_child_process::DuplexUnixStream;
+                        
                         // Inlined declare_callback_glue
                         static CALLBACK_HANDLE: once_cell::sync::OnceCell<kameo_child_process::callback::CallbackHandle<$callback>> = once_cell::sync::OnceCell::new();
                         #[allow(non_snake_case)]
@@ -57,6 +58,8 @@ macro_rules! setup_python_subprocess_system {
                             }
                         };
                         kameo_snake_handler::setup_python_runtime(builder);
+                        
+                        
                         let root_span = tracing::info_span!("child_process", process_role = "child");
                         let result = pyo3::Python::with_gil(|py| {
                             // config_json and config

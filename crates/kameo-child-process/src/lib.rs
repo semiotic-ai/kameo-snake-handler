@@ -1,10 +1,70 @@
 #![forbid(unsafe_code)]
 
+//! # Kameo Child Process IPC Library
+//! 
+//! This library provides a robust inter-process communication (IPC) system for Rust applications
+//! that need to communicate with child processes, particularly Python subprocesses. It's built on
+//! top of the Kameo actor system and provides both synchronous and streaming message protocols.
+//! 
+//! ## Architecture Overview
+//! 
+//! The library implements a multiplexed IPC protocol over Unix domain sockets with the following
+//! key components:
+//! 
+//! ### Core Protocol
+//! - **Control Messages**: Handshake, Sync (single response), Stream (streaming response), StreamEnd
+//! - **Multiplexed Envelopes**: All messages are wrapped with correlation IDs and tracing context
+//! - **Bidirectional Communication**: Request/response and callback channels
+//! 
+//! ### Streaming Support
+//! The library now uses a unified streaming protocol where all responses are treated as streams:
+//! - **Sync Messages**: Converted to single-item streams for backward compatibility
+//! - **Stream Messages**: Native streaming with multiple items and proper termination
+//! - **Stream End Markers**: Explicit stream termination with optional final value
+//! 
+//! ### Key Types
+//! - `SubprocessIpcBackend`: Core IPC backend for parent processes
+//! - `SubprocessIpcActor`: Kameo actor wrapper for IPC communication
+//! - `ChildProcessMessageHandler`: Trait for handling messages in child processes
+//! - `ReplySlot`: Unified slot for both sync and streaming responses
+//! 
+//! ### Tracing & Observability
+//! - OpenTelemetry integration for distributed tracing
+//! - Metrics collection for performance monitoring
+//! - Structured logging with correlation IDs
+//! 
+//! ## Usage Example
+//! 
+//! ```rust
+//! use kameo_child_process::prelude::*;
+//! 
+//! // Define your message types
+//! #[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+//! struct MyMessage { data: String }
+//! 
+//! impl KameoChildProcessMessage for MyMessage {
+//!     type Ok = String;
+//! }
+//! 
+//! // Create backend and actor
+//! let backend = SubprocessIpcBackend::from_duplex(stream);
+//! let actor = spawn_subprocess_ipc_actor(backend);
+//! 
+//! // Send synchronous message
+//! let response = actor.ask(MyMessage { data: "hello".to_string() }).await?;
+//! 
+//! // Send streaming message
+//! let stream = actor.send_stream(MyMessage { data: "stream".to_string() }).await?;
+//! while let Some(item) = stream.next().await {
+//!     println!("Received: {:?}", item?);
+//! }
+//! ```
+
 use once_cell::sync::Lazy;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
+use futures::stream::StreamExt;
 
 static GLOBAL_PROPAGATOR: Lazy<Arc<dyn TextMapPropagator + Send + Sync>> = Lazy::new(|| {
     Arc::new(TraceContextPropagator::new())
@@ -30,13 +90,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::Level;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_futures::Instrument;
+
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tracing::{trace, error};
 use dashmap::DashMap;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 pub mod error;
 pub use error::PythonExecutionError;
-
 
 
 
@@ -50,7 +110,7 @@ impl TracingContext {
         use opentelemetry::propagation::Injector;
         let mut context = Self::default();
         struct MapInjector<'a>(&'a mut std::collections::HashMap<String, String>);
-        impl<'a> Injector for MapInjector<'a> {
+        impl Injector for MapInjector<'_> {
             fn set(&mut self, key: &str, value: String) {
                 self.0.insert(key.to_string(), value);
             }
@@ -81,7 +141,7 @@ impl TracingContext {
     pub fn extract_parent(&self) -> opentelemetry::Context {
         use opentelemetry::propagation::Extractor;
         struct MapExtractor<'a>(&'a std::collections::HashMap<String, String>);
-        impl<'a> Extractor for MapExtractor<'a> {
+        impl Extractor for MapExtractor<'_> {
             fn get(&self, key: &str) -> Option<&str> {
                 self.0.get(key).map(|s| s.as_str())
             }
@@ -135,22 +195,58 @@ pub trait KameoChildProcessMessage:
     type Ok: Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + Clone + 'static;
 }
 
-/// Control message for handshake and real messages (errors are always inside the envelope)
+/// Control message for the unified IPC protocol.
+/// 
+/// This enum represents the different types of control messages that can be sent over the IPC
+/// connection. The protocol has been unified to treat all responses as streams, with sync
+/// messages being converted to single-item streams for backward compatibility.
+/// 
+/// ## Protocol Flow
+/// 
+/// 1. **Handshake**: Initial connection establishment
+/// 2. **Sync**: Single request/response (converted to single-item stream internally)
+/// 3. **Stream**: Multiple items in a stream
+/// 4. **StreamEnd**: Explicit stream termination with optional final value
+/// 
+/// ## Examples
+/// 
+/// ```rust
+/// // Sync message (single response)
+/// Control::Sync(MultiplexEnvelope { correlation_id: 1, inner: msg, context })
+/// 
+/// // Streaming message (multiple responses)
+/// Control::Stream(MultiplexEnvelope { correlation_id: 2, inner: msg, context })
+/// 
+/// // Stream termination
+/// Control::StreamEnd(MultiplexEnvelope { correlation_id: 2, inner: Some(final_value), context })
+/// ```
 #[derive(Debug, Serialize, Deserialize, Encode, Decode, Clone)]
 pub enum Control<T> {
+    /// Initial handshake message for connection establishment
     Handshake,
-    Real(MultiplexEnvelope<T>),
+    /// Synchronous message - converted to single-item stream internally
+    Sync(MultiplexEnvelope<T>),
+    /// Streaming message - part of a multi-item stream
+    Stream(MultiplexEnvelope<T>),
+    /// Stream end marker - indicates stream completion with optional final value
+    StreamEnd(MultiplexEnvelope<Option<T>>),
 }
 
 impl<T> Control<T> {
     pub fn is_handshake(&self) -> bool {
         matches!(self, Control::Handshake)
     }
-    pub fn into_real(self) -> Option<MultiplexEnvelope<T>> {
+    pub fn into_sync(self) -> Option<MultiplexEnvelope<T>> {
         match self {
-            Control::Real(env) => Some(env),
+            Control::Sync(env) => Some(env),
             _ => None,
         }
+    }
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Control::Stream(_))
+    }
+    pub fn is_stream_end(&self) -> bool {
+        matches!(self, Control::StreamEnd(_))
     }
 }
 
@@ -164,45 +260,128 @@ pub struct MultiplexEnvelope<T> {
 
 pub struct WriteRequest<M> {
     pub correlation_id: u64,
-    pub envelope: MultiplexEnvelope<M>,
+    pub control: Control<M>,
 }
 
 pub type CorrelationId = u64;
+/// Unified reply slot for both synchronous and streaming responses.
+/// 
+/// This struct implements a unified approach where all responses are treated as streams.
+/// Synchronous responses are converted to single-item streams internally, while streaming
+/// responses can contain multiple items.
+/// 
+/// ## Design
+/// 
+/// - **Stream Sender**: Used by the child process to send response items
+/// - **Stream Receiver**: Used by the parent process to receive response items
+/// - **Unified Protocol**: Both sync and stream responses use the same underlying mechanism
+/// 
+/// ## Usage
+/// 
+/// ```rust
+/// // Create a new reply slot
+/// let mut slot = ReplySlot::new();
+/// 
+/// // For sync responses (single item)
+/// slot.try_send_stream_item(Ok(result))?;
+/// slot.close_stream();
+/// 
+/// // For streaming responses (multiple items)
+/// slot.try_send_stream_item(Ok(item1))?;
+/// slot.try_send_stream_item(Ok(item2))?;
+/// slot.close_stream();
+/// 
+/// // Parent receives the stream
+/// let receiver = slot.take_stream_receiver()?;
+/// while let Some(item) = receiver.recv().await {
+///     println!("Received: {:?}", item?);
+/// }
+/// ```
 pub struct ReplySlot<R> {
-    sender: Option<oneshot::Sender<R>>,
-    receiver: Option<oneshot::Receiver<R>>,
+    /// Sender for streaming response items (used by child process)
+    stream_sender: Option<mpsc::UnboundedSender<Result<R, PythonExecutionError>>>,
+    /// Receiver for streaming response items (used by parent process)
+    stream_receiver: Option<mpsc::UnboundedReceiver<Result<R, PythonExecutionError>>>,
 }
 
 impl<R> ReplySlot<R> {
     pub fn new() -> Self {
-        let (sender, receiver) = oneshot::channel();
-        Self { sender: Some(sender), receiver: Some(receiver) }
-    }
-    pub async fn set_and_notify(&mut self, value: R) {
-        if let Some(sender) = self.sender.take() {
-            if sender.send(value).is_err() {
-                tracing::error!(event = "reply_slot", error = "Failed to send reply, receiver dropped", "Reply channel closed");
-            }
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            stream_sender: Some(tx),
+            stream_receiver: Some(rx),
         }
     }
+
+    pub fn new_streaming() -> Self {
+        Self::new() // Same as new() now
+    }
+
+    // Sync methods now use streaming internally
+    pub async fn set_and_notify(&mut self, value: R) {
+        if let Some(sender) = &self.stream_sender {
+            if sender.send(Ok(value)).is_err() {
+                tracing::error!(event = "reply_slot", error = "Failed to send reply, receiver dropped", "Reply channel closed");
+            }
+            // Close the stream after sending
+            self.close_stream();
+        }
+    }
+
     pub async fn wait(mut self) -> Option<R> {
-        if let Some(receiver) = self.receiver.take() {
-            receiver.await.ok()
+        if let Some(mut receiver) = self.stream_receiver.take() {
+            // Wait for the first item and close
+            match receiver.recv().await {
+                Some(Ok(item)) => Some(item),
+                Some(Err(_)) => None, // Error case
+                None => None, // Channel closed
+            }
         } else {
             None
         }
+    }
+
+    // Streaming methods
+    pub fn try_send_stream_item(&mut self, item: Result<R, PythonExecutionError>) -> bool {
+        if let Some(sender) = &self.stream_sender {
+            sender.send(item).is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub fn try_send_stream_error(&mut self, err: PythonExecutionError) {
+        if let Some(sender) = &self.stream_sender {
+            let _ = sender.send(Err(err));
+        }
+    }
+
+    pub fn close_stream(&mut self) {
+        self.stream_sender.take();
+    }
+
+    pub fn into_stream_receiver(mut self) -> Option<mpsc::UnboundedReceiver<Result<R, PythonExecutionError>>> {
+        self.stream_receiver.take()
+    }
+
+    pub fn take_stream_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<Result<R, PythonExecutionError>>> {
+        self.stream_receiver.take()
     }
 }
 
 impl<R> ReplySlot<Result<R, PythonExecutionError>> {
     pub fn try_set_err(&mut self, err: PythonExecutionError) {
-        if let Some(sender) = self.sender.take() {
+        if let Some(sender) = self.stream_sender.take() {
             if sender.send(Err(err)).is_err() {
                 tracing::error!(event = "reply_slot", error = "Failed to send error reply, receiver dropped", "Error reply channel closed");
             }
+            // Close the stream after sending
+            self.close_stream();
         }
     }
 }
+
+
 
 impl<R> Default for ReplySlot<R> {
     fn default() -> Self {
@@ -211,6 +390,8 @@ impl<R> Default for ReplySlot<R> {
 }
 
 pub struct InFlightMap<OkType>(pub Arc<DashMap<CorrelationId, ReplySlot<OkType>>>);
+
+
 
 impl<OkType> Clone for InFlightMap<OkType> {
     fn clone(&self) -> Self {
@@ -229,6 +410,8 @@ impl<R> Default for InFlightMap<R> {
         Self::new()
     }
 }
+
+
 
 /// Encapsulates a full-duplex UnixStream for protocol artefacts, enforcing correct split/unsplit usage.
 pub struct DuplexUnixStream {
@@ -253,16 +436,64 @@ impl AsRef<tokio::net::UnixStream> for DuplexUnixStream {
     }
 }
 
+/// Core IPC backend for parent processes implementing the unified streaming protocol.
+/// 
+/// This backend manages the communication with child processes over Unix domain sockets.
+/// It implements a unified streaming protocol where all responses are treated as streams,
+/// with synchronous responses converted to single-item streams for backward compatibility.
+/// 
+/// ## Architecture
+/// 
+/// - **Writer Task**: Handles sending messages to the child process
+/// - **Reader Task**: Handles receiving responses from the child process
+/// - **In-Flight Map**: Tracks pending requests with correlation IDs
+/// - **Adaptive Throttling**: Monitors pending count to prevent overwhelming
+/// 
+/// ## Protocol Flow
+/// 
+/// 1. **Send Message**: Creates correlation ID and ReplySlot
+/// 2. **Send Control**: Wraps message in appropriate Control variant
+/// 3. **Wait Response**: Receives stream items from child process
+/// 4. **Return Result**: For sync messages, returns first item; for streams, returns full stream
+/// 
+/// ## Key Features
+/// 
+/// - **Unified Streaming**: All responses use the same underlying stream mechanism
+/// - **Correlation Tracking**: Each request gets a unique correlation ID
+/// - **Error Handling**: Comprehensive error propagation and cleanup
+/// - **Metrics Integration**: Built-in performance monitoring
+/// - **Graceful Shutdown**: Proper cleanup on cancellation
+/// 
+/// ## Usage
+/// 
+/// ```rust
+/// // Create backend from duplex stream
+/// let backend = SubprocessIpcBackend::from_duplex(stream);
+/// 
+/// // Send synchronous message (returns single result)
+/// let result = backend.send(message).await?;
+/// 
+/// // Send streaming message (returns stream of results)
+/// let stream = backend.send_stream(message).await?;
+/// while let Some(item) = stream.next().await {
+///     println!("Stream item: {:?}", item?);
+/// }
+/// ```
 pub struct SubprocessIpcBackend<M>
 where
     M: KameoChildProcessMessage + Send + Sync + Clone + 'static,
 {
+    /// Channel for sending write requests to the writer task
     write_tx: tokio::sync::mpsc::UnboundedSender<WriteRequest<M>>,
+    /// Map of in-flight requests indexed by correlation ID
     in_flight: InFlightMap<Result<M::Ok, PythonExecutionError>>,
+    /// Atomic counter for generating unique correlation IDs
     next_id: AtomicU64,
+    /// Token for graceful shutdown of all tasks
     cancellation_token: tokio_util::sync::CancellationToken,
-    // Track pending requests for adaptive throttling
+    /// Track pending requests for adaptive throttling
     pending_count: AtomicUsize,
+    /// Phantom data for message type
     _phantom: std::marker::PhantomData<M>,
 }
 
@@ -317,7 +548,7 @@ where
                         match message {
                             Some(write_req) => {
                                 // Process write directly, one at a time
-                                if let Err(e) = writer.write_msg(&write_req.envelope).await {
+                                if let Err(e) = writer.write_msg(&write_req.control).await {
                                     tracing::error!(event = "writer_task", error = ?e, "Failed to write message");
                                     // Don't break on errors - just log them and continue
                                 }
@@ -366,37 +597,68 @@ where
                     result = reader.read_msg::<Control<Result<M::Ok, PythonExecutionError>>>() => {
                         match result {
                             Ok(ctrl) => {
-                                if let Control::Real(envelope) = ctrl {
+                                match ctrl {
+                                    Control::Sync(envelope) => {
                                     let correlation_id = envelope.correlation_id;
-                                    trace!(event = "parent_in_flight", action = "response_received", correlation_id, "Received response for correlation_id");
-                                    
-                                    // Extract the entry from in_flight map to avoid race conditions
-                                    if let Some((_, slot)) = in_flight_reader.0.remove(&correlation_id) {
-                                        // Decrement pending count as we've received a response
-                                        result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                        trace!(event = "parent_in_flight", action = "sync_response_received", correlation_id, "Received sync response for correlation_id");
                                         
-                                        // Extract the sender so we can drop the slot immediately
-                                        if let Some(sender) = slot.sender {
-                                            // Send the response directly to the waiting task
-                                            if sender.send(envelope.inner).is_err() {
-                                                tracing::error!(event = "parent_in_flight", error = "Failed to send reply, receiver dropped", correlation_id);
-                                                
-                                                // Track error in metrics
-                                                metrics::MetricsHandle::parent().track_error("reply_channel_closed");
+                                        // Handle sync responses as single-item streams
+                                        if let Some(mut slot) = in_flight_reader.0.get_mut(&correlation_id) {
+                                            let result = envelope.inner.clone();
+                                            // Send through streaming channel and close
+                                            if slot.try_send_stream_item(Ok(result.clone())) {
+                                                trace!(event = "parent_in_flight", action = "sync_item_sent", correlation_id, "Sent sync item through streaming channel");
+                                                slot.close_stream();
                                             } else {
-                                                trace!(event = "parent_in_flight", action = "notify", correlation_id, "Sent reply to waiting task");
+                                                tracing::error!(event = "parent_in_flight", correlation_id, "Sync reply slot sender missing");
+                                                metrics::MetricsHandle::parent().track_error("sync_missing_sender");
                                             }
                                         } else {
-                                            tracing::error!(event = "parent_in_flight", correlation_id, "Reply slot sender missing");
-                                            
-                                            // Track error in metrics
-                                            metrics::MetricsHandle::parent().track_error("missing_sender");
+                                            tracing::error!(event = "parent_in_flight", correlation_id, "Received sync reply for unknown correlation id");
+                                            metrics::MetricsHandle::parent().track_error("sync_unknown_correlation_id");
                                         }
-                                    } else {
-                                        tracing::error!(event = "parent_in_flight", correlation_id, "Received reply for unknown correlation id");
                                         
-                                        // Track error in metrics
-                                        metrics::MetricsHandle::parent().track_error("unknown_correlation_id");
+                                        // Remove from in_flight after sending sync response
+                                        if in_flight_reader.0.remove(&correlation_id).is_some() {
+                                            result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                        }
+                                    }
+                                    Control::Stream(envelope) => {
+                                        let correlation_id = envelope.correlation_id;
+                                        trace!(event = "parent_in_flight", action = "stream_item_received", correlation_id, "Received stream item for correlation_id");
+                                        
+                                        // Handle streaming responses
+                                        if let Some(mut slot) = in_flight_reader.0.get_mut(&correlation_id) {
+                                            let result = envelope.inner.clone();
+                                            // Send through streaming channel
+                                            if slot.try_send_stream_item(Ok(result.clone())) {
+                                                trace!(event = "parent_in_flight", action = "stream_item_sent", correlation_id, "Sent stream item through streaming channel");
+                                    } else {
+                                                tracing::error!(event = "parent_in_flight", correlation_id, "Stream reply slot sender missing");
+                                                metrics::MetricsHandle::parent().track_error("stream_missing_sender");
+                                            }
+                                        } else {
+                                            tracing::error!(event = "parent_in_flight", correlation_id, "Received stream item for unknown correlation id");
+                                            metrics::MetricsHandle::parent().track_error("stream_unknown_correlation_id");
+                                        }
+                                    }
+                                    Control::StreamEnd(envelope) => {
+                                        let correlation_id = envelope.correlation_id;
+                                        trace!(event = "parent_in_flight", action = "stream_end_received", correlation_id, "Received stream end for correlation_id");
+                                        
+                                        // Close the streaming channel and remove from in_flight
+                                        if let Some(mut slot) = in_flight_reader.0.get_mut(&correlation_id) {
+                                            slot.close_stream();
+                                            trace!(event = "parent_in_flight", action = "stream_complete", correlation_id, "Stream completed and closed");
+                                        }
+                                        // Remove from in_flight
+                                        if in_flight_reader.0.remove(&correlation_id).is_some() {
+                                            result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                        }
+                                    }
+                                    Control::Handshake => {
+                                        // Handshake messages shouldn't be received by parent in normal operation
+                                        tracing::warn!(event = "parent_in_flight", action = "unexpected_handshake", "Received unexpected handshake from child");
                                     }
                                 }
                             }
@@ -427,7 +689,7 @@ where
             // On exit, drain in_flight and send error to all pending
             in_flight_reader.0.iter_mut().for_each(|mut item| {
                 let (_corr_id, slot) = item.pair_mut();
-                if let Some(sender) = slot.sender.take() {
+                if let Some(sender) = slot.stream_sender.take() {
                     let err = PythonExecutionError::ExecutionError { message: "IPC backend reply loop exited".to_string() };
                     if sender.send(Err(err)).is_err() {
                         tracing::error!(event = "reader_task", error = "Failed to send shutdown error to waiting task", "Failed to notify waiting task about shutdown");
@@ -469,21 +731,19 @@ where
         // Create the ipc-parent-send span as a child of the ipc-message span
         let send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
         
-        // Create the oneshot channel BEFORE sending the message
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Create a reply slot (now always streaming)
+        let slot = ReplySlot::new();
         
         // Insert into in_flight map and track pending count
         {
-            let mut slot = ReplySlot::new();
-            slot.sender = Some(tx);
-            slot.receiver = None;
             self.in_flight.0.insert(correlation_id, slot);
             self.pending_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         
-        // Create the envelope with the ipc-parent-send span context
+        // Create the envelope with the ipc-message span context (not ipc-parent-send)
+        // This ensures ipc-child-receive will be a sibling of ipc-parent-send
         let envelope = {
-            let _send_guard = send_span.enter();
+            let _message_guard = ipc_message_span.enter();
             MultiplexEnvelope {
                 correlation_id,
                 inner: msg,
@@ -491,11 +751,11 @@ where
             }
         };
         
-        // Send the message and attach the send span to the future
-        let send_future = async move {
-            trace!(event = "send_start", correlation_id = correlation_id, message_type = msg_type, "Starting IPC send");
-            
-            let write_req = WriteRequest { correlation_id, envelope };
+        // Send the message as a sync request (but handled as single-item stream)
+        let write_req = WriteRequest { 
+            correlation_id, 
+            control: Control::Sync(envelope) 
+        };
             if let Err(e) = self.write_tx.send(write_req) {
                 self.in_flight.0.remove(&correlation_id);
                 self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -504,45 +764,77 @@ where
                 });
             }
             
-            trace!(event = "message_sent", correlation_id, "Message sent successfully");
-            
-            // Wait for reply with timeout
-            let result = match timeout(Duration::from_secs(30), rx).await {
-                Ok(Ok(reply)) => {
-                    trace!(event = "reply_received", correlation_id, "Reply received successfully");
-                    reply
-                }
-                Ok(Err(_)) => {
-                    error!(event = "reply_channel_closed", correlation_id, "Reply channel closed");
-                    if self.in_flight.0.remove(&correlation_id).is_some() {
-                        self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    return Err(PythonExecutionError::ExecutionError { 
-                        message: "Reply channel closed before response received".to_string() 
-                    });
-                }
-                Err(_) => {
-                    error!(event = "reply_timeout", correlation_id, "Reply timeout");
-                    if self.in_flight.0.remove(&correlation_id).is_some() {
-                        self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    return Err(PythonExecutionError::ExecutionError { 
-                        message: "Reply timeout after 30 seconds".to_string() 
-                    });
-                }
-            };
-            
-            // Clean up in_flight entry
-            {
-                self.in_flight.0.remove(&correlation_id);
-                self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            
-            trace!(event = "send_complete", correlation_id = correlation_id, "IPC send completed");
-            result
+        // Wait for the response by getting the receiver from the in_flight map
+        let mut receiver = {
+            let mut slot = self.in_flight.0.get_mut(&correlation_id).expect("Slot should exist");
+            slot.take_stream_receiver().expect("Stream receiver should be available")
         };
         
-        send_future.instrument(send_span).await
+        // Wait for the first (and only) item from the stream
+        match receiver.recv().await {
+            Some(Ok(Ok(result))) => Ok(result),
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(e)) => Err(e),
+            None => Err(PythonExecutionError::ExecutionError { 
+                message: "Stream closed without response".to_string() 
+            }),
+        }
+    }
+    
+    /// Send a streaming message to the child process.
+    /// Returns a stream of responses from the child.
+    pub async fn send_stream(&self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
+        let correlation_id = self.next_correlation_id();
+        let msg_type = std::any::type_name::<M>();
+        
+        // Create the root ipc-message span that will encompass the entire IPC operation
+        let ipc_message_span = tracing_utils::create_root_ipc_message_span(correlation_id, msg_type);
+        
+        // Create the ipc-parent-send span as a child of the ipc-message span
+        let send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
+        
+        // Create a streaming reply slot
+        let mut slot = ReplySlot::new_streaming();
+        let stream_receiver = slot.take_stream_receiver().expect("Stream receiver should be available");
+        
+        // Insert into in_flight map and track pending count
+        {
+            self.in_flight.0.insert(correlation_id, slot);
+            self.pending_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        
+        // Create the envelope with the ipc-message span context (not ipc-parent-send)
+        // This ensures ipc-child-receive will be a sibling of ipc-parent-send
+        let envelope = {
+            let _message_guard = ipc_message_span.enter();
+            MultiplexEnvelope {
+                correlation_id,
+                inner: msg,
+                context: TracingContext::from_current_span(),
+            }
+        };
+        
+        // Send the message as a streaming request
+        let write_req = WriteRequest { 
+            correlation_id, 
+            control: Control::Stream(envelope) 
+        };
+        if let Err(e) = self.write_tx.send(write_req) {
+                self.in_flight.0.remove(&correlation_id);
+                self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(PythonExecutionError::ExecutionError { 
+                message: format!("Failed to send streaming write request: {e}") 
+            });
+        }
+        
+        // Convert the receiver into a stream using tokio_stream with type conversion
+        let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(stream_receiver)
+            .map(|item| match item {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(e),
+            });
+        Ok(Box::new(stream))
     }
 }
 
@@ -564,10 +856,77 @@ impl Default for ChildProcessConfig {
     }
 }
 
-/// Trait for message handlers in the child process (no Context, no actor system)
+/// Trait for handling messages in child processes with unified streaming support.
+/// 
+/// This trait defines the interface for processing messages in child processes.
+/// It supports both synchronous and streaming message handling, with streaming
+/// being the primary mechanism and sync messages converted to single-item streams.
+/// 
+/// ## Unified Streaming Protocol
+/// 
+/// All message handling now uses streams internally:
+/// - **Sync Messages**: `handle_child_message()` returns a single result, converted to single-item stream
+/// - **Stream Messages**: `handle_child_message_stream()` returns a multi-item stream
+/// - **Backward Compatibility**: Default implementation converts sync to stream automatically
+/// 
+/// ## Implementation Guidelines
+/// 
+/// - **Sync Handlers**: Implement `handle_child_message()` for single request/response
+/// - **Stream Handlers**: Override `handle_child_message_stream()` for multi-item responses
+/// - **Error Handling**: Always return `PythonExecutionError` for proper error propagation
+/// - **Async Safety**: Ensure handlers are `Send + Clone + 'static`
+/// 
+/// ## Example Implementation
+/// 
+/// ```rust
+/// struct MyHandler;
+/// 
+/// #[async_trait]
+/// impl ChildProcessMessageHandler<MyMessage> for MyHandler {
+///     // Sync handler (converted to single-item stream)
+///     async fn handle_child_message(&mut self, msg: MyMessage) -> Result<MyResponse, PythonExecutionError> {
+///         // Process single message
+///         Ok(MyResponse { result: "done" })
+///     }
+///     
+///     // Stream handler (optional override)
+///     async fn handle_child_message_stream(&mut self, msg: MyMessage) -> Result<Box<dyn Stream<Item = Result<MyResponse, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
+///         // Process streaming message
+///         let stream = futures::stream::iter(vec![
+///             Ok(MyResponse { result: "item1" }),
+///             Ok(MyResponse { result: "item2" }),
+///         ]);
+///         Ok(Box::new(stream))
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ChildProcessMessageHandler<Msg> where Msg: KameoChildProcessMessage {
+    /// Handle a synchronous message and return a single response.
+    /// 
+    /// This method is converted to a single-item stream internally for the unified protocol.
+    /// Override `handle_child_message_stream()` if you need true streaming behavior.
     async fn handle_child_message(&mut self, msg: Msg) -> Result<Msg::Ok, PythonExecutionError>;
+    
+    /// Handle a synchronous message with tracing context and return a single response.
+    /// 
+    /// This method is called by the child process loop with the tracing context from the envelope.
+    /// The default implementation calls `handle_child_message()` without the context.
+    async fn handle_child_message_with_context(&mut self, msg: Msg, _context: TracingContext) -> Result<Msg::Ok, PythonExecutionError> {
+        self.handle_child_message(msg).await
+    }
+    
+    /// Handle a streaming message and return a stream of responses.
+    /// 
+    /// Default implementation converts the single response from `handle_child_message()`
+    /// to a single-item stream for backward compatibility. Override this method to
+    /// implement true streaming behavior with multiple response items.
+    async fn handle_child_message_stream(&mut self, msg: Msg) -> Result<Box<dyn futures::stream::Stream<Item = Result<Msg::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
+        // Default implementation: convert single response to single-item stream
+        let result = self.handle_child_message(msg).await;
+        let stream = futures::stream::iter(vec![result]);
+        Ok(Box::new(stream))
+    }
 }
 
 /// Run the IPC handler loop in the child process. No ActorRef, no Clone, no spawn, just handle messages.
@@ -630,13 +989,10 @@ where
     M: KameoChildProcessMessage + Send + 'static,
     M::Ok: serde::Serialize + bincode::Encode + std::fmt::Debug + 'static,
 {
-    // Clear all ambient span context for the entire select loop and all futures polled within it
-    let none_span = tracing::Span::none();
-    let _none_guard = none_span.enter();
     tracing::debug!(event = "run_child_actor_loop", step = "start", "run_child_actor_loop started");
     use futures::stream::{FuturesUnordered, StreamExt};
     let _config = config.unwrap_or_default();
-    let mut in_flight = FuturesUnordered::new();
+    let mut in_flight = FuturesUnordered::<Box<dyn futures::Future<Output = ()> + Send + Unpin>>::new();
 
     // Make reply_tx Option and drop it on shutdown
     let (reply_tx_inner, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Vec<u8>)>();
@@ -650,7 +1006,7 @@ where
                 Some(_) = in_flight.next() => {
                     tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
                 }
-                read_res = read_next_message(&mut *conn) => {
+                read_res = read_next_message(&mut conn) => {
                     match read_res {
                         Ok(Some(msg)) => {
                             tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..std::cmp::min(100, msg.len())], "Read message from parent");
@@ -668,9 +1024,8 @@ where
                                 Control::Handshake => {
                                     tracing::debug!(event = "child_ipc", step = "handshake", "Received handshake from parent");
                                 }
-                                Control::Real(envelope) => {
+                                Control::Sync(envelope) => {
                                     let correlation_id = envelope.correlation_id;
-                                    let parent_cx = envelope.context.extract_parent();
                                     
                                     // Debug: Log the context contents to see what's being extracted
                                     tracing::debug!(
@@ -685,19 +1040,22 @@ where
                                     let reply_tx = reply_tx.as_ref().unwrap().clone();
                                     
                                     // Use encapsulated span lifecycle management
-                                    let msg_type = std::any::type_name::<M>();
+                                    let _msg_type = std::any::type_name::<M>();
                                     
-                                    // Create ipc-child-receive span as a child of the root ipc-message span
-                                    let receive_span = tracing_utils::create_ipc_child_receive_span(
-                                        correlation_id,
-                                        msg_type,
-                                        parent_cx.clone(),
-                                    );
-                                    
-                                    // Create the message processing future and instrument it with the span
+                                    // Create the message processing future with ipc-child-receive span
                                     let process_future = async move {
-                                        // Process the message
-                                        let result = handler.handle_child_message(envelope.inner).await;
+                                        // Create ipc-child-receive span with proper parent context
+                                        let parent_cx = envelope.context.extract_parent();
+                                        let child_receive_span = crate::tracing_utils::create_ipc_child_receive_span(
+                                            correlation_id,
+                                            std::any::type_name::<M>(),
+                                            parent_cx,
+                                        );
+                                        
+                                        // Process the message with tracing context
+                                        let result = async {
+                                            handler.handle_child_message_with_context(envelope.inner, envelope.context.clone()).await
+                                        }.instrument(child_receive_span).await;
                                         
                                         // Send the reply
                                         let reply_envelope = MultiplexEnvelope {
@@ -705,7 +1063,7 @@ where
                                             inner: result,
                                             context: envelope.context,
                                         };
-                                        let ctrl = Control::Real(reply_envelope);
+                                        let ctrl = Control::Sync(reply_envelope);
                                         
                                         // Encode the reply to bytes
                                         match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
@@ -723,10 +1081,132 @@ where
                                         }
                                     };
                                     
-                                    // Instrument the future with the receive_span
-                                    in_flight.push(process_future.instrument(receive_span));
+                                    // Box the future without redundant span instrumentation
+                                    let boxed_future = Box::pin(process_future);
+                                    in_flight.push(Box::new(boxed_future));
                                     tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(), 
                                         correlation_id = correlation_id, "Pushed message future to child in_flight");
+                                }
+                                Control::Stream(envelope) => {
+                                    let correlation_id = envelope.correlation_id;
+                                    let parent_cx = envelope.context.extract_parent();
+                                    
+                                    tracing::debug!(
+                                        event = "context_debug",
+                                        correlation_id = correlation_id,
+                                        context_keys = ?envelope.context.0.keys().collect::<Vec<_>>(),
+                                        context_values = ?envelope.context.0.values().collect::<Vec<_>>(),
+                                        "Extracted parent context from stream envelope"
+                                    );
+                                    
+                                    let mut handler = handler.clone();
+                                    let reply_tx = reply_tx.as_ref().unwrap().clone();
+                                    
+                                    // Use encapsulated span lifecycle management
+                                    let _msg_type = std::any::type_name::<M>();
+                                    
+                                    // Create the streaming message processing future with ipc-child-receive span
+                                    let process_future = async move {
+                                        // Create ipc-child-receive span with proper parent context
+                                        let child_receive_span = crate::tracing_utils::create_ipc_child_receive_span(
+                                            correlation_id,
+                                            std::any::type_name::<M>(),
+                                            parent_cx,
+                                        );
+                                        
+                                        // Process the message as a stream
+                                        let stream_result = async {
+                                            handler.handle_child_message_stream(envelope.inner).await
+                                        }.instrument(child_receive_span).await;
+                                        
+                                        match stream_result {
+                                            Ok(mut stream) => {
+                                                // Process each item in the stream
+                                                while let Some(item_result) = stream.next().await {
+                                                    let reply_envelope = MultiplexEnvelope {
+                                                        correlation_id,
+                                                        inner: item_result,
+                                                        context: envelope.context.clone(),
+                                                    };
+                                                    
+                                                    // Send as stream item
+                                                    let ctrl = Control::Stream(reply_envelope);
+                                                    
+                                                    // Encode the reply to bytes
+                                                    match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
+                                                        Ok(reply_bytes) => {
+                                                            trace!(event = "stream_reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Stream reply encoded successfully");
+                                                            if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
+                                                                trace!(event = "stream_reply_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream reply");
+                                                                break;
+                                                            } else {
+                                                                trace!(event = "stream_reply_sent", correlation_id = correlation_id, "Stream reply sent successfully");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            trace!(event = "stream_reply_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream reply");
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                // Send stream end marker
+                                                let end_envelope: MultiplexEnvelope<Option<Result<(), PythonExecutionError>>> = MultiplexEnvelope {
+                                                    correlation_id,
+                                                    inner: None, // Stream end marker
+                                                    context: envelope.context,
+                                                };
+                                                let end_ctrl = Control::StreamEnd(end_envelope);
+                                                
+                                                match bincode::encode_to_vec(end_ctrl, bincode::config::standard()) {
+                                                    Ok(end_bytes) => {
+                                                        trace!(event = "stream_end_encoded", correlation_id = correlation_id, "Stream end encoded successfully");
+                                                        if let Err(e) = reply_tx.send((correlation_id, end_bytes)) {
+                                                            trace!(event = "stream_end_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream end");
+                                                        } else {
+                                                            trace!(event = "stream_end_sent", correlation_id = correlation_id, "Stream end sent successfully");
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        trace!(event = "stream_end_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream end");
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                // Send error as stream end
+                                                let error_envelope: MultiplexEnvelope<Option<Result<M::Ok, PythonExecutionError>>> = MultiplexEnvelope {
+                                                    correlation_id,
+                                                    inner: Some(Err(e)),
+                                                    context: envelope.context,
+                                                };
+                                                let error_ctrl = Control::StreamEnd(error_envelope);
+                                                
+                                                match bincode::encode_to_vec(error_ctrl, bincode::config::standard()) {
+                                                    Ok(error_bytes) => {
+                                                        trace!(event = "stream_error_encoded", correlation_id = correlation_id, "Stream error encoded successfully");
+                                                        if let Err(e) = reply_tx.send((correlation_id, error_bytes)) {
+                                                            trace!(event = "stream_error_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream error");
+                                                        } else {
+                                                            trace!(event = "stream_error_sent", correlation_id = correlation_id, "Stream error sent successfully");
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        trace!(event = "stream_error_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream error");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
+                                    
+                                    // Box the future without redundant span instrumentation
+                                    let boxed_future = Box::pin(process_future);
+                                    in_flight.push(Box::new(boxed_future));
+                                    tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(), 
+                                        correlation_id = correlation_id, "Pushed streaming message future to child in_flight");
+                                }
+                                Control::StreamEnd(_) => {
+                                    // Stream end messages are only sent from child to parent, not received by child
+                                    tracing::warn!(event = "child_ipc", step = "unexpected_stream_end", "Received unexpected stream end message from parent");
                                 }
                             }
                         }
@@ -790,6 +1270,8 @@ where
 /// Prelude module for commonly used items
 pub mod prelude {
     pub use tokio::runtime;
+    pub use super::StreamingActor;
+    pub use super::SubprocessIpcActorExt;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -867,12 +1349,47 @@ where
     Ok(())
 }
 
-// 1. Define SubprocessIpcActor<M>
+/// Kameo actor wrapper for IPC communication with child processes.
+/// 
+/// This actor provides a high-level interface for communicating with child processes
+/// through the unified streaming protocol. It wraps the `SubprocessIpcBackend` and
+/// integrates with the Kameo actor system for proper lifecycle management.
+/// 
+/// ## Actor Integration
+/// 
+/// - **Message Handling**: Implements `Message<M>` for synchronous requests
+/// - **Streaming Support**: Implements `StreamingActor<M>` for streaming requests
+/// - **Lifecycle Management**: Proper startup/shutdown with actor system
+/// - **Error Handling**: Integrates with Kameo's error handling mechanisms
+/// 
+/// ## Protocol Support
+/// 
+/// - **Sync Messages**: Use `actor.ask(message)` for single request/response
+/// - **Stream Messages**: Use `actor.send_stream(message)` for streaming responses
+/// - **Error Propagation**: All errors properly propagated through actor system
+/// 
+/// ## Usage
+/// 
+/// ```rust
+/// // Create actor from backend
+/// let actor = spawn_subprocess_ipc_actor(backend);
+/// 
+/// // Send sync message
+/// let response = actor.ask(MyMessage { data: "hello" }).await?;
+/// 
+/// // Send streaming message
+/// let stream = actor.send_stream(MyMessage { data: "stream" }).await?;
+/// while let Some(item) = stream.next().await {
+///     println!("Stream item: {:?}", item?);
+/// }
+/// ```
 pub struct SubprocessIpcActor<M>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
 {
+    /// The underlying IPC backend that handles the actual communication
     backend: Arc<SubprocessIpcBackend<M>>,
+    /// Phantom data for message type
     _phantom: std::marker::PhantomData<M>,
 }
 
@@ -911,6 +1428,83 @@ where
     }
 }
 
+/// Trait for actors that support streaming message responses.
+/// 
+/// This trait provides a unified interface for sending streaming messages to actors
+/// that can return multiple response items. It's implemented by `SubprocessIpcActor`
+/// to support the unified streaming protocol.
+/// 
+/// ## Streaming Protocol
+/// 
+/// - **Multi-Item Responses**: Actors can return streams with multiple items
+/// - **Error Handling**: Each stream item can be a `Result<T, E>`
+/// - **Async Stream**: Returns `Box<dyn Stream>` for flexible streaming
+/// - **Send + Unpin**: Streams are safe for async contexts
+/// 
+/// ## Usage
+/// 
+/// ```rust
+/// // Send streaming message
+/// let stream = actor.send_stream(message).await?;
+/// 
+/// // Process stream items
+/// while let Some(item) = stream.next().await {
+///     match item {
+///         Ok(response) => println!("Received: {:?}", response),
+///         Err(e) => eprintln!("Error: {:?}", e),
+///     }
+/// }
+/// ```
+#[async_trait]
+pub trait StreamingActor<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    /// Send a streaming message and return a stream of responses.
+    /// 
+    /// This method sends a message to the actor and returns a stream that can yield
+    /// multiple response items. The stream will continue until the actor indicates
+    /// completion or an error occurs.
+    async fn send_stream(&self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError>;
+}
+
+#[async_trait]
+impl<M> StreamingActor<M> for SubprocessIpcActor<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    async fn send_stream(&self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
+        self.backend.send_stream(msg).await
+    }
+}
+
+/// Extension trait to add streaming methods to `ActorRef<SubprocessIpcActor<M>>`
+#[async_trait]
+pub trait SubprocessIpcActorExt<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    /// Send a streaming message and return a stream of responses
+    async fn send_stream(&self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError>;
+}
+
+#[async_trait]
+impl<M> SubprocessIpcActorExt<M> for kameo::actor::ActorRef<SubprocessIpcActor<M>>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    async fn send_stream(&self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
+        // Use the new StreamingRequest message type to access the real streaming functionality
+        let streaming_request = StreamingRequest::new(msg);
+        match self.ask(streaming_request).await {
+            Ok(stream) => Ok(stream),
+            Err(_) => Err(PythonExecutionError::ExecutionError {
+                message: "Actor send failed".to_string()
+            }),
+        }
+    }
+}
+
 // 3. Factory function to create and spawn the actor shim
 pub fn spawn_subprocess_ipc_actor<M>(backend: Arc<SubprocessIpcBackend<M>>) -> ActorRef<SubprocessIpcActor<M>>
 where
@@ -918,6 +1512,8 @@ where
 {
     kameo::spawn(SubprocessIpcActor::<M> { backend, _phantom: std::marker::PhantomData })
 }
+
+
 
 pub mod framing;
 pub use framing::{LengthPrefixedRead, LengthPrefixedWrite};
@@ -972,17 +1568,7 @@ where
                                 // Extract OTEL context from the received message
                                 let parent_cx = envelope.context.extract_parent();
                                 
-                                // Create ipc-child-receive span as a child of the root ipc-message span
-                                let receive_span = tracing::info_span!(
-                                    "ipc-child-receive",
-                                    correlation_id = correlation_id,
-                                    message_type = std::any::type_name::<M>(),
-                                    messaging.system = "ipc",
-                                    messaging.operation = "receive",
-                                    messaging.source_kind = "queue"
-                                );
-                                receive_span.set_parent(parent_cx.clone());
-                                let _receive_guard = receive_span.enter();
+                                // Skip redundant ipc-child-receive span - it duplicates ipc-message
                                 
                                 // Create process span
                                 let process_span = tracing::info_span!(
@@ -996,13 +1582,14 @@ where
                                 
                                 trace!(event = "message_processing_start", correlation_id, "Starting message processing");
                                 
-                                let reply: Result<M::Ok, PythonExecutionError> = match handler.handle_child_message(envelope.inner).await {
-                                    Ok(result) => {
-                                        trace!(event = "message_processing_success", correlation_id, ?result, "Message processing successful");
-                                        Ok(result)
+                                // Handle as streaming message
+                                let stream_result = match handler.handle_child_message_stream(envelope.inner).await {
+                                    Ok(stream) => {
+                                        trace!(event = "stream_processing_success", correlation_id, "Stream processing successful");
+                                        Ok(stream)
                                     },
                                     Err(e) => {
-                                        error!(event = "message_processing_error", correlation_id, error = %e, "Message processing failed");
+                                        error!(event = "stream_processing_error", correlation_id, error = %e, "Stream processing failed");
                                         Err(e)
                                     }
                                 };
@@ -1020,19 +1607,75 @@ where
                                 reply_span.set_parent(parent_cx);
                                 let _reply_guard = reply_span.enter();
                                 
-                                // Create reply envelope with tracing context
-                                let reply_envelope = MultiplexEnvelope {
+                                // Process the stream and send each item
+                                match stream_result {
+                                    Ok(mut stream) => {
+                                        use futures::stream::StreamExt;
+                                        
+                                        // Send each stream item
+                                        while let Some(item) = stream.next().await {
+                                            let stream_envelope = MultiplexEnvelope {
                                     correlation_id,
-                                    inner: reply,
+                                                inner: item,
+                                                context: envelope.context.clone(),
+                                            };
+                                            
+                                            let stream_ctrl = Control::Stream(stream_envelope);
+                                            let mut writer_guard = writer.lock().await;
+                                            if writer_guard.write_msg(&stream_ctrl).await.is_err() {
+                                                error!(event = "stream_item_send_failed", correlation_id, "Failed to send stream item");
+                                                break;
+                                            } else {
+                                                trace!(event = "stream_item_sent", correlation_id, "Stream item sent successfully");
+                                            }
+                                        }
+                                        
+                                        // Send stream end marker
+                                        let end_envelope: MultiplexEnvelope<Option<Result<M::Ok, PythonExecutionError>>> = MultiplexEnvelope {
+                                            correlation_id,
+                                            inner: None, // Stream end marker
                                     context: envelope.context,
                                 };
                                 
-                                let reply_ctrl = Control::Real(reply_envelope);
+                                        let end_ctrl = Control::StreamEnd(end_envelope);
                                 let mut writer_guard = writer.lock().await;
-                                if writer_guard.write_msg(&reply_ctrl).await.is_err() {
-                                    error!(event = "reply_send_failed", correlation_id, "Failed to send reply");
+                                        if writer_guard.write_msg(&end_ctrl).await.is_err() {
+                                            error!(event = "stream_end_send_failed", correlation_id, "Failed to send stream end");
                                 } else {
-                                    trace!(event = "reply_sent", correlation_id, "Reply sent successfully");
+                                            trace!(event = "stream_end_sent", correlation_id, "Stream end sent successfully");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        // Send error as single stream item
+                                        let error_envelope: MultiplexEnvelope<Result<M::Ok, PythonExecutionError>> = MultiplexEnvelope {
+                                            correlation_id,
+                                            inner: Err(e),
+                                            context: envelope.context.clone(),
+                                        };
+                                        
+                                        let error_ctrl = Control::Stream(error_envelope);
+                                        let mut writer_guard = writer.lock().await;
+                                        if writer_guard.write_msg(&error_ctrl).await.is_err() {
+                                            error!(event = "error_send_failed", correlation_id, "Failed to send error");
+                                        } else {
+                                            trace!(event = "error_sent", correlation_id, "Error sent successfully");
+                                        }
+                                        
+                                        // Send stream end marker
+                                        let end_envelope: MultiplexEnvelope<Option<Result<M::Ok, PythonExecutionError>>> = MultiplexEnvelope {
+                                            correlation_id,
+                                            inner: None, // Stream end marker
+                                            context: envelope.context,
+                                        };
+                                        
+                                        let end_ctrl = Control::StreamEnd(end_envelope);
+                                        let mut writer_guard = writer.lock().await;
+                                        if writer_guard.write_msg(&end_ctrl).await.is_err() {
+                                            error!(event = "stream_end_send_failed", correlation_id, "Failed to send stream end");
+                                        } else {
+                                            trace!(event = "stream_end_sent", correlation_id, "Stream end sent successfully");
+                                        }
+                                    }
                                 }
                                 
                                 // Drop reply guard to end the span
@@ -1068,25 +1711,45 @@ where
     loop {
         tokio::select! {
             _ = cancellation_token.cancelled() => break,
-            result = reader.read_msg::<MultiplexEnvelope<M>>() => {
-                let envelope: MultiplexEnvelope<M> = match result {
-                    Ok(env) => {
-                        trace!(event = "child_reader", step = "read_msg", correlation_id = env.correlation_id, "Read message envelope");
-                        env
+            result = reader.read_msg::<Control<M>>() => {
+                let control: Control<M> = match result {
+                    Ok(ctrl) => {
+                        trace!(event = "child_reader", step = "read_control", "Read control message");
+                        ctrl
                     },
                     Err(e) => {
                         trace!(event = "child_reader", step = "read_error", error = ?e, "Reader error");
                         break;
                     }
                 };
-                let correlation_id = envelope.correlation_id;
-                
-                tracing::debug!(event = "message_received", correlation_id = correlation_id, "Child received message");
-                
-                if let Err(e) = tx.send(envelope) {
-                    error!(event = "message_forward_failed", correlation_id, error = %e, "Failed to forward message to handler");
-                } else {
-                    trace!(event = "message_forwarded", correlation_id, "Message forwarded to handler");
+                    
+                match control {
+                    Control::Stream(envelope) => {
+                        let correlation_id = envelope.correlation_id;
+                        tracing::debug!(event = "message_received", correlation_id = correlation_id, "Child received stream message");
+                    
+                        if let Err(e) = tx.send(envelope) {
+                        error!(event = "message_forward_failed", correlation_id, error = %e, "Failed to forward message to handler");
+                    } else {
+                        trace!(event = "message_forwarded", correlation_id, "Message forwarded to handler");
+                    }
+                    },
+                    Control::Sync(envelope) => {
+                        let correlation_id = envelope.correlation_id;
+                        tracing::debug!(event = "message_received", correlation_id = correlation_id, "Child received sync message");
+                        
+                        if let Err(e) = tx.send(envelope) {
+                            error!(event = "message_forward_failed", correlation_id, error = %e, "Failed to forward message to handler");
+                        } else {
+                            trace!(event = "message_forwarded", correlation_id, "Message forwarded to handler");
+                        }
+                    },
+                    Control::StreamEnd(_) => {
+                        trace!(event = "child_reader", step = "stream_end", "Received stream end, ignoring");
+                    },
+                    Control::Handshake => {
+                        trace!(event = "child_reader", step = "handshake", "Received handshake, ignoring");
+                    }
                 }
             }
         }
@@ -1094,5 +1757,34 @@ where
     trace!(event = "child_reader", step = "exit", "Reader loop exiting");
     Ok(())
 }
+
+/// Message type for streaming requests
+pub struct StreamingRequest<M> {
+    pub inner: M,
+}
+
+impl<M> StreamingRequest<M> {
+    pub fn new(inner: M) -> Self {
+        Self { inner }
+    }
+}
+
+impl<M> kameo::message::Message<StreamingRequest<M>> for SubprocessIpcActor<M>
+where
+    M: KameoChildProcessMessage + Send + Sync + 'static,
+{
+    type Reply = Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError>;
+    fn handle(
+        &mut self,
+        msg: StreamingRequest<M>,
+        _ctx: &mut kameo::message::Context<Self, Self::Reply>,
+    ) -> impl std::future::Future<Output = Self::Reply> + Send {
+        let backend = self.backend.clone();
+        async move {
+            backend.send_stream(msg.inner).await
+        }
+    }
+}
+
 
 
