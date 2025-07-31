@@ -16,7 +16,8 @@ macro_rules! setup_python_subprocess_system {
                         use pyo3_async_runtimes::tokio::future_into_py;
                         use kameo_child_process::callback::{CallbackIpcChild, CallbackHandler};
                         use kameo_child_process::DuplexUnixStream;
-                        
+                        use kameo_snake_handler::telemetry::{build_subscriber_with_otel_and_fmt_async_with_config, TelemetryExportConfig};
+
                         // Inlined declare_callback_glue
                         static CALLBACK_HANDLE: once_cell::sync::OnceCell<kameo_child_process::callback::CallbackHandle<$callback>> = once_cell::sync::OnceCell::new();
                         #[allow(non_snake_case)]
@@ -94,6 +95,15 @@ macro_rules! setup_python_subprocess_system {
                             debug!(function = %config.function_name, "Located Python function");
                             let actor = kameo_snake_handler::PythonActor::<$msg, $callback>::new(config, function);
                             let async_block = async move {
+                                let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
+                                    TelemetryExportConfig {
+                                        otlp_enabled: true,
+                                        stdout_enabled: true,
+                                        metrics_enabled: true,
+                                    }
+                                ).await;
+                                tracing::subscriber::set_global_default(subscriber).expect("set global");
+                                tracing::info!("Child process telemetry initialized");
                                 let request_conn = match kameo_child_process::child_request().await {
                                     Ok(conn) => conn,
                                     Err(e) => {

@@ -729,7 +729,7 @@ where
         let ipc_message_span = tracing_utils::create_root_ipc_message_span(correlation_id, msg_type);
         
         // Create the ipc-parent-send span as a child of the ipc-message span
-        let send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
+        let _send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
         
         // Create a reply slot (now always streaming)
         let slot = ReplySlot::new();
@@ -791,7 +791,7 @@ where
         let ipc_message_span = tracing_utils::create_root_ipc_message_span(correlation_id, msg_type);
         
         // Create the ipc-parent-send span as a child of the ipc-message span
-        let send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
+        let _send_span = tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
         
         // Create a streaming reply slot
         let mut slot = ReplySlot::new_streaming();
@@ -819,6 +819,7 @@ where
             correlation_id, 
             control: Control::Stream(envelope) 
         };
+        tracing::debug!(event = "send_stream_request", correlation_id = correlation_id, control_type = "Stream", "Sending streaming request");
         if let Err(e) = self.write_tx.send(write_req) {
                 self.in_flight.0.remove(&correlation_id);
                 self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1013,6 +1014,7 @@ where
                             let ctrl: Control<M> = match bincode::decode_from_slice(&msg[..], bincode::config::standard()) {
                                 Ok((ctrl, _)) => {
                                     tracing::trace!(event = "bincode_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
+                                    tracing::debug!(event = "control_received", control_type = ?ctrl, "Received control message");
                                     ctrl
                                 },
                                 Err(e) => {

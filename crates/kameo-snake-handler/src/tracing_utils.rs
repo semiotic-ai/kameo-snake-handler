@@ -393,29 +393,29 @@ else:
     print("[DEBUG] Python OpenTelemetry SDK already initialized")
 
 # Always try to add OTLP exporter if endpoint is configured (even if provider already exists)
-otlp_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
+    otlp_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
 print(f"[DEBUG] OTEL_EXPORTER_OTLP_ENDPOINT: {otlp_endpoint}")
-if otlp_endpoint:
-    try:
+    if otlp_endpoint:
+        try:
         print("[DEBUG] Attempting to import OTLP exporter...")
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
         print("[DEBUG] OTLP exporter imported successfully")
-        otlp_exporter = OTLPSpanExporter(
-            endpoint=otlp_endpoint,
-            insecure=True
-        )
+            otlp_exporter = OTLPSpanExporter(
+                endpoint=otlp_endpoint,
+                insecure=True
+            )
         print(f"[DEBUG] OTLP exporter created with endpoint: {otlp_endpoint}")
         # Get the current provider (may have just been set above)
         provider = trace.get_tracer_provider()
         print(f"[DEBUG] Current provider: {provider}")
-        provider.add_span_processor(
-            BatchSpanProcessor(otlp_exporter)
-        )
-        print(f"[DEBUG] OTLP exporter configured with endpoint: {otlp_endpoint}")
+            provider.add_span_processor(
+                BatchSpanProcessor(otlp_exporter)
+            )
+            print(f"[DEBUG] OTLP exporter configured with endpoint: {otlp_endpoint}")
     except ImportError as e:
         print(f"[DEBUG] OTLP exporter not available, skipping: {e}")
-    except Exception as e:
-        print(f"[DEBUG] OTLP exporter configuration failed: {e}")
+        except Exception as e:
+            print(f"[DEBUG] OTLP exporter configuration failed: {e}")
 else:
     print("[DEBUG] No OTEL_EXPORTER_OTLP_ENDPOINT found, skipping OTLP exporter")
 
@@ -427,7 +427,7 @@ else:
                 tracing::debug!("Successfully executed Python OpenTelemetry SDK initialization");
             },
             Err(e) => {
-                tracing::error!("Failed to initialize Python OpenTelemetry SDK: {:?}", e);
+            tracing::error!("Failed to initialize Python OpenTelemetry SDK: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };

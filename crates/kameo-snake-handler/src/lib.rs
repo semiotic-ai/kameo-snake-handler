@@ -104,20 +104,6 @@ pub use crate::actor::PythonMessageHandler;
 pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
     pyo3::prepare_freethreaded_python();
     pyo3_async_runtimes::tokio::init(builder);
-       // Set up telemetry for child process in a background task
-       tokio::spawn(async {
-           use crate::telemetry::{build_subscriber_with_otel_and_fmt_async_with_config, TelemetryExportConfig};
-           let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
-               TelemetryExportConfig {
-                   otlp_enabled: true,
-                   stdout_enabled: true,
-                   metrics_enabled: true,
-               }
-           ).await;
-           tracing::subscriber::set_global_default(subscriber).expect("set global");
-           tracing::info!("Child process telemetry initialized");
-       });
-
 }
 
 pub mod prelude {
