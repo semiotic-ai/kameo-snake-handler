@@ -8,6 +8,7 @@ use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use opentelemetry::Context as OtelContext;
 use opentelemetry::propagation::TextMapPropagator;
+// Removed unused imports
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -367,8 +368,6 @@ provider_class = trace.get_tracer_provider().__class__.__name__
 if provider_class in ['NoOpTracerProvider', 'ProxyTracerProvider']:
     print("[DEBUG] Initializing Python OpenTelemetry SDK from Rust")
     
-
-    
     # Create a resource with Python-specific attributes (let environment handle service attributes)
     resource = Resource.create({
         "telemetry.sdk.language": "python",
@@ -393,29 +392,29 @@ else:
     print("[DEBUG] Python OpenTelemetry SDK already initialized")
 
 # Always try to add OTLP exporter if endpoint is configured (even if provider already exists)
-    otlp_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
+otlp_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
 print(f"[DEBUG] OTEL_EXPORTER_OTLP_ENDPOINT: {otlp_endpoint}")
-    if otlp_endpoint:
-        try:
+if otlp_endpoint:
+    try:
         print("[DEBUG] Attempting to import OTLP exporter...")
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
         print("[DEBUG] OTLP exporter imported successfully")
-            otlp_exporter = OTLPSpanExporter(
-                endpoint=otlp_endpoint,
-                insecure=True
-            )
+        otlp_exporter = OTLPSpanExporter(
+            endpoint=otlp_endpoint,
+            insecure=True
+        )
         print(f"[DEBUG] OTLP exporter created with endpoint: {otlp_endpoint}")
         # Get the current provider (may have just been set above)
         provider = trace.get_tracer_provider()
         print(f"[DEBUG] Current provider: {provider}")
-            provider.add_span_processor(
-                BatchSpanProcessor(otlp_exporter)
-            )
-            print(f"[DEBUG] OTLP exporter configured with endpoint: {otlp_endpoint}")
+        provider.add_span_processor(
+            BatchSpanProcessor(otlp_exporter)
+        )
+        print(f"[DEBUG] OTLP exporter configured with endpoint: {otlp_endpoint}")
     except ImportError as e:
         print(f"[DEBUG] OTLP exporter not available, skipping: {e}")
-        except Exception as e:
-            print(f"[DEBUG] OTLP exporter configuration failed: {e}")
+    except Exception as e:
+        print(f"[DEBUG] OTLP exporter configuration failed: {e}")
 else:
     print("[DEBUG] No OTEL_EXPORTER_OTLP_ENDPOINT found, skipping OTLP exporter")
 
@@ -439,13 +438,14 @@ else:
         // Debug: Check what's in the context before injection
         tracing::debug!("About to inject context: {:?}", context);
         
+        // Always try to inject context - propagator will handle empty contexts gracefully
         propagator.inject_context(context, &mut carrier);
         
         tracing::debug!("Extracted trace context to carrier: {:?}", carrier);
         
         // Debug: Check if carrier is empty
         if carrier.is_empty() {
-            tracing::error!("Carrier is empty! Context injection failed!");
+            tracing::debug!("Carrier is empty - no active span context to propagate");
         } else {
             tracing::debug!("Carrier has {} items", carrier.len());
             for (key, value) in &carrier {

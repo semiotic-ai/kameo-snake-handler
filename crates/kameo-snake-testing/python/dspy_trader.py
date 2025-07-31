@@ -23,7 +23,7 @@ mlflow.dspy.autolog(
     disable=False,
     silent=False
 )
-    print("[DEBUG] DSPy autologging configured with OTEL context")
+print("[DEBUG] DSPy autologging configured with OTEL context")
 
 logging.getLogger("mlflow").setLevel(logging.DEBUG)
 
@@ -119,14 +119,14 @@ async def handle_message(message):
     print(f"[DEBUG] handle_message ENTRY: thread={threading.get_ident()} message={message}")
     
     # Instantiate the trader agent
-            agent = TraderAgent()
+    agent = TraderAgent()
         
     # Process the message
-        result = await agent.forward(message)
+    result = await agent.forward(message)
         
     print(f"[DEBUG] handle_message EXIT: result={result}")
         
-        return result
+    return result
     
 
 

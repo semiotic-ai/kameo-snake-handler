@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::pin::Pin;
 use std::future::Future;
-use pyo3_async_runtimes::tokio::into_future;
 
 
 /// Configuration for Python subprocess execution.
@@ -348,6 +347,43 @@ where
         self.handle_child_message_impl(msg, Some(context)).await
     }
     
+    /// Handle a streaming message and return a stream of responses.
+    /// 
+    /// This method processes messages that should return multiple results over time.
+    /// It supports both synchronous and asynchronous Python functions:
+    /// 
+    /// ## Sync Functions
+    /// 
+    /// For synchronous Python functions (`is_async = false`), the function is called
+    /// once and its result is wrapped in a single-item stream for protocol consistency.
+    /// 
+    /// ## Async Functions (Streaming)
+    /// 
+    /// For asynchronous Python functions (`is_async = true`), the function is expected
+    /// to be an async generator that yields multiple values. The function is called
+    /// and its async generator is consumed using the `PythonAsyncGeneratorStream`.
+    /// 
+    /// ## Python Async Generator Protocol
+    /// 
+    /// The Python function should implement the async generator protocol:
+    /// - Return an object with `__aiter__()` method
+    /// - `__aiter__()` should return an async iterator
+    /// - `__anext__()` should yield values or raise `StopAsyncIteration`
+    /// 
+    /// ## Error Handling
+    /// 
+    /// - Python exceptions are converted to `PythonExecutionError`
+    /// - `StopAsyncIteration` is handled gracefully for stream completion
+    /// - GIL-related errors are prevented through proper lock management
+    /// 
+    /// ## Example Python Function
+    /// 
+    /// ```python
+    /// async def handle_message_streaming(message):
+    ///     for i in range(10):
+    ///         yield {"index": i, "value": i * 2}
+    ///         await asyncio.sleep(0.1)
+    /// ```
     async fn handle_child_message_stream(&mut self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
         tracing::debug!(event = "handle_child_message_stream", function = %self.config.function_name, is_async = %self.config.is_async, "handle_child_message_stream called");
         
@@ -366,7 +402,32 @@ where
     }
 }
 
-/// Custom stream struct for handling Python async generators with proper GIL management
+/// Custom stream struct for handling Python async generators with proper GIL management.
+/// 
+/// This struct implements Rust's `Stream` trait to consume Python async generators.
+/// It manages the Python Global Interpreter Lock (GIL) correctly and handles the
+/// async generator lifecycle including creation, iteration, and cleanup.
+/// 
+/// ## State Machine
+/// 
+/// The stream uses a state machine to manage the async generator lifecycle:
+/// - `Initial`: Starting state, need to create the generator
+/// - `CreatingGenerator`: Async future for creating the generator
+/// - `Generator`: Generator created, have the async iterator ready
+/// - `GettingNext`: Async future for getting the next item
+/// - `Exhausted`: Generator has been fully consumed
+/// 
+/// ## GIL Management
+/// 
+/// All Python operations are wrapped in `Python::with_gil()` calls to ensure
+/// proper GIL acquisition and release. This prevents deadlocks and ensures
+/// thread safety when working with Python objects from Rust async contexts.
+/// 
+/// ## Error Handling
+/// 
+/// The stream properly handles Python exceptions including `StopAsyncIteration`
+/// for normal stream completion and other exceptions for error conditions.
+/// All errors are converted to `PythonExecutionError` for consistent error handling.
 struct PythonAsyncGeneratorStream<M>
 where
     M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
@@ -376,6 +437,11 @@ where
     state: PythonAsyncGeneratorState<M>,
 }
 
+/// State machine for managing Python async generator lifecycle.
+/// 
+/// This enum tracks the current state of the async generator stream,
+/// allowing the `Stream::poll_next` method to handle different phases
+/// of the generator's lifecycle correctly.
 enum PythonAsyncGeneratorState<M>
 where
     M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
@@ -433,6 +499,37 @@ where
 {
     type Item = Result<M::Ok, PythonExecutionError>;
 
+    /// Poll the stream for the next item from the Python async generator.
+    /// 
+    /// This method implements the core streaming logic using a state machine approach.
+    /// It handles the transition between different states of the async generator lifecycle
+    /// and ensures proper GIL management throughout the process.
+    /// 
+    /// ## State Transitions
+    /// 
+    /// 1. **Initial → CreatingGenerator**: Start creating the Python async generator
+    /// 2. **CreatingGenerator → Generator**: Generator created, ready to iterate
+    /// 3. **Generator → GettingNext**: Start getting the next item
+    /// 4. **GettingNext → Generator**: Item received, ready for next iteration
+    /// 5. **GettingNext → Exhausted**: Stream completed (StopAsyncIteration)
+    /// 
+    /// ## GIL Safety
+    /// 
+    /// All Python operations are wrapped in `Python::with_gil()` calls to ensure
+    /// thread safety and prevent deadlocks. The GIL is acquired only when needed
+    /// and released immediately after use.
+    /// 
+    /// ## Error Handling
+    /// 
+    /// - `StopAsyncIteration`: Normal stream completion, returns `None`
+    /// - Other Python exceptions: Converted to `PythonExecutionError`
+    /// - GIL errors: Prevented through proper lock management
+    /// 
+    /// ## Performance Considerations
+    /// 
+    /// - Uses `Pin<Box<dyn Future>>` for async operations within sync `poll_next`
+    /// - Clones `Py<PyAny>` objects only when necessary
+    /// - Minimizes GIL acquisition time
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
