@@ -433,7 +433,7 @@ where
     M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
 {
     handler: PythonMessageHandler,
-    msg: M,
+    msg: Option<M>,
     state: PythonAsyncGeneratorState<M>,
 }
 
@@ -487,7 +487,7 @@ where
     async fn new(handler: PythonMessageHandler, msg: M) -> Result<Self, PythonExecutionError> {
         Ok(Self {
             handler,
-            msg,
+            msg: Some(msg),
             state: PythonAsyncGeneratorState::Initial,
         })
     }
@@ -544,7 +544,7 @@ where
                 tracing::debug!(event = "stream_initial_state", "Starting to create generator");
                 // Start creating the generator
                 let handler = self.handler.clone();
-                let msg = std::mem::replace(&mut self.msg, unsafe { std::mem::zeroed() });
+                let msg = self.msg.take().expect("Message should be available in Initial state");
                 
                 let fut = async move {
                     let function_name = handler.config.function_name.clone();

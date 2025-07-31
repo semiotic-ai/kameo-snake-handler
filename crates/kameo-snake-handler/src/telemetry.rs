@@ -25,13 +25,17 @@ impl Drop for OtelGuard {
     fn drop(&mut self) {
         // Ensure all spans are exported on shutdown
         if let Err(e) = self.tracer_provider.shutdown() {
-            eprintln!("Failed to shut down tracer provider: {:?}", e);
+            tracing::warn!("Failed to shut down tracer provider: {:?}", e);
         }
         
         // Ensure all metrics are exported on shutdown
         if let Some(meter_provider) = self.meter_provider.take() {
+            // Add a small delay to allow pending metrics to be exported
+            std::thread::sleep(Duration::from_millis(100));
+            
             if let Err(e) = meter_provider.shutdown() {
-                eprintln!("Failed to shut down meter provider: {:?}", e);
+                // Only log as warning since this is often expected during process shutdown
+                tracing::warn!("Failed to shut down meter provider: {:?}", e);
             }
         }
     }
@@ -185,14 +189,19 @@ fn setup_metrics() -> SdkMeterProvider {
     tracing::info!("Initializing OpenTelemetry metrics with OTLP exporter");
     
     // Create a metrics exporter - this will automatically use OTEL_* environment variables
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
+    let exporter = match opentelemetry_otlp::MetricExporter::builder()
         .with_tonic() // Default to gRPC, environment variables will override if needed
         .build()
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to create OTLP metrics exporter");
-            e
-        })
-        .expect("Failed to create OTLP metrics exporter");
+    {
+        Ok(exporter) => exporter,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to create OTLP metrics exporter, using basic provider");
+            // Return a basic provider without reader if OTLP setup fails
+            return opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_resource(Resource::builder().build())
+                .build();
+        }
+    };
     
     // Create a periodic reader with the exporter
     let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
@@ -217,7 +226,7 @@ fn setup_metrics() -> SdkMeterProvider {
     
     // Install the recorder
     if let Err(err) = metrics::set_global_recorder(recorder) {
-        tracing::error!(error = %err, "Failed to install metrics-exporter-opentelemetry recorder");
+        tracing::warn!(error = %err, "Failed to install metrics-exporter-opentelemetry recorder");
     } else {
         tracing::info!("OTLP metrics exporter and metrics-opentelemetry bridge configured");
     }
