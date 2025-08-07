@@ -89,9 +89,21 @@ macro_rules! setup_python_subprocess_system {
                                 debug!(added_path = %path, "Appended to sys.path");
                             }
                             // import module and function
-                            let module = py.import(&config.module_name).expect("import module");
+                            let module = match py.import(&config.module_name) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    error!(error = %e, module = %config.module_name, "Failed to import Python module - this will cause parent actor to exit");
+                                    return Err(pyo3::exceptions::PyImportError::new_err(format!("Failed to import module '{}': {}", config.module_name, e)));
+                                }
+                            };
                             debug!(module = %config.module_name, "Imported Python module");
-                            let function: Py<PyAny> = module.getattr(&config.function_name).expect("getattr function").unbind();
+                            let function: Py<PyAny> = match module.getattr(&config.function_name) {
+                                Ok(f) => f.unbind(),
+                                Err(e) => {
+                                    error!(error = %e, function = %config.function_name, module = %config.module_name, "Failed to get function from Python module - this will cause parent actor to exit");
+                                    return Err(pyo3::exceptions::PyAttributeError::new_err(format!("Failed to get function '{}' from module '{}': {}", config.function_name, config.module_name, e)));
+                                }
+                            };
                             debug!(function = %config.function_name, "Located Python function");
                             let actor = kameo_snake_handler::PythonActor::<$msg, $callback>::new(config, function);
                             let async_block = async move {

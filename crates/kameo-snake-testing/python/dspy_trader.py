@@ -13,17 +13,17 @@ mlflow.set_experiment("dspy-otel-integration")
 # Defer DSPy autologging setup until after OTEL context is established
 # This will be called from the handle_message function
 def setup_dspy_autologging():
-# Enable MLflow DSPy autologging with OTEL
-mlflow.dspy.autolog(
-    log_traces=True,
-    log_traces_from_compile=False,
-    log_traces_from_eval=True,
-    log_compiles=False,
-    log_evals=False,
-    disable=False,
-    silent=False
-)
-print("[DEBUG] DSPy autologging configured with OTEL context")
+    # Enable MLflow DSPy autologging with OTEL
+    mlflow.dspy.autolog(
+        log_traces=True,
+        log_traces_from_compile=False,
+        log_traces_from_eval=True,
+        log_compiles=False,
+        log_evals=False,
+        disable=False,
+        silent=False
+    )
+    print("[DEBUG] DSPy autologging configured with OTEL context")
 
 logging.getLogger("mlflow").setLevel(logging.DEBUG)
 
@@ -51,15 +51,15 @@ import dspy
 
 # Async order item tool for TraderMessage
 async def order_item_tool(item: str, currency: int) -> str:
-        import kameo
-        print(f"[DEBUG] order_item TOOL called with item={item}, currency={currency}")
-        
+    import kameo
+    print(f"[DEBUG] order_item TOOL called with item={item}, currency={currency}")
+    
     # Set callback attributes on the tool span
-            callback_result = await kameo.callback_handle({"value": currency})
-            print(f"[DEBUG] order_item TOOL got callback_result={callback_result}")
-        
-        result = f"Order for {item} ({currency} units) complete: callback returned {callback_result}"
-        return result
+    callback_result = await kameo.callback_handle({"value": currency})
+    print(f"[DEBUG] order_item TOOL got callback_result={callback_result}")
+    
+    result = f"Order for {item} ({currency} units) complete: callback returned {callback_result}"
+    return result
 
 order_item = dspy.Tool(order_item_tool)
 
