@@ -17,9 +17,10 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::env;
 use std::fmt::Write as _;
-use futures::stream::StreamExt;
+use futures::stream::{StreamExt, Stream};
+use std::pin::Pin;
 use kameo_child_process::error::PythonExecutionError;
-use kameo_child_process::callback::{CallbackHandler};
+use kameo_child_process::callback::CallbackStreamHandler;
 use pyo3::pyfunction;
 
 
@@ -140,42 +141,127 @@ pub struct TestCallbackMessage {
 #[derive(Clone)]
 pub struct TestCallbackHandler;
 
+
+
+
 #[async_trait::async_trait]
-impl CallbackHandler<TestCallbackMessage> for TestCallbackHandler {
-    async fn handle(&self, callback: TestCallbackMessage) -> Result<(), PythonExecutionError> {
+impl CallbackStreamHandler<TestCallbackMessage> for TestCallbackHandler {
+    type Response = TestResponse;
+    
+    async fn handle_stream(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
         tracing::info!(event = "test_callback", value = callback.value, "TestCallbackHandler received callback");
-        Ok(())
+        let response = TestResponse::CallbackRoundtripResult { value: callback.value + 1 };
+        Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
 }
 
+
 #[async_trait::async_trait]
-impl CallbackHandler<TraderCallbackMessage> for TestCallbackHandler {
-    async fn handle(&self, callback: TraderCallbackMessage) -> Result<(), PythonExecutionError> {
+impl CallbackStreamHandler<TraderCallbackMessage> for TestCallbackHandler {
+    type Response = TraderResponse;
+    
+    async fn handle_stream(&self, callback: TraderCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
         tracing::info!(event = "trader_callback", value = callback.value, "TestCallbackHandler received trader callback");
-        Ok(())
+        let response = TraderResponse::OrderResult { result: format!("Order processed with value {}", callback.value) };
+        Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
 }
 
+
 #[async_trait::async_trait]
-impl CallbackHandler<BenchCallback> for TestCallbackHandler {
-    async fn handle(&self, callback: BenchCallback) -> Result<(), PythonExecutionError> {
+impl CallbackStreamHandler<BenchCallback> for TestCallbackHandler {
+    type Response = BenchResponse;
+    
+    async fn handle_stream(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
         tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "TestCallbackHandler received bench callback");
-        Ok(())
+        if callback.rust_sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms));
+        }
+        let response = BenchResponse::CallbackRoundtripResult { value: callback.id as u32 };
+        Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
 }
+
 
 #[derive(Clone)]
 struct CountingCallbackHandler {
     counter: Arc<AtomicUsize>,
 }
+
 #[async_trait::async_trait]
-impl CallbackHandler<BenchCallback> for CountingCallbackHandler {
-    async fn handle(&self, callback: BenchCallback) -> Result<(), PythonExecutionError> {
-        self.counter.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "CountingCallbackHandler received bench callback");
-        tokio::time::sleep(Duration::from_millis(callback.rust_sleep_ms)).await;
-        Ok(())
+impl CallbackStreamHandler<BenchCallback> for CountingCallbackHandler {
+    type Response = BenchResponse;
+    
+    async fn handle_stream(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
+        let counter = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        tracing::info!(event = "counting_bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, counter, "CountingCallbackHandler received bench callback");
+        if callback.rust_sleep_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms));
+        }
+        let response = BenchResponse::CallbackRoundtripResult { value: callback.id as u32 * counter as u32 };
+        Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
+}
+
+
+/// Streaming callback handler that generates multiple responses
+#[derive(Clone)]
+pub struct StreamingCallbackHandler;
+
+#[async_trait::async_trait]
+impl CallbackStreamHandler<TestCallbackMessage> for StreamingCallbackHandler {
+    type Response = TestResponse;
+    
+    async fn handle_stream(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
+        tracing::info!(event = "streaming_callback", value = callback.value, "🌊 StreamingCallbackHandler starting stream with {} items", callback.value);
+        
+        // Generate a stream of TestResponse objects based on the callback value
+        let count = callback.value.max(1).min(10); // Limit to reasonable range
+        let stream = stream::iter(0..count)
+            .map(move |i| {
+                let response_value = callback.value + i + 1; // Generate meaningful response data
+                let response = TestResponse::CallbackRoundtripResult { value: response_value };
+                tracing::info!(event = "streaming_callback", value = callback.value, item = i, response_value, "📤 StreamingCallbackHandler sending stream item {}/{} with response: {:?}", i + 1, count, response);
+                Ok(response)
+            });
+        
+        Ok(Box::pin(stream))
+    }
+}
+
+
+async fn run_streaming_callback_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    info!("🧪 ==== STREAMING CALLBACK TEST ====");
+    
+    let config = PythonConfig {
+        python_path: python_path.clone(),
+        module_name: "streaming_callback_test".to_string(),
+        function_name: "handle_message_async".to_string(),
+        env_vars: vec![],
+        is_async: true,
+        enable_otel_propagation: false,
+    };
+    
+    let pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(config)
+        .with_callback_handler(StreamingCallbackHandler)
+        .spawn_pool(1, None)
+        .await?;
+    
+    let actor = pool.get_actor();
+    
+    // Test callback with value=5, should generate 5 stream items
+    info!("🔄 Testing callback with value=5 (should generate 5 stream items)");
+    let response = actor.ask(TestMessage::CallbackRoundtrip { value: 5 }).await?;
+    info!("✅ Streaming callback test completed: {:?}", response);
+    
+    pool.shutdown().await;
+    info!("🏁 Streaming callback test finished");
+    Ok(())
 }
 
 // --- DSPy Trader Demo Types ---
@@ -1096,9 +1182,9 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
 
 
 kameo_snake_handler::setup_python_subprocess_system! {
-        actor = (TestMessage, TestCallbackMessage),
-        actor = (TraderMessage, TraderCallbackMessage),
-        actor = (BenchMessage, BenchCallback),
+        actor = (TestMessage, TestCallbackMessage, TestResponse),
+        actor = (TraderMessage, TraderCallbackMessage, TraderResponse),
+        actor = (BenchMessage, BenchCallback, BenchResponse),
         child_init = {{
             kameo_child_process::RuntimeConfig {
                 flavor: kameo_child_process::RuntimeFlavor::MultiThread,
@@ -1125,8 +1211,9 @@ kameo_snake_handler::setup_python_subprocess_system! {
             let run_streaming = run_all || args.iter().any(|a| a == "streaming");
             let run_streaming_throughput = run_all || args.iter().any(|a| a == "streaming-throughput");
             let run_streaming_errors = run_all || args.iter().any(|a| a == "streaming-errors");
+            let run_streaming_callbacks = run_all || args.iter().any(|a| a == "streaming-callbacks");
             if args.iter().any(|a| a == "--help" || a == "-h") {
-                println!("Usage: kameo-snake-testing [sync] [async] [trader] [bench] [module] [streaming] [streaming-throughput] [streaming-errors]");
+                println!("Usage: kameo-snake-testing [sync] [async] [trader] [bench] [module] [streaming] [streaming-throughput] [streaming-errors] [streaming-callbacks]");
                 println!("  If no args, runs all tests.");
                 return Ok(());
             }
@@ -1175,6 +1262,9 @@ kameo_snake_handler::setup_python_subprocess_system! {
                 }
                 if run_streaming_errors {
                     run_streaming_error_handling_test(python_path_vec.clone()).await?;
+                }
+                if run_streaming_callbacks {
+                    run_streaming_callback_test(python_path_vec.clone()).await?;
                 }
                 Ok::<(), Box<dyn std::error::Error>>(())
             })?

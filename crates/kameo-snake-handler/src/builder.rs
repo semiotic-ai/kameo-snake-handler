@@ -1,7 +1,7 @@
 use kameo_child_process::KameoChildProcessMessage;
 use tracing::Level;
 use tracing_futures::Instrument;
-use kameo_child_process::callback::{NoopCallbackHandler, CallbackHandler};
+use kameo_child_process::callback::{NoopCallbackHandler, CallbackStreamHandler};
 use std::time::Duration;
 
 /// Builder for a Python child process
@@ -130,7 +130,7 @@ where
         + Sync
         + 'static,
     C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
-    H: CallbackHandler<C> + Clone + Send + Sync + 'static,
+    H: CallbackStreamHandler<C> + Clone + Send + Sync + 'static,
 {
     /// Python configuration for subprocess setup
     python_config: crate::PythonConfig,
@@ -191,12 +191,12 @@ where
         + Sync
         + 'static,
     C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
-    H: CallbackHandler<C> + Clone + Send + Sync + 'static,
+    H: CallbackStreamHandler<C> + Clone + Send + Sync + 'static,
 {
     /// Sets the callback handler.
     pub fn with_callback_handler<T>(self, handler: T) -> PythonChildProcessBuilder<M, C, T>
     where
-        T: CallbackHandler<C> + Clone + Send + Sync + 'static,
+        T: CallbackStreamHandler<C> + Clone + Send + Sync + 'static,
     {
         PythonChildProcessBuilder {
             python_config: self.python_config,

@@ -23,6 +23,15 @@ use crate::framing::{LengthPrefixedRead, LengthPrefixedWrite};
 use crate::InFlightMap;
 use crate::ReplySlot;
 
+/// Control messages for streaming callbacks
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub enum CallbackControl {
+    /// A stream item with bincode-serialized data
+    StreamItem(Result<Vec<u8>, PythonExecutionError>),
+    /// Signal that the stream is complete
+    StreamComplete,
+}
+
 #[derive(Debug, Error)]
 pub enum CallbackError {
     #[error("IPC error: {0}")]
@@ -42,10 +51,39 @@ pub struct CallbackEnvelope<T> {
     pub context: TracingContext,
 }
 
+use futures::stream::Stream;
+use std::pin::Pin;
+
+/// Streaming callback handler trait - handles callbacks and returns a stream of responses
+/// This trait is implemented by handlers that know their specific response type
 #[async_trait]
-pub trait CallbackHandler<C>: Send + Sync + 'static {
-    async fn handle(&self, callback: C) -> Result<(), PythonExecutionError>;
+pub trait CallbackStreamHandler<C>: Send + Sync + 'static {
+    type Response: bincode::Encode + Send + 'static;
+    async fn handle_stream(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError>;
 }
+
+/// Helper function to serialize a stream of responses to bincode bytes
+pub fn serialize_response_stream<R, S>(stream: S) -> impl Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send
+where
+    R: bincode::Encode + Send + 'static,
+    S: Stream<Item = Result<R, PythonExecutionError>> + Send,
+{
+    futures::StreamExt::map(stream, |result| {
+        match result {
+            Ok(response) => {
+                match bincode::encode_to_vec(&response, bincode::config::standard()) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(PythonExecutionError::ExecutionError { 
+                        message: format!("Failed to serialize response: {e}")
+                    }),
+                }
+            },
+            Err(e) => Err(e),
+        }
+    })
+}
+
+
 
 #[derive(Clone)]
 pub struct NoopCallbackHandler<C>(std::marker::PhantomData<C>);
@@ -56,15 +94,19 @@ impl<C> Default for NoopCallbackHandler<C> {
     }
 }
 
+
 #[async_trait]
-impl<C> CallbackHandler<C> for NoopCallbackHandler<C>
+impl<C> CallbackStreamHandler<C> for NoopCallbackHandler<C>
 where
     C: Send + Sync + 'static,
 {
-    async fn handle(&self, _callback: C) -> Result<(), PythonExecutionError> {
+    type Response = ();
+    
+    async fn handle_stream(&self, _callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         panic!("NoopCallbackHandler called; implement your own handler if you need a real reply");
     }
 }
+
 
 /// Child-side message pump: forwards callback messages to the parent process over a channel.
 /// Use this as the callback handler in the child process.
@@ -78,25 +120,30 @@ impl<C> CallbackForwarder<C> {
     }
 }
 
+
 #[async_trait]
-impl<C> CallbackHandler<C> for CallbackForwarder<C>
+impl<C> CallbackStreamHandler<C> for CallbackForwarder<C>
 where
     C: Send + Sync + 'static,
 {
-    async fn handle(&self, callback: C) -> Result<(), PythonExecutionError> {
-        self.sender.send(callback).map_err(|_| PythonExecutionError::ExecutionError {
+    type Response = ();
+    
+    async fn handle_stream(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
+        let result = self.sender.send(callback).map_err(|_| PythonExecutionError::ExecutionError {
             message: "Failed to forward callback to parent (channel closed)".to_string(),
-        })
+        });
+        Ok(Box::pin(stream::once(async move { result })))
     }
 }
 
-pub type CallbackHandle<C> = std::sync::Arc<dyn CallbackHandler<C>>;
+pub type CallbackHandle<C> = std::sync::Arc<CallbackIpcChild<C>>;
 
 /// Multiplexed callback protocol artefact for child processes.
 /// Owns the callback socket, maintains in-flight map, and implements `CallbackHandler<C>`.
 /// This is the only production callback handler for child processes.
 pub struct CallbackIpcChild<C> {
-    pub in_flight: InFlightMap<Result<(), PythonExecutionError>>,
+    pub in_flight: InFlightMap<Vec<u8>>,
     write_tx: tokio::sync::mpsc::UnboundedSender<CallbackWriteRequest<C>>,
     next_id: std::sync::atomic::AtomicU64,
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -160,28 +207,42 @@ where
             loop {
                 tokio::select! {
                     _ = cancellation_token_reader.cancelled() => break,
-                    result = reader.read_msg::<CallbackEnvelope<Result<(), PythonExecutionError>>>() => {
+                    result = reader.read_msg::<CallbackEnvelope<CallbackControl>>() => {
                         match result {
                             Ok(env) => {
                                 let correlation_id = env.correlation_id;
-                                // Extract the entry from in_flight map to avoid race conditions
-                                if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
-                                    // Track that we're processing one less in-flight request
-                                    result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                                    
-                                    // Extract the sender so we can drop the slot immediately
-                                    if let Some(sender) = &slot.stream_sender {
-                                        // Send the response directly to the waiting task
-                                        if sender.send(Ok(env.inner)).is_err() {
-                                            tracing::error!(event = "callback_ipc_child_read", correlation_id, "Failed to send reply, receiver dropped");
+                                match env.inner {
+                                    CallbackControl::StreamItem(item) => {
+                                        // Handle stream item - keep correlation ID alive
+                                        if let Some(slot) = in_flight_reader.0.get(&correlation_id) {
+                                            if let Some(sender) = &slot.stream_sender {
+                                                // Send the stream item to the waiting task
+                                                if sender.send(item).is_err() {
+                                                    tracing::error!(event = "callback_ipc_child_read", correlation_id, "Failed to send stream item, receiver dropped");
+                                                    // Remove the correlation ID since receiver is gone
+                                                    in_flight_reader.0.remove(&correlation_id);
+                                                    result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                                }
+                                            } else {
+                                                tracing::error!(event = "callback_ipc_child_read", correlation_id, "Stream item received but sender missing");
+                                            }
+                                        } else {
+                                            tracing::error!(event = "callback_ipc_child_read", correlation_id, "Received stream item for unknown correlation id");
                                         }
-                                        // Close the stream after sending
-                                        slot.close_stream();
-                                    } else {
-                                        tracing::error!(event = "callback_ipc_child_read", correlation_id, "Reply slot sender missing");
+                                    },
+                                    CallbackControl::StreamComplete => {
+                                        // Handle stream completion - remove correlation ID and close stream
+                                        if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
+                                            // Track that we're processing one less in-flight request
+                                            result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                            
+                                            // Close the stream to signal completion
+                                            slot.close_stream();
+                                            tracing::debug!(event = "callback_ipc_child_read", correlation_id, "Stream completed");
+                                        } else {
+                                            tracing::error!(event = "callback_ipc_child_read", correlation_id, "Received stream completion for unknown correlation id");
+                                        }
                                     }
-                                } else {
-                                    tracing::error!(event = "callback_ipc_child_read", correlation_id, "Received reply for unknown correlation id");
                                 }
                             }
                             Err(e) => {
@@ -226,14 +287,9 @@ where
     pub fn pending_count(&self) -> usize {
         self.pending_count.load(std::sync::atomic::Ordering::SeqCst)
     }
-}
-
-#[async_trait]
-impl<C> CallbackHandler<C> for CallbackIpcChild<C>
-where
-    C: Send + Sync + Encode + Decode<()> + 'static,
-{
-    async fn handle(&self, callback: C) -> Result<(), PythonExecutionError> {
+    
+    /// Handle a callback and return a stream of bincode bytes
+    pub async fn handle_stream_bincode(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError> {
         let correlation_id = self.next_correlation_id();
         
         let envelope = CallbackEnvelope {
@@ -243,7 +299,7 @@ where
         };
         
         // Create the reply slot BEFORE sending the message to prevent race conditions
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<u8>, PythonExecutionError>>();
         
         // Create tracker to automatically track metrics for this operation
         let _metrics_tracker = crate::metrics::OperationTracker::track_callback();
@@ -252,7 +308,7 @@ where
         {
             let mut slot = ReplySlot::new();
             slot.stream_sender = Some(tx);
-            slot.stream_receiver = None; // We'll keep the receiver separately
+            slot.stream_receiver = None; // We'll return the receiver
             self.in_flight.0.insert(correlation_id, slot);
             
             // Track that we now have one more in-flight request
@@ -284,22 +340,19 @@ where
             });
         }
         
-        // Wait for the response
-        match rx.recv().await {
-            Some(Ok(Ok(()))) => Ok(()),
-            Some(Ok(Err(e))) => Err(e),
-            Some(Err(e)) => Err(e),
-            None => Err(PythonExecutionError::ExecutionError { 
-                message: "Callback channel closed without response".to_string() 
-            }),
-        }
+        // Convert the receiver into a stream
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        let stream = UnboundedReceiverStream::new(rx);
+        Ok(Box::pin(stream))
     }
 }
+
+
 
 pub struct CallbackReceiver<M, H>
 where
     M: Send + Sync + Decode<()> + 'static,
-    H: CallbackHandler<M> + Clone + Send + Sync + 'static,
+    H: CallbackStreamHandler<M> + Clone + Send + Sync + 'static,
 {
     read_half: tokio::net::unix::OwnedReadHalf,
     write_half: Option<tokio::net::unix::OwnedWriteHalf>,
@@ -311,7 +364,7 @@ where
 impl<M, H> CallbackReceiver<M, H>
 where
     M: Send + Sync + Decode<()> + 'static,
-    H: CallbackHandler<M> + Clone + Send + Sync + 'static,
+    H: CallbackStreamHandler<M> + Clone + Send + Sync + 'static,
 {
     pub fn from_duplex(duplex: crate::DuplexUnixStream, handler: H) -> Self {
         let (read_half, write_half) = duplex.into_inner().into_split();
@@ -339,7 +392,7 @@ where
         crate::metrics::init_metrics();
         
         let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<M>>();
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<Result<(), PythonExecutionError>>>();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<CallbackControl>>();
         let reply_tx = Arc::new(reply_tx);
         let cancellation_token_reader = cancellation_token.clone();
         
@@ -449,20 +502,81 @@ where
                                     // Create a metrics tracker for this handler operation
                                     let _metrics_tracker = crate::metrics::OperationTracker::track_callback();
                                     
-                                    // Handle the callback without creating a span
-                                    let result = handler.handle(msg).await;
-                                    
-                                    let reply_envelope = CallbackEnvelope {
-                                        correlation_id,
-                                        inner: result,
-                                        context: envelope.context,
-                                    };
-                                    if let Err(e) = reply_tx.send(reply_envelope) {
-                                        tracing::error!(event = "callback_receiver", task = "handler_task", step = "send_error", 
-                                            correlation_id, error = ?e, "Failed to send reply envelope");
-                                        
-                                        // Track error in metrics
-                                        crate::metrics::MetricsHandle::callback().track_error("reply_send_failed");
+                                    // Handle the streaming callback and serialize to bincode
+                                    match handler.handle_stream(msg).await {
+                                        Ok(mut stream) => {
+                                            // Process each item in the stream, serializing to bincode
+                                            while let Some(result) = stream.next().await {
+                                                let bincode_result = match result {
+                                                    Ok(response) => {
+                                                        match bincode::encode_to_vec(&response, bincode::config::standard()) {
+                                                            Ok(bytes) => Ok(bytes),
+                                                            Err(e) => Err(PythonExecutionError::ExecutionError { 
+                                                                message: format!("Failed to serialize response: {e}")
+                                                            }),
+                                                        }
+                                                    },
+                                                    Err(e) => Err(e),
+                                                };
+                                                
+                                                let reply_envelope = CallbackEnvelope {
+                                                    correlation_id,
+                                                    inner: CallbackControl::StreamItem(bincode_result),
+                                                    context: envelope.context.clone(),
+                                                };
+                                                if let Err(e) = reply_tx.send(reply_envelope) {
+                                                    tracing::error!(event = "callback_receiver", task = "handler_task", step = "send_error", 
+                                                        correlation_id, error = ?e, "Failed to send reply envelope");
+                                                    
+                                                    // Track error in metrics
+                                                    crate::metrics::MetricsHandle::callback().track_error("reply_send_failed");
+                                                    break; // Stop processing on send error
+                                                }
+                                            }
+                                            
+                                            // Send stream completion signal
+                                            let completion_envelope = CallbackEnvelope {
+                                                correlation_id,
+                                                inner: CallbackControl::StreamComplete,
+                                                context: envelope.context.clone(),
+                                            };
+                                            if let Err(e) = reply_tx.send(completion_envelope) {
+                                                tracing::error!(event = "callback_receiver", task = "handler_task", step = "completion_send_error", 
+                                                    correlation_id, error = ?e, "Failed to send stream completion signal");
+                                                
+                                                // Track error in metrics
+                                                crate::metrics::MetricsHandle::callback().track_error("completion_send_failed");
+                                            }
+                                        },
+                                        Err(e) => {
+                                            // Send the error as a single stream item followed by completion
+                                            let reply_envelope = CallbackEnvelope {
+                                                correlation_id,
+                                                inner: CallbackControl::StreamItem(Err(e)),
+                                                context: envelope.context.clone(),
+                                            };
+                                            if let Err(send_err) = reply_tx.send(reply_envelope) {
+                                                tracing::error!(event = "callback_receiver", task = "handler_task", step = "error_send_error", 
+                                                    correlation_id, error = ?send_err, "Failed to send error reply envelope");
+                                                
+                                                // Track error in metrics
+                                                crate::metrics::MetricsHandle::callback().track_error("error_reply_send_failed");
+                                            } else {
+                                                // Send completion signal even after error
+                                                let completion_envelope = CallbackEnvelope {
+                                                    correlation_id,
+                                                    inner: CallbackControl::StreamComplete,
+                                                    context: envelope.context,
+                                                };
+                                                if let Err(e) = reply_tx.send(completion_envelope) {
+                                                    tracing::error!(event = "callback_receiver", task = "handler_task", step = "error_completion_send_error", 
+                                                        correlation_id, error = ?e, "Failed to send error completion signal");
+                                                    
+                                                    // Track error in metrics
+                                                    crate::metrics::MetricsHandle::callback().track_error("error_completion_send_failed");
+                                                }
+                                            }
+                                        }
                                     }
                                 }));
                             },

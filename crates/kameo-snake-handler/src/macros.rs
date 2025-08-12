@@ -1,7 +1,7 @@
 #[macro_export]
 macro_rules! setup_python_subprocess_system {
     (
-        $(actor = ($msg:ty, $callback:ty)),* ,
+        $(actor = ($msg:ty, $callback:ty, $callback_response:ty)),* ,
         child_init = $child_init:block,
         parent_init = $parent_init:block
     ) => {
@@ -11,12 +11,13 @@ macro_rules! setup_python_subprocess_system {
                     std::any::type_name::<kameo_snake_handler::PythonActor<$msg, $callback>>(),
                     || {
                         use tracing::{info, debug, error, instrument};
-                        use std::sync::Arc;
                         use pyo3::prelude::*;
                         use pyo3_async_runtimes::tokio::future_into_py;
-                        use kameo_child_process::callback::{CallbackIpcChild, CallbackHandler};
+                        use kameo_child_process::callback::{CallbackIpcChild, CallbackStreamHandler};
                         use kameo_child_process::DuplexUnixStream;
                         use kameo_snake_handler::telemetry::{build_subscriber_with_otel_and_fmt_async_with_config, TelemetryExportConfig};
+                        use std::sync::Arc;
+                        use tokio::sync::Mutex;
 
                         // Inlined declare_callback_glue
                         static CALLBACK_HANDLE: once_cell::sync::OnceCell<kameo_child_process::callback::CallbackHandle<$callback>> = once_cell::sync::OnceCell::new();
@@ -24,18 +25,107 @@ macro_rules! setup_python_subprocess_system {
                         fn set_callback_handle_glue(handle: kameo_child_process::callback::CallbackHandle<$callback>) {
                             let _ = CALLBACK_HANDLE.set(handle);
                         }
+                        
+                        #[pyo3::pyclass]
+                        struct CallbackAsyncIterator {
+                            stream: Arc<Mutex<Option<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, kameo_child_process::error::PythonExecutionError>> + Send>>>>>,
+                            exhausted: Arc<std::sync::atomic::AtomicBool>,
+                            count: Arc<std::sync::atomic::AtomicUsize>,
+                        }
+                        
+                        #[pyo3::pymethods]
+                        impl CallbackAsyncIterator {
+                            fn __aiter__(slf: pyo3::PyRef<Self>) -> pyo3::PyRef<Self> {
+                                slf
+                            }
+                            
+                            fn __anext__<'py>(&self, py: pyo3::Python<'py>) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
+                                let stream = self.stream.clone();
+                                let exhausted = self.exhausted.clone();
+                                let count = self.count.clone();
+                                
+                                pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                                    // Check if stream is already exhausted
+                                    if exhausted.load(std::sync::atomic::Ordering::SeqCst) {
+                                        return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                                    }
+                                    
+                                    use futures::StreamExt;
+                                    let mut stream_guard = stream.lock().await;
+                                    if let Some(ref mut stream) = stream_guard.as_mut() {
+                                        match stream.next().await {
+                                            Some(result) => {
+                                                let item_count = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                                                tracing::info!("🎯 Yielding stream item {} to Python via __anext__: {:?}", item_count, result);
+                                                
+                                                match result {
+                                                    Ok(bincode_bytes) => {
+                                                        // Deserialize the bincode bytes to the concrete response type  
+                                                        match bincode::decode_from_slice::<$callback_response, _>(&bincode_bytes, bincode::config::standard()) {
+                                                            Ok((response, _)) => {
+                                                                // Convert the typed response to a Python object via JSON
+                                                                match serde_json::to_value(&response) {
+                                                                    Ok(json_value) => {
+                                                                        use kameo_snake_handler::serde_py::to_pyobject;
+                                                                        pyo3::Python::with_gil(|py| -> pyo3::PyResult<pyo3::PyObject> {
+                                                                            match to_pyobject(py, &json_value) {
+                                                                                Ok(py_obj) => Ok(py_obj.into()),
+                                                                                Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to convert to Python object: {e}"))),
+                                                                            }
+                                                                        })
+                                                                    },
+                                                                    Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize response to JSON: {e}"))),
+                                                                }
+                                                            },
+                                                            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to deserialize bincode: {e}"))),
+                                                        }
+                                                    },
+                                                    Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Stream item error: {e}"))),
+                                                }
+                                            },
+                                            None => {
+                                                let total_count = count.load(std::sync::atomic::Ordering::SeqCst);
+                                                tracing::info!("✅ Stream exhausted after yielding {} items via __anext__", total_count);
+                                                exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
+                                                *stream_guard = None; // Drop the stream
+                                                Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                                            }
+                                        }
+                                    } else {
+                                        Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()))
+                                    }
+                                })
+                            }
+                        }
+
                         #[pyfunction]
                         fn callback_handle<'py>(py: pyo3::Python<'py>, py_msg: &pyo3::Bound<'py, pyo3::PyAny>) -> pyo3::PyResult<pyo3::Bound<'py, pyo3::PyAny>> {
                             use pyo3::prelude::*;
                             use kameo_snake_handler::serde_py::{from_pyobject, to_pyobject};
+                            
                             let handle = CALLBACK_HANDLE.get().cloned().ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Callback handle not initialized yet"))?;
                             let msg = match from_pyobject::<$callback>(py_msg.as_ref()) {
                                 Ok(m) => m,
                                 Err(e) => return Err(pyo3::exceptions::PyValueError::new_err(format!("Failed to parse callback: {e}"))),
                             };
+                            
+                            // Return a Python async iterator that implements the asyncio protocol
                             pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                                match handle.handle(msg).await {
-                                    Ok(_) => Python::with_gil(|py| Ok(py.None())),
+                                match handle.handle_stream_bincode(msg).await {
+                                    Ok(stream) => {
+                                        
+                                        let iterator = CallbackAsyncIterator {
+                                            stream: Arc::new(Mutex::new(Some(stream))),
+                                            exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                            count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                                        };
+                                        
+                                        // Create the iterator outside the async context to avoid Send issues
+                                        pyo3::Python::with_gil(|py| -> pyo3::PyResult<pyo3::PyObject> {
+                                            let py_iterator = pyo3::Py::new(py, iterator)?;
+                                            Ok(py_iterator.into())
+                                        })
+                                    },
                                     Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Callback handler error: {e}"))),
                                 }
                             })
@@ -133,7 +223,6 @@ macro_rules! setup_python_subprocess_system {
                                 tracing::debug!("Setting callback handle glue for child process: {}", stringify!($callback));
                                 set_callback_handle_glue(
                                     CallbackIpcChild::<$callback>::from_duplex(DuplexUnixStream::new(*callback_conn))
-                                        as Arc<dyn CallbackHandler<$callback>>
                                 );
                                 tracing::debug!("Set callback handle glue for {}", stringify!($callback));
                                 info!("Child connected to both sockets and set callback handle");

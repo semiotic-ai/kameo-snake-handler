@@ -28,11 +28,15 @@ struct DummyMsg {
 #[derive(Clone)]
 struct DummyHandler;
 #[async_trait::async_trait]
-impl kameo_child_process::callback::CallbackHandler<DummyMsg> for DummyHandler {
-    async fn handle(&self, _cb: DummyMsg) -> Result<(), kameo_child_process::error::PythonExecutionError> {
-        Ok(())
+impl kameo_child_process::callback::CallbackStreamHandler<DummyMsg> for DummyHandler {
+    type Response = ();
+    
+    async fn handle_stream(&self, _cb: DummyMsg) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+        use futures::stream;
+        Ok(Box::pin(stream::once(async move { Ok(()) })))
     }
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 struct DummyParentMsg {
@@ -204,7 +208,7 @@ async fn test_callback_protocol_full_duplex() {
     tokio::time::timeout(Duration::from_secs(180), async {
         tracing::info!("Test started - setting up callback protocol test");
         // test body
-        use kameo_child_process::callback::{CallbackReceiver, CallbackIpcChild, CallbackHandler};
+        use kameo_child_process::callback::{CallbackReceiver, CallbackIpcChild};
         
         
         use futures::stream::{self, StreamExt};
@@ -221,12 +225,16 @@ async fn test_callback_protocol_full_duplex() {
         #[derive(Clone)]
         struct ParentHandler;
         #[async_trait::async_trait]
-        impl CallbackHandler<DummyMsg> for ParentHandler {
-            async fn handle(&self, cb: DummyMsg) -> Result<(), kameo_child_process::error::PythonExecutionError> {
+        impl kameo_child_process::callback::CallbackStreamHandler<DummyMsg> for ParentHandler {
+            type Response = ();
+            
+            async fn handle_stream(&self, cb: DummyMsg) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+                use futures::stream;
                 trace!(event = "parent_handler", id = cb.id, "Parent handling callback");
-                Ok(())
+                Ok(Box::pin(stream::once(async move { Ok(()) })))
             }
         }
+
         
         tracing::info!("Creating socket pair");
         // Create the sockets
@@ -267,9 +275,25 @@ async fn test_callback_protocol_full_duplex() {
                 async move {
                     tracing::info!("Starting callback {}", i);
                     let msg = DummyMsg { id: i as u64 };
-                    let result = child_ipc.handle(msg).await;
-                    tracing::info!("Completed callback {} with result: {:?}", i, result);
-                    result
+                    match child_ipc.handle_stream_bincode(msg).await {
+                        Ok(mut stream) => {
+                            use futures::StreamExt;
+                            // For this test, just consume the entire stream and return Ok(()) if successful
+                            let mut count = 0;
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok(_bytes) => count += 1,
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            tracing::info!("Completed callback {} with {} stream items", i, count);
+                            Ok(())
+                        },
+                        Err(e) => {
+                            tracing::info!("Callback {} failed: {:?}", i, e);
+                            Err(e)
+                        }
+                    }
                 }
             });
             
