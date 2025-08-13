@@ -42,3 +42,7 @@ tokio-test = "0.4"
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 
+[[example]]
+name = "test_typed_callbacks"
+path = "examples/test_typed_callbacks.rs"
+

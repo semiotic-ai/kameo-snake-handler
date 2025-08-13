@@ -71,6 +71,7 @@ static GLOBAL_PROPAGATOR: Lazy<Arc<dyn TextMapPropagator + Send + Sync>> = Lazy:
 });
 
 pub mod callback;
+pub use callback::*;
 pub mod handshake;
 pub use handshake::*;
 pub mod metrics;

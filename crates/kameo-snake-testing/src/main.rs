@@ -20,8 +20,8 @@ use std::fmt::Write as _;
 use futures::stream::{StreamExt, Stream};
 use std::pin::Pin;
 use kameo_child_process::error::PythonExecutionError;
-use kameo_child_process::callback::CallbackStreamHandler;
-use pyo3::pyfunction;
+use kameo_child_process::callback::TypedCallbackHandler;
+
 
 
 
@@ -145,36 +145,44 @@ pub struct TestCallbackHandler;
 
 
 #[async_trait::async_trait]
-impl CallbackStreamHandler<TestCallbackMessage> for TestCallbackHandler {
+impl TypedCallbackHandler<TestCallbackMessage> for TestCallbackHandler {
     type Response = TestResponse;
     
-    async fn handle_stream(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+    async fn handle_callback(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
         tracing::info!(event = "test_callback", value = callback.value, "TestCallbackHandler received callback");
         let response = TestResponse::CallbackRoundtripResult { value: callback.value + 1 };
         Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
-}
-
-
-#[async_trait::async_trait]
-impl CallbackStreamHandler<TraderCallbackMessage> for TestCallbackHandler {
-    type Response = TraderResponse;
     
-    async fn handle_stream(&self, callback: TraderCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
-        use futures::stream;
-        tracing::info!(event = "trader_callback", value = callback.value, "TestCallbackHandler received trader callback");
-        let response = TraderResponse::OrderResult { result: format!("Order processed with value {}", callback.value) };
-        Ok(Box::pin(stream::once(async move { Ok(response) })))
+    fn type_name(&self) -> &'static str {
+        "TestCallback"
     }
 }
 
 
 #[async_trait::async_trait]
-impl CallbackStreamHandler<BenchCallback> for TestCallbackHandler {
+impl TypedCallbackHandler<TraderCallbackMessage> for TestCallbackHandler {
+    type Response = TraderResponse;
+    
+    async fn handle_callback(&self, callback: TraderCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        use futures::stream;
+        tracing::info!(event = "trader_callback", value = callback.value, "TestCallbackHandler received trader callback");
+        let response = TraderResponse::OrderResult { result: format!("Order processed with value {}", callback.value) };
+        Ok(Box::pin(stream::once(async move { Ok(response) })))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "TraderCallback"
+    }
+}
+
+
+#[async_trait::async_trait]
+impl TypedCallbackHandler<BenchCallback> for TestCallbackHandler {
     type Response = BenchResponse;
     
-    async fn handle_stream(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+    async fn handle_callback(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
         tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "TestCallbackHandler received bench callback");
         if callback.rust_sleep_ms > 0 {
@@ -182,6 +190,10 @@ impl CallbackStreamHandler<BenchCallback> for TestCallbackHandler {
         }
         let response = BenchResponse::CallbackRoundtripResult { value: callback.id as u32 };
         Ok(Box::pin(stream::once(async move { Ok(response) })))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "BenchCallback"
     }
 }
 
@@ -192,10 +204,10 @@ struct CountingCallbackHandler {
 }
 
 #[async_trait::async_trait]
-impl CallbackStreamHandler<BenchCallback> for CountingCallbackHandler {
+impl TypedCallbackHandler<BenchCallback> for CountingCallbackHandler {
     type Response = BenchResponse;
     
-    async fn handle_stream(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+    async fn handle_callback(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
         let counter = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         tracing::info!(event = "counting_bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, counter, "CountingCallbackHandler received bench callback");
@@ -205,6 +217,10 @@ impl CallbackStreamHandler<BenchCallback> for CountingCallbackHandler {
         let response = BenchResponse::CallbackRoundtripResult { value: callback.id as u32 * counter as u32 };
         Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
+    
+    fn type_name(&self) -> &'static str {
+        "BenchCallback"
+    }
 }
 
 
@@ -213,10 +229,10 @@ impl CallbackStreamHandler<BenchCallback> for CountingCallbackHandler {
 pub struct StreamingCallbackHandler;
 
 #[async_trait::async_trait]
-impl CallbackStreamHandler<TestCallbackMessage> for StreamingCallbackHandler {
+impl TypedCallbackHandler<TestCallbackMessage> for StreamingCallbackHandler {
     type Response = TestResponse;
     
-    async fn handle_stream(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+    async fn handle_callback(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
         tracing::info!(event = "streaming_callback", value = callback.value, "🌊 StreamingCallbackHandler starting stream with {} items", callback.value);
         
@@ -231,6 +247,10 @@ impl CallbackStreamHandler<TestCallbackMessage> for StreamingCallbackHandler {
             });
         
         Ok(Box::pin(stream))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "StreamingCallback"
     }
 }
 
@@ -247,19 +267,21 @@ async fn run_streaming_callback_test(python_path: Vec<String>) -> Result<(), Box
         enable_otel_propagation: false,
     };
     
-    let pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(config)
-        .with_callback_handler(StreamingCallbackHandler)
+    let mut pool = PythonChildProcessBuilder::<TestMessage>::new(config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", StreamingCallbackHandler)
+        .with_callback_handler::<TestCallbackMessage, _>("basic", TestCallbackHandler)
+        .with_callback_handler::<TraderCallbackMessage, _>("trader", TestCallbackHandler)
         .spawn_pool(1, None)
         .await?;
     
-    let actor = pool.get_actor();
+    let actor = pool.get_actor().clone();
     
     // Test callback with value=5, should generate 5 stream items
     info!("🔄 Testing callback with value=5 (should generate 5 stream items)");
     let response = actor.ask(TestMessage::CallbackRoundtrip { value: 5 }).await?;
     info!("✅ Streaming callback test completed: {:?}", response);
     
-    pool.shutdown().await;
+    pool.shutdown();
     info!("🏁 Streaming callback test finished");
     Ok(())
 }
@@ -369,11 +391,11 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         step = "before_spawn",
         "About to spawn Python child process"
     );
-    let sync_pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(sync_config)
-        .with_callback_handler(TestCallbackHandler)
+    let sync_pool = PythonChildProcessBuilder::<TestMessage>::new(sync_config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
-    let sync_ref = sync_pool.get_actor();
+    let sync_ref = sync_pool.get_actor().clone();
     tracing::trace!(
         event = "test_spawn",
         step = "after_spawn",
@@ -467,8 +489,8 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         enable_otel_propagation: true,
     };
-    let async_pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(async_config)
-        .with_callback_handler(TestCallbackHandler)
+    let async_pool = PythonChildProcessBuilder::<TestMessage>::new(async_config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
     let async_ref = async_pool.get_actor();
@@ -582,11 +604,11 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
         is_async: true,
         enable_otel_propagation: false,
     };
-    let streaming_pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(streaming_config)
-        .with_callback_handler(TestCallbackHandler)
+    let streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
-    let streaming_ref: kameo::prelude::ActorRef<kameo_child_process::SubprocessIpcActor<TestMessage>> = streaming_pool.get_actor();
+    let streaming_ref: kameo::prelude::ActorRef<kameo_child_process::SubprocessIpcActor<TestMessage>> = streaming_pool.get_actor().clone();
 
     // Test 1: Fibonacci stream
     info!("Test 1: Fibonacci stream");
@@ -808,8 +830,8 @@ async fn run_streaming_throughput_test(python_path: Vec<String>) -> Result<(), B
         is_async: true,
         enable_otel_propagation: false,
     };
-    let streaming_pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(streaming_config)
-        .with_callback_handler(TestCallbackHandler)
+    let streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(100, None)
         .await?;
     
@@ -818,7 +840,7 @@ async fn run_streaming_throughput_test(python_path: Vec<String>) -> Result<(), B
     let mut total_items = 0;
     
     for _i in 0..N {
-        let streaming_ref = streaming_pool.get_actor();
+        let streaming_ref = streaming_pool.get_actor().clone();
         handles.push(tokio::spawn(async move {
             let msg = TestMessage::StreamRandomNumbers { 
                 count: STREAM_SIZE, 
@@ -894,8 +916,8 @@ async fn run_streaming_error_handling_test(python_path: Vec<String>) -> Result<(
         is_async: true,
         enable_otel_propagation: false,
     };
-    let streaming_pool = PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(streaming_config)
-        .with_callback_handler(TestCallbackHandler)
+    let streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
     let streaming_ref = streaming_pool.get_actor();
@@ -973,7 +995,7 @@ async fn run_invalid_config_tests(
 
     let spawn_result = timeout(
         Duration::from_secs(31),
-        PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(invalid_module_config)
+        PythonChildProcessBuilder::<TestMessage>::new(invalid_module_config)
             .spawn_pool(POOL_SIZE, None),
     )
     .await;
@@ -994,7 +1016,7 @@ async fn run_invalid_config_tests(
     };
     let spawn_result = timeout(
         Duration::from_secs(31),
-        PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(invalid_function_config)
+        PythonChildProcessBuilder::<TestMessage>::new(invalid_function_config)
             .spawn_pool(POOL_SIZE, None),
     )
     .await;
@@ -1015,7 +1037,7 @@ async fn run_invalid_config_tests(
     };
     let spawn_result = timeout(
         Duration::from_secs(32),
-        PythonChildProcessBuilder::<TestMessage, TestCallbackMessage>::new(invalid_path_config)
+        PythonChildProcessBuilder::<TestMessage>::new(invalid_path_config)
             .spawn_pool(POOL_SIZE, None),
     )
     .await;
@@ -1037,8 +1059,8 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
             is_async: true,
             enable_otel_propagation: true,
         };
-    let trader_pool = PythonChildProcessBuilder::<TraderMessage, TraderCallbackMessage>::new(trader_config)
-        .with_callback_handler(TestCallbackHandler)
+    let trader_pool = PythonChildProcessBuilder::<TraderMessage>::new(trader_config)
+        .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
     let trader_ref = trader_pool.get_actor();
@@ -1071,8 +1093,8 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
     };
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_handler = CountingCallbackHandler { counter: callback_count.clone() };
-    let bench_pool = PythonChildProcessBuilder::<BenchMessage, BenchCallback>::new(bench_config)
-        .with_callback_handler(callback_handler)
+    let bench_pool = PythonChildProcessBuilder::<BenchMessage>::new(bench_config)
+        .with_callback_handler::<BenchCallback, _>("bench", callback_handler)
         .spawn_pool(1000, None)
         .await?;
     let start = Instant::now();
@@ -1084,7 +1106,7 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
         let py_sleep_ms = rng.gen_range(10..=MAX_SLEEP_MS);
         let rust_sleep_ms = rng.gen_range(10..=MAX_SLEEP_MS);
         let msg = BenchMessage { id: i as u64, py_sleep_ms, rust_sleep_ms };
-        let bench_ref = bench_pool.get_actor();
+        let bench_ref = bench_pool.get_actor().clone();
         let in_flight = in_flight.clone();
         let max_concurrency = max_concurrency.clone();
         handles.push(tokio::spawn(async move {
@@ -1182,9 +1204,9 @@ async fn run_bench_throughput_test(python_path: Vec<String>) -> Result<(), Box<d
 
 
 kameo_snake_handler::setup_python_subprocess_system! {
-        actor = (TestMessage, TestCallbackMessage, TestResponse),
-        actor = (TraderMessage, TraderCallbackMessage, TraderResponse),
-        actor = (BenchMessage, BenchCallback, BenchResponse),
+        actor = (TestMessage),
+        actor = (TraderMessage),
+        actor = (BenchMessage),
         child_init = {{
             kameo_child_process::RuntimeConfig {
                 flavor: kameo_child_process::RuntimeFlavor::MultiThread,

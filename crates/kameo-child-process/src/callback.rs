@@ -1,654 +1,614 @@
-#![forbid(unsafe_code)]
-
-use std::io;
-use std::marker::PhantomData;
-use std::sync::Arc;
-use std::time::Duration;
-
-use async_trait::async_trait;
-use bincode::{Decode, Encode};
-use serde::Serialize;
-use thiserror::Error;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
-use tokio_util::sync::CancellationToken;
-use tracing::trace;
-use tracing::{error, instrument};
-
-use serde::Deserialize;
-
-use crate::TracingContext;
 use crate::error::PythonExecutionError;
 use crate::framing::{LengthPrefixedRead, LengthPrefixedWrite};
-use crate::InFlightMap;
-use crate::ReplySlot;
+use async_trait::async_trait;
+use bincode::{Decode, Encode};
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tracing::{error, info, trace};
 
-/// Control messages for streaming callbacks
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
-pub enum CallbackControl {
-    /// A stream item with bincode-serialized data
-    StreamItem(Result<Vec<u8>, PythonExecutionError>),
-    /// Signal that the stream is complete
-    StreamComplete,
+/// Simple tracing context for now - we can enhance this later
+#[derive(Clone, Debug, Serialize, Deserialize, Encode, Decode)]
+pub struct TracingContext {
+    pub trace_id: String,
+    pub span_id: String,
 }
 
-#[derive(Debug, Error)]
-pub enum CallbackError {
-    #[error("IPC error: {0}")]
-    Ipc(#[from] io::Error),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::error::EncodeError),
-    #[error("Deserialization error: {0}")]
-    Deserialization(#[from] bincode::error::DecodeError),
-    #[error("Connection closed")]
-    ConnectionClosed,
+impl Default for TracingContext {
+    fn default() -> Self {
+        Self {
+            trace_id: "default".to_string(),
+            span_id: "default".to_string(),
+        }
+    }
 }
 
+/// New: Dynamic module-based callback system
+/// This allows handlers to be registered in modules and automatically discovered
+pub struct DynamicCallbackModule {
+    handlers: HashMap<String, Box<dyn CallbackHandlerTrait + Send + Sync>>,
+    module_registry: HashMap<String, Vec<String>>, // module_name -> handler_types
+}
+
+impl DynamicCallbackModule {
+    pub fn new() -> Self {
+        Self {
+            handlers: HashMap::new(),
+            module_registry: HashMap::new(),
+        }
+    }
+    
+    /// Register a handler in a specific module
+    pub fn register_handler<C, H>(&mut self, module_name: &str, handler: H) -> Result<(), String>
+    where
+        C: Send + Sync + Decode<()> + 'static,
+        H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
+    {
+        let type_name = handler.type_name().to_string();
+        let full_name = format!("{}.{}", module_name, type_name);
+        
+        if self.handlers.contains_key(&full_name) {
+            return Err(format!("Handler for type '{}' already exists", full_name));
+        }
+        
+        // Create a wrapper that implements CallbackHandlerTrait
+        let wrapper = TypedCallbackHandlerWrapper { 
+            handler,
+            _phantom: std::marker::PhantomData,
+        };
+        
+        self.handlers.insert(full_name.clone(), Box::new(wrapper));
+        
+        // Register in module registry
+        self.module_registry
+            .entry(module_name.to_string())
+            .or_insert_with(Vec::new)
+            .push(type_name);
+        
+        Ok(())
+    }
+    
+    /// Register a handler with automatic module discovery
+    /// Uses the module path from the handler's type
+    pub fn auto_register_handler<C, H>(&mut self, handler: H) -> Result<(), String>
+    where
+        C: Send + Sync + Decode<()> + 'static,
+        H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
+    {
+        // Extract module name from the handler's type
+        let module_name = Self::extract_module_name::<H>();
+        self.register_handler(&module_name, handler)
+    }
+    
+    /// Extract module name from a type using reflection
+    fn extract_module_name<T>() -> String {
+        let type_name = std::any::type_name::<T>();
+        
+        // Parse the type name to extract module path
+        // Format is typically: "crate_name::module::submodule::TypeName"
+        let parts: Vec<&str> = type_name.split("::").collect();
+        
+        if parts.len() >= 2 {
+            // Take everything except the last part (the type name)
+            parts[..parts.len()-1].join("::")
+        } else {
+            "unknown".to_string()
+        }
+    }
+    
+    /// Handle a callback using module-based routing
+    /// Supports both "Module.Type" and "Type" formats
+    pub async fn handle_callback(
+        &self,
+        callback_path: &str,
+        callback_data: &[u8],
+        correlation_id: u64,
+        context: TracingContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        // Try exact match first
+        if let Some(handler) = self.handlers.get(callback_path) {
+            return handler.handle_callback_typed(callback_data, correlation_id, context).await;
+        }
+        
+        // Try to find by type name in any module
+        for (full_name, _) in &self.handlers {
+            if full_name.ends_with(&format!(".{}", callback_path)) {
+                if let Some(handler) = self.handlers.get(full_name) {
+                    return handler.handle_callback_typed(callback_data, correlation_id, context).await;
+                }
+            }
+        }
+        
+        // Try to find by module name
+        if let Some(module_handlers) = self.module_registry.get(callback_path) {
+            if module_handlers.len() == 1 {
+                let full_name = format!("{}.{}", callback_path, module_handlers[0]);
+                if let Some(handler) = self.handlers.get(&full_name) {
+                    return handler.handle_callback_typed(callback_data, correlation_id, context).await;
+                }
+            }
+        }
+        
+        Err(PythonExecutionError::ExecutionError {
+            message: format!("No handler found for callback path: {}", callback_path)
+        })
+    }
+    
+    /// Get a handler by callback path
+    pub fn get_handler(&self, callback_path: &str) -> Option<&dyn CallbackHandlerTrait> {
+        // Try exact match first
+        if let Some(handler) = self.handlers.get(callback_path) {
+            return Some(handler.as_ref());
+        }
+        
+        // Try to find by type name in any module
+        for (full_name, _) in &self.handlers {
+            if full_name.ends_with(&format!(".{}", callback_path)) {
+                if let Some(handler) = self.handlers.get(full_name) {
+                    return Some(handler.as_ref());
+                }
+            }
+        }
+        
+        // Try to find by module name
+        if let Some(module_handlers) = self.module_registry.get(callback_path) {
+            if module_handlers.len() == 1 {
+                let full_name = format!("{}.{}", callback_path, module_handlers[0]);
+                if let Some(handler) = self.handlers.get(&full_name) {
+                    return Some(handler.as_ref());
+                }
+            }
+        }
+        
+        None
+    }
+    
+    /// Get all available callback paths
+    pub fn available_callbacks(&self) -> Vec<String> {
+        self.handlers.keys().cloned().collect()
+    }
+    
+    /// Get all available modules
+    pub fn available_modules(&self) -> Vec<String> {
+        self.module_registry.keys().cloned().collect()
+    }
+    
+    /// Get handlers in a specific module
+    pub fn module_handlers(&self, module_name: &str) -> Vec<String> {
+        self.module_registry.get(module_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+    
+    /// Get the full module registry for serialization
+    /// Returns HashMap<module_name, Vec<handler_types>>
+    pub fn get_registry(&self) -> &HashMap<String, Vec<String>> {
+        &self.module_registry
+    }
+}
+
+impl Default for DynamicCallbackModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Strongly-typed callback handler trait
+/// Each handler is responsible for a specific callback type
+#[async_trait]
+pub trait TypedCallbackHandler<C>: Send + Sync + 'static 
+where
+    C: Send + Sync + Decode<()> + 'static,
+{
+    type Response: Encode + Send + 'static;
+    
+    /// Handle a callback of the specific type
+    async fn handle_callback(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError>;
+    
+    /// Return the type name for this handler
+    fn type_name(&self) -> &'static str;
+}
+
+/// Internal trait for dynamic dispatch compatibility
+/// This bridges the gap between async traits and trait objects
+pub trait CallbackHandlerTrait: Send + Sync {
+    fn type_name(&self) -> &str;
+    
+    fn response_type_name(&self) -> &str;
+    
+    fn handle_callback_typed(
+        &self,
+        callback_data: &[u8],
+        correlation_id: u64,
+        context: TracingContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError>> + Send>>;
+}
+
+/// Wrapper that implements CallbackHandlerTrait for TypedCallbackHandler
+/// This handles the serialization/deserialization and async compatibility
+struct TypedCallbackHandlerWrapper<C, H>
+where
+    C: Send + Sync + Decode<()> + 'static,
+    H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
+{
+    handler: H,
+    _phantom: std::marker::PhantomData<C>,
+}
+
+impl<C, H> CallbackHandlerTrait for TypedCallbackHandlerWrapper<C, H>
+where
+    C: Send + Sync + Decode<()> + 'static,
+    H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
+{
+    fn type_name(&self) -> &str {
+        self.handler.type_name()
+    }
+    
+    fn response_type_name(&self) -> &str {
+        std::any::type_name::<H::Response>()
+    }
+    
+    fn handle_callback_typed(
+        &self,
+        callback_data: &[u8],
+        _correlation_id: u64,
+        _context: TracingContext,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError>> + Send>> {
+        let handler = self.handler.clone();
+        let data = callback_data.to_vec();
+        
+        Box::pin(async move {
+            // Deserialize the callback data to the specific type
+            let callback: C = bincode::decode_from_slice(&data, bincode::config::standard())
+                .map_err(|e| PythonExecutionError::ExecutionError {
+                    message: format!("Failed to deserialize callback: {}", e)
+                })?
+                .0;
+            
+            // Handle the callback and get the response stream
+            let response_stream = handler.handle_callback(callback).await?;
+            
+            // Convert the response stream to a stream of serialized data
+            let serialized_stream = response_stream.map(|result| {
+                result.and_then(|response| {
+                    bincode::encode_to_vec(&response, bincode::config::standard())
+                        .map_err(|e| PythonExecutionError::ExecutionError {
+                            message: format!("Failed to serialize response: {}", e)
+                        })
+                })
+            });
+            
+            Ok(Box::pin(serialized_stream) as Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>)
+        })
+    }
+}
+
+/// Callback envelope for typed callbacks
 #[derive(Serialize, Deserialize, Encode, Decode, Debug)]
-pub struct CallbackEnvelope<T> {
+pub struct TypedCallbackEnvelope {
+    pub callback_path: String, // e.g., "DataFetch", "TraderCallback", etc.
     pub correlation_id: u64,
-    pub inner: T,
+    pub callback_data: Vec<u8>, // Serialized callback data
     pub context: TracingContext,
 }
 
-use futures::stream::Stream;
-use std::pin::Pin;
-
-/// Streaming callback handler trait - handles callbacks and returns a stream of responses
-/// This trait is implemented by handlers that know their specific response type
-#[async_trait]
-pub trait CallbackStreamHandler<C>: Send + Sync + 'static {
-    type Response: bincode::Encode + Send + 'static;
-    async fn handle_stream(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError>;
+/// Callback response envelope that includes type information
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct TypedCallbackResponse {
+    pub callback_path: String,        // e.g., "trading.DataFetch"
+    pub response_type: String,        // e.g., "DataFetchResponse" 
+    pub response_data: Vec<u8>,      // Serialized response data
+    pub correlation_id: u64,
 }
 
-/// Helper function to serialize a stream of responses to bincode bytes
-pub fn serialize_response_stream<R, S>(stream: S) -> impl Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send
-where
-    R: bincode::Encode + Send + 'static,
-    S: Stream<Item = Result<R, PythonExecutionError>> + Send,
-{
-    futures::StreamExt::map(stream, |result| {
-        match result {
-            Ok(response) => {
-                match bincode::encode_to_vec(&response, bincode::config::standard()) {
-                    Ok(bytes) => Ok(bytes),
-                    Err(e) => Err(PythonExecutionError::ExecutionError { 
-                        message: format!("Failed to serialize response: {e}")
-                    }),
-                }
-            },
-            Err(e) => Err(e),
-        }
-    })
-}
-
-
-
-#[derive(Clone)]
-pub struct NoopCallbackHandler<C>(std::marker::PhantomData<C>);
-
-impl<C> Default for NoopCallbackHandler<C> {
-    fn default() -> Self {
-        NoopCallbackHandler(std::marker::PhantomData)
-    }
-}
-
-
-#[async_trait]
-impl<C> CallbackStreamHandler<C> for NoopCallbackHandler<C>
-where
-    C: Send + Sync + 'static,
-{
-    type Response = ();
-    
-    async fn handle_stream(&self, _callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
-        panic!("NoopCallbackHandler called; implement your own handler if you need a real reply");
-    }
-}
-
-
-/// Child-side message pump: forwards callback messages to the parent process over a channel.
-/// Use this as the callback handler in the child process.
-pub struct CallbackForwarder<C> {
-    sender: tokio::sync::mpsc::UnboundedSender<C>,
-}
-
-impl<C> CallbackForwarder<C> {
-    pub fn new(sender: tokio::sync::mpsc::UnboundedSender<C>) -> Self {
-        Self { sender }
-    }
-}
-
-
-#[async_trait]
-impl<C> CallbackStreamHandler<C> for CallbackForwarder<C>
-where
-    C: Send + Sync + 'static,
-{
-    type Response = ();
-    
-    async fn handle_stream(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
-        use futures::stream;
-        let result = self.sender.send(callback).map_err(|_| PythonExecutionError::ExecutionError {
-            message: "Failed to forward callback to parent (channel closed)".to_string(),
-        });
-        Ok(Box::pin(stream::once(async move { result })))
-    }
-}
-
-pub type CallbackHandle<C> = std::sync::Arc<CallbackIpcChild<C>>;
-
-/// Multiplexed callback protocol artefact for child processes.
-/// Owns the callback socket, maintains in-flight map, and implements `CallbackHandler<C>`.
-/// This is the only production callback handler for child processes.
-pub struct CallbackIpcChild<C> {
-    pub in_flight: InFlightMap<Vec<u8>>,
-    write_tx: tokio::sync::mpsc::UnboundedSender<CallbackWriteRequest<C>>,
-    next_id: std::sync::atomic::AtomicU64,
+/// Main callback receiver that handles typed callbacks
+pub struct TypedCallbackReceiver {
+    dispatcher: Arc<DynamicCallbackModule>,
+    reader: LengthPrefixedRead<tokio::net::unix::OwnedReadHalf>,
+    writer: LengthPrefixedWrite<tokio::net::unix::OwnedWriteHalf>,
     cancellation_token: tokio_util::sync::CancellationToken,
-    // Track message stats for adaptive throttling
-    pending_count: std::sync::atomic::AtomicUsize,
 }
 
-struct CallbackWriteRequest<C> {
-    envelope: CallbackEnvelope<C>,
-}
-
-impl<C> CallbackIpcChild<C>
-where
-    C: Send + Sync + Encode + Decode<()> + 'static,
-{
-    pub fn from_duplex(duplex: crate::DuplexUnixStream) -> std::sync::Arc<Self> {
-        let (read_half, write_half) = duplex.into_inner().into_split();
-        Self::new(read_half, write_half)
-    }
+impl TypedCallbackReceiver {
     pub fn new(
-        read_half: tokio::net::unix::OwnedReadHalf,
-        write_half: tokio::net::unix::OwnedWriteHalf,
-    ) -> std::sync::Arc<Self> {
-        use tokio::sync::mpsc::unbounded_channel;
-        let (write_tx, mut write_rx) = unbounded_channel::<CallbackWriteRequest<C>>();
-        let in_flight = InFlightMap::new();
-        let in_flight_reader = in_flight.clone();
-        let cancellation_token = tokio_util::sync::CancellationToken::new();
-        let cancellation_token_writer = cancellation_token.clone();
-        let cancellation_token_reader = cancellation_token.clone();
-        
-        // Create the shared struct first, so we can track pending counts
-        let result = std::sync::Arc::new(Self {
-            in_flight,
-            write_tx,
-            next_id: std::sync::atomic::AtomicU64::new(1),
+        dispatcher: Arc<DynamicCallbackModule>,
+        reader: LengthPrefixedRead<tokio::net::unix::OwnedReadHalf>,
+        writer: LengthPrefixedWrite<tokio::net::unix::OwnedWriteHalf>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        Self {
+            dispatcher,
+            reader,
+            writer,
             cancellation_token,
-            pending_count: std::sync::atomic::AtomicUsize::new(0),
-        });
+        }
+    }
+    
+    pub async fn run(mut self) -> Result<(), PythonExecutionError> {
+        info!("Starting typed callback receiver");
         
-        // Writer task
-        tokio::spawn(async move {
-            let mut writer = LengthPrefixedWrite::new(write_half);
-            loop {
-                tokio::select! {
-                    _ = cancellation_token_writer.cancelled() => break,
-                    Some(write_req) = write_rx.recv() => {
-                        let env = write_req.envelope;
-                        if writer.write_msg(&env).await.is_err() {
-                            break;
-                        }
+        let mut active_tasks: usize = 0;
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<TypedCallbackResponse>();
+        
+        loop {
+            tokio::select! {
+            // Check for cancellation
+            _ = self.cancellation_token.cancelled() => {
+                info!("Cancellation requested, shutting down callback receiver");
+                        break;
+            }
+            
+            // Send responses back to Python
+            response = response_rx.recv() => {
+                if let Some(response_envelope) = response {
+                    trace!("Sending response back to Python: {:?}", response_envelope);
+                    if let Err(e) = self.writer.write_msg(&response_envelope).await {
+                        error!("Failed to send response: {}", e);
                     }
                 }
             }
-        });
-        
-        // Reader task with improved error handling and tracking
-        let result_clone = result.clone();
-        tokio::spawn(async move {
-            let mut reader = LengthPrefixedRead::new(read_half);
-            loop {
-                tokio::select! {
-                    _ = cancellation_token_reader.cancelled() => break,
-                    result = reader.read_msg::<CallbackEnvelope<CallbackControl>>() => {
+            
+            // Read incoming callback
+            result = self.reader.read_msg::<TypedCallbackEnvelope>() => {
                         match result {
-                            Ok(env) => {
-                                let correlation_id = env.correlation_id;
-                                match env.inner {
-                                    CallbackControl::StreamItem(item) => {
-                                        // Handle stream item - keep correlation ID alive
-                                        if let Some(slot) = in_flight_reader.0.get(&correlation_id) {
-                                            if let Some(sender) = &slot.stream_sender {
-                                                // Send the stream item to the waiting task
-                                                if sender.send(item).is_err() {
-                                                    tracing::error!(event = "callback_ipc_child_read", correlation_id, "Failed to send stream item, receiver dropped");
-                                                    // Remove the correlation ID since receiver is gone
-                                                    in_flight_reader.0.remove(&correlation_id);
-                                                    result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(envelope) => {
+                            trace!("Received typed callback: {} (correlation_id: {})", 
+                                   envelope.callback_path, envelope.correlation_id);
+                            
+                            // Spawn a task to handle this callback
+                            let dispatcher = Arc::clone(&self.dispatcher);
+                            let response_tx = response_tx.clone();
+                            let callback_path = envelope.callback_path.clone();
+                            let callback_data = envelope.callback_data.clone();
+                            let correlation_id = envelope.correlation_id;
+                            let context = envelope.context;
+                            
+                            // Get the response type name before spawning the task
+                            let response_type_name = if let Some(handler) = dispatcher.get_handler(&callback_path) {
+                                handler.response_type_name().to_string()
+                            } else {
+                                "UnknownResponse".to_string()
+                            };
+                            
+                            let task = tokio::spawn(async move {
+                                match dispatcher.handle_callback(&callback_path, &callback_data, correlation_id, context).await {
+                                    Ok(mut response_stream) => {
+                                        // Process each response and wrap it in TypedCallbackResponse
+                                        while let Some(response_result) = response_stream.next().await {
+                                            match response_result {
+                                                Ok(response_data) => {
+                                                    // Create TypedCallbackResponse envelope with real type name
+                                                    let response_envelope = TypedCallbackResponse {
+                                                        callback_path: callback_path.clone(),
+                                                        response_type: response_type_name.clone(),
+                                                        response_data,
+                                                        correlation_id,
+                                                    };
+                                                    
+                                                    // Send response back through the channel
+                                                    if let Err(e) = response_tx.send(response_envelope) {
+                                                        error!("Failed to send response through channel: {}", e);
+                                                    }
+                                                    trace!("Sent response for callback {} through channel", callback_path);
                                                 }
-                                            } else {
-                                                tracing::error!(event = "callback_ipc_child_read", correlation_id, "Stream item received but sender missing");
+                                                Err(e) => {
+                                                    error!("Error in response stream: {}", e);
+                                                    break;
+                                                }
                                             }
-                                        } else {
-                                            tracing::error!(event = "callback_ipc_child_read", correlation_id, "Received stream item for unknown correlation id");
                                         }
-                                    },
-                                    CallbackControl::StreamComplete => {
-                                        // Handle stream completion - remove correlation ID and close stream
-                                        if let Some((_, mut slot)) = in_flight_reader.0.remove(&correlation_id) {
-                                            // Track that we're processing one less in-flight request
-                                            result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                                            
-                                            // Close the stream to signal completion
-                                            slot.close_stream();
-                                            tracing::debug!(event = "callback_ipc_child_read", correlation_id, "Stream completed");
-                                        } else {
-                                            tracing::error!(event = "callback_ipc_child_read", correlation_id, "Received stream completion for unknown correlation id");
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to handle callback {}: {}", callback_path, e);
+                                        // Send error response back to Python
+                                        let error_response = TypedCallbackResponse {
+                                            callback_path: callback_path.clone(),
+                                            response_type: "ErrorResponse".to_string(),
+                                            response_data: bincode::encode_to_vec(&e, bincode::config::standard()).unwrap_or_default(),
+                                            correlation_id,
+                                        };
+                                        if let Err(e) = response_tx.send(error_response) {
+                                            error!("Failed to send error response through channel: {}", e);
                                         }
                                     }
                                 }
+                            });
+                            
+                            tasks.push(task);
+                            active_tasks += 1;
                             }
                             Err(e) => {
                                 if let std::io::ErrorKind::UnexpectedEof = e.kind() {
-                                    tracing::debug!(event = "callback_ipc_child_read_eof", error = ?e, "CallbackIpcChild reader task got EOF (expected on clean shutdown)");
-                                    // EOF is expected on clean shutdown
+                                info!("EOF received, shutting down callback receiver");
+                                break;
                                 } else {
-                                    tracing::error!(event = "callback_ipc_child_read_error", error = ?e, "CallbackIpcChild reader task error, exiting");
-                                }
+                                error!("Error reading callback message: {}", e);
                                 break;
                             }
                         }
                     }
                 }
             }
-            // After the reader loop, drain in_flight with error, signalling that the child process has exited
-            in_flight_reader.0.iter_mut().for_each(|mut item| {
-                let (_, slot) = item.pair_mut();
-                if let Some(sender) = slot.stream_sender.take() {
-                    let err = PythonExecutionError::ExecutionError { message: "Callback reply loop exited (EOF)".to_string() };
-                    if sender.send(Err(err)).is_err() {
-                        tracing::error!(event = "callback_ipc_child_read", error = "Failed to send EOF error to waiting task", "Failed to notify waiting task about EOF");
-                    }
+            
+            // Check for completed tasks outside of tokio::select!
+            if let Some(task_result) = tasks.iter().position(|task: &JoinHandle<()>| task.is_finished()) {
+                let task = tasks.swap_remove(task_result);
+                if let Err(e) = task.await {
+                    error!("Task failed: {}", e);
                 }
-            });
-            // Reset pending count to 0
-            result_clone.pending_count.store(0, std::sync::atomic::Ordering::SeqCst);
-            // Clear the map after notifying all waiting tasks
-            in_flight_reader.0.clear();
-        });
+                active_tasks = active_tasks.saturating_sub(1);
+            }
+        }
         
-        result
+        // Wait for remaining tasks to complete
+        for task in tasks {
+            if let Err(e) = task.await {
+                error!("Task failed during shutdown: {}", e);
+            }
+        }
+        
+        info!("Typed callback receiver shutdown complete");
+        Ok(())
     }
-    fn next_correlation_id(&self) -> u64 {
-        self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-    pub fn shutdown(&self) {
-        self.cancellation_token.cancel();
+}
+
+/// Macro to create a module with automatic handler registration
+/// Usage: callback_module! { module_name => { handler1, handler2 } }
+#[macro_export]
+macro_rules! callback_module {
+    ($module:ident => { $($handler:ident),* }) => {
+        pub mod $module {
+            use super::*;
+            
+            pub fn register_handlers(dispatcher: &mut DynamicCallbackModule) -> Result<(), String> {
+                $(
+                    dispatcher.register_handler(stringify!($module), $handler)?;
+                )*
+                Ok(())
+            }
+            
+            pub fn available_handlers() -> Vec<&'static str> {
+                vec![$(
+                    stringify!($handler)
+                ),*]
+            }
+        }
+    };
+}
+
+/// Example usage of the new system
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+    
+    // Example callback types
+    #[derive(Clone, Debug, Encode, Decode)]
+    struct DataFetchRequest {
+        pub symbol: String,
+        pub start_date: String,
+        pub end_date: String,
     }
     
-    // New method to get current pending count
-    pub fn pending_count(&self) -> usize {
-        self.pending_count.load(std::sync::atomic::Ordering::SeqCst)
+    #[derive(Clone, Debug, Encode, Decode)]
+    struct DataFetchResponse {
+        pub data: Vec<f64>,
+        pub timestamps: Vec<String>,
     }
     
-    /// Handle a callback and return a stream of bincode bytes
-    pub async fn handle_stream_bincode(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError> {
-        let correlation_id = self.next_correlation_id();
+    #[derive(Clone, Debug, Encode, Decode)]
+    struct TraderCallback {
+        pub action: String,
+        pub quantity: f64,
+    }
+    
+    #[derive(Clone, Debug, Encode, Decode)]
+    struct TraderResponse {
+        pub success: bool,
+        pub message: String,
+    }
+    
+    // Example handlers
+    #[derive(Clone)]
+    struct DataFetchHandler;
+    
+    #[async_trait]
+    impl TypedCallbackHandler<DataFetchRequest> for DataFetchHandler {
+        type Response = DataFetchResponse;
         
-        let envelope = CallbackEnvelope {
-            correlation_id,
-            inner: callback,
-            context: TracingContext::default(),
+        async fn handle_callback(&self, callback: DataFetchRequest) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+            let response = DataFetchResponse {
+                data: vec![100.0, 101.0, 102.0],
+                timestamps: vec!["2024-01-01".to_string(), "2024-01-02".to_string(), "2024-01-03".to_string()],
+            };
+            
+            let stream = stream::once(async move { Ok(response) });
+            Ok(Box::pin(stream))
+        }
+        
+        fn type_name(&self) -> &'static str {
+            "DataFetch"
+        }
+    }
+    
+    #[derive(Clone)]
+    struct TraderHandler;
+    
+    #[async_trait]
+    impl TypedCallbackHandler<TraderCallback> for TraderHandler {
+        type Response = TraderResponse;
+        
+        async fn handle_callback(&self, callback: TraderCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+            let response = TraderResponse {
+                success: true,
+                message: format!("Executed {} of {}", callback.action, callback.quantity),
+            };
+            
+            let stream = stream::once(async move { Ok(response) });
+            Ok(Box::pin(stream))
+        }
+        
+        fn type_name(&self) -> &'static str {
+            "TraderCallback"
+        }
+    }
+    
+    // Create a module with handlers
+    callback_module! {
+        trading => { DataFetchHandler, TraderHandler }
+    }
+    
+    #[tokio::test]
+    async fn test_dynamic_callback_module() {
+        let mut dispatcher = DynamicCallbackModule::new();
+        
+        // Register handlers from the module
+        trading::register_handlers(&mut dispatcher).unwrap();
+        
+        // Test available callbacks
+        let callbacks = dispatcher.available_callbacks();
+        assert!(callbacks.contains(&"trading.DataFetch".to_string()));
+        assert!(callbacks.contains(&"trading.TraderCallback".to_string()));
+        
+        // Test module handlers
+        let module_handlers = dispatcher.module_handlers("trading");
+        assert_eq!(module_handlers.len(), 2);
+        assert!(module_handlers.contains(&"DataFetch".to_string()));
+        assert!(module_handlers.contains(&"TraderCallback".to_string()));
+    }
+    
+    #[tokio::test]
+    async fn test_callback_routing() {
+        let mut dispatcher = DynamicCallbackModule::new();
+        
+        // Register handlers
+        dispatcher.register_handler("trading", DataFetchHandler).unwrap();
+        dispatcher.register_handler("trading", TraderHandler).unwrap();
+        
+        // Test routing by full path
+        let data_request = DataFetchRequest {
+            symbol: "AAPL".to_string(),
+            start_date: "2024-01-01".to_string(),
+            end_date: "2024-01-03".to_string(),
         };
         
-        // Create the reply slot BEFORE sending the message to prevent race conditions
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<u8>, PythonExecutionError>>();
+        let serialized = bincode::encode_to_vec(&data_request, bincode::config::standard()).unwrap();
         
-        // Create tracker to automatically track metrics for this operation
-        let _metrics_tracker = crate::metrics::OperationTracker::track_callback();
+        // This should work
+        let result = dispatcher.handle_callback("trading.DataFetch", &serialized, 1, TracingContext::default()).await;
+        assert!(result.is_ok());
         
-        // Insert into in_flight map and track pending count
-        {
-            let mut slot = ReplySlot::new();
-            slot.stream_sender = Some(tx);
-            slot.stream_receiver = None; // We'll return the receiver
-            self.in_flight.0.insert(correlation_id, slot);
-            
-            // Track that we now have one more in-flight request
-            self.pending_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        // Test routing by type name only
+        let result = dispatcher.handle_callback("DataFetch", &serialized, 2, TracingContext::default()).await;
+        assert!(result.is_ok());
         
-        // If we have too many pending callbacks, introduce a small adaptive backoff
-        let current_pending = self.pending_count();
-        if current_pending > 1000 {
-            // Adaptive backoff based on pending count
-            let backoff_ms = std::cmp::min(current_pending / 100, 20); // Max 20ms backoff
-            if backoff_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(backoff_ms as u64)).await;
-            }
-        }
-        
-        // Send the write request with careful error handling
-        let write_req = CallbackWriteRequest { envelope };
-        if let Err(e) = self.write_tx.send(write_req) {
-            // Clean up in_flight entry on error and decrement pending count
-            self.in_flight.0.remove(&correlation_id);
-            self.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            
-            // Track the error in metrics
-            crate::metrics::MetricsHandle::callback().track_error("send_failed");
-            
-            return Err(PythonExecutionError::ExecutionError { 
-                message: format!("Failed to send callback write request: {e}") 
-            });
-        }
-        
-        // Convert the receiver into a stream
-        use tokio_stream::wrappers::UnboundedReceiverStream;
-        let stream = UnboundedReceiverStream::new(rx);
-        Ok(Box::pin(stream))
-    }
-}
-
-
-
-pub struct CallbackReceiver<M, H>
-where
-    M: Send + Sync + Decode<()> + 'static,
-    H: CallbackStreamHandler<M> + Clone + Send + Sync + 'static,
-{
-    read_half: tokio::net::unix::OwnedReadHalf,
-    write_half: Option<tokio::net::unix::OwnedWriteHalf>,
-    handler: H,
-    cancellation_token: CancellationToken,
-    _phantom: PhantomData<(M, H)>,
-}
-
-impl<M, H> CallbackReceiver<M, H>
-where
-    M: Send + Sync + Decode<()> + 'static,
-    H: CallbackStreamHandler<M> + Clone + Send + Sync + 'static,
-{
-    pub fn from_duplex(duplex: crate::DuplexUnixStream, handler: H) -> Self {
-        let (read_half, write_half) = duplex.into_inner().into_split();
-        let cancellation_token = CancellationToken::new();
-        Self {
-            read_half,
-            write_half: Some(write_half),
-            handler,
-            cancellation_token,
-            _phantom: PhantomData,
-        }
-    }
-    pub fn shutdown(&self) {
-        self.cancellation_token.cancel();
-    }
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token.clone()
-    }
-    #[instrument(skip(self), fields(message_type = std::any::type_name::<M>()))]
-    pub async fn run(self) -> Result<(), CallbackError> {
-        let CallbackReceiver { read_half, write_half, handler, cancellation_token, _phantom } = self;
-        tracing::debug!(event = "callback_receiver", step = "start", "CallbackReceiver started, waiting for callback messages");
-        
-        // Initialize metrics
-        crate::metrics::init_metrics();
-        
-        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<M>>();
-        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<CallbackEnvelope<CallbackControl>>();
-        let reply_tx = Arc::new(reply_tx);
-        let cancellation_token_reader = cancellation_token.clone();
-        
-        // Create a task to periodically log metrics
-        let metrics_token = cancellation_token.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    _ = metrics_token.cancelled() => {
-                        break;
-                    }
-                    _ = interval.tick() => {
-                        crate::metrics::MetricsReporter::log_metrics_state();
-                    }
-                }
-            }
-        });
-        
-        let reader_task = tokio::spawn(async move {
-            let mut reader = LengthPrefixedRead::new(read_half);
-            let req_tx = req_tx;
-            loop {
-                tokio::select! {
-                    _ = cancellation_token_reader.cancelled() => {
-                        tracing::debug!(event = "callback_receiver", task = "reader", step = "shutdown_signal", "Reader task received shutdown signal, exiting");
-                        drop(req_tx);
-                        break;
-                    }
-                    result = reader.read_msg::<CallbackEnvelope<M>>() => {
-                        let envelope = match result {
-                            Ok(env) => env,
-                            Err(e) => {
-                                if let std::io::ErrorKind::UnexpectedEof = e.kind() {
-                                    tracing::debug!(event = "callback_receiver", task = "reader", step = "read_eof", error = ?e, "Reader task got EOF (expected on clean shutdown)");
-                                } else {
-                                    tracing::error!(event = "callback_receiver", task = "reader", step = "read_error", error = ?e, "Reader task read error, exiting");
-                                }
-                                drop(req_tx);
-                                break;
-                            }
-                        };
-                        tracing::trace!(event = "callback_receiver", task = "reader", step = "msg_received", correlation_id = envelope.correlation_id, "Read callback request from socket");
-                        if req_tx.send(envelope).is_err() {
-                            tracing::debug!(event = "callback_receiver", task = "reader", step = "req_tx_closed", "Request channel closed, exiting");
-                            drop(req_tx);
-                            break;
-                        }
-                    }
-                }
-            }
-            tracing::debug!(event = "callback_receiver", task = "reader", step = "exit", "Reader task exiting");
-            Ok::<(), CallbackError>(())
-        });
-        
-        // Continue with the rest of the run method...
-        let reply_tx_handler = reply_tx.clone();
-        let cancellation_token_handler = cancellation_token.clone();
-        let handler_pool = tokio::spawn(async move {
-            // Create a more flexible concurrency management system
-            // Instead of a fixed semaphore, use an adaptive approach with FuturesUnordered
-            let mut tasks = FuturesUnordered::new();
-            let mut req_rx_closed = false;
-            let handler = handler;
-            
-            // Use a token bucket rate limiter for smoother handling
-            let max_concurrent_tasks = 500; // Much higher limit but still bounded
-            let mut active_tasks: usize = 0;
-            
-            loop {
-                // First check if we need to exit
-                if req_rx_closed && tasks.is_empty() {
-                    tracing::debug!(event = "callback_receiver", task = "handler_pool", step = "drain_complete", 
-                        "All handler tasks complete and request channel closed, breaking loop");
-                    break;
-                }
-
-                tokio::select! {
-                    biased;
-                    
-                    // Process completed tasks first to free up slots
-                    Some(result) = tasks.next(), if !tasks.is_empty() => {
-                        if let Err(e) = result {
-                            tracing::error!(event = "callback_receiver", task = "handler_pool", step = "task_error", error = ?e, "Handler task error");
-                        }
-                        active_tasks = active_tasks.saturating_sub(1);
-                    }
-                    
-                    // Check for cancellation
-                    _ = cancellation_token_handler.cancelled() => {
-                        tracing::debug!(event = "callback_receiver", task = "handler_pool", step = "shutdown_signal", "Handler pool received shutdown signal, breaking loop");
-                        break;
-                    }
-                    
-                    // Process new request or detect channel close
-                    message = req_rx.recv() => {
-                        match message {
-                            Some(envelope) if active_tasks < max_concurrent_tasks => {
-                                let correlation_id = envelope.correlation_id;
-                                let msg = envelope.inner;
-                                let handler = handler.clone();
-                                let reply_tx = reply_tx_handler.clone();
-                                
-                                // Spawn a new task and track it
-                                active_tasks += 1;
-                                tasks.push(tokio::spawn(async move {
-                                    // Create a metrics tracker for this handler operation
-                                    let _metrics_tracker = crate::metrics::OperationTracker::track_callback();
-                                    
-                                    // Handle the streaming callback and serialize to bincode
-                                    match handler.handle_stream(msg).await {
-                                        Ok(mut stream) => {
-                                            // Process each item in the stream, serializing to bincode
-                                            while let Some(result) = stream.next().await {
-                                                let bincode_result = match result {
-                                                    Ok(response) => {
-                                                        match bincode::encode_to_vec(&response, bincode::config::standard()) {
-                                                            Ok(bytes) => Ok(bytes),
-                                                            Err(e) => Err(PythonExecutionError::ExecutionError { 
-                                                                message: format!("Failed to serialize response: {e}")
-                                                            }),
-                                                        }
-                                                    },
-                                                    Err(e) => Err(e),
-                                                };
-                                                
-                                                let reply_envelope = CallbackEnvelope {
-                                                    correlation_id,
-                                                    inner: CallbackControl::StreamItem(bincode_result),
-                                                    context: envelope.context.clone(),
-                                                };
-                                                if let Err(e) = reply_tx.send(reply_envelope) {
-                                                    tracing::error!(event = "callback_receiver", task = "handler_task", step = "send_error", 
-                                                        correlation_id, error = ?e, "Failed to send reply envelope");
-                                                    
-                                                    // Track error in metrics
-                                                    crate::metrics::MetricsHandle::callback().track_error("reply_send_failed");
-                                                    break; // Stop processing on send error
-                                                }
-                                            }
-                                            
-                                            // Send stream completion signal
-                                            let completion_envelope = CallbackEnvelope {
-                                                correlation_id,
-                                                inner: CallbackControl::StreamComplete,
-                                                context: envelope.context.clone(),
-                                            };
-                                            if let Err(e) = reply_tx.send(completion_envelope) {
-                                                tracing::error!(event = "callback_receiver", task = "handler_task", step = "completion_send_error", 
-                                                    correlation_id, error = ?e, "Failed to send stream completion signal");
-                                                
-                                                // Track error in metrics
-                                                crate::metrics::MetricsHandle::callback().track_error("completion_send_failed");
-                                            }
-                                        },
-                                        Err(e) => {
-                                            // Send the error as a single stream item followed by completion
-                                            let reply_envelope = CallbackEnvelope {
-                                                correlation_id,
-                                                inner: CallbackControl::StreamItem(Err(e)),
-                                                context: envelope.context.clone(),
-                                            };
-                                            if let Err(send_err) = reply_tx.send(reply_envelope) {
-                                                tracing::error!(event = "callback_receiver", task = "handler_task", step = "error_send_error", 
-                                                    correlation_id, error = ?send_err, "Failed to send error reply envelope");
-                                                
-                                                // Track error in metrics
-                                                crate::metrics::MetricsHandle::callback().track_error("error_reply_send_failed");
-                                            } else {
-                                                // Send completion signal even after error
-                                                let completion_envelope = CallbackEnvelope {
-                                                    correlation_id,
-                                                    inner: CallbackControl::StreamComplete,
-                                                    context: envelope.context,
-                                                };
-                                                if let Err(e) = reply_tx.send(completion_envelope) {
-                                                    tracing::error!(event = "callback_receiver", task = "handler_task", step = "error_completion_send_error", 
-                                                        correlation_id, error = ?e, "Failed to send error completion signal");
-                                                    
-                                                    // Track error in metrics
-                                                    crate::metrics::MetricsHandle::callback().track_error("error_completion_send_failed");
-                                                }
-                                            }
-                                        }
-                                    }
-                                }));
-                            },
-                            Some(_) => {
-                                // Too many active tasks, sleep briefly and retry
-                                tokio::time::sleep(Duration::from_millis(1)).await;
-                            },
-                            None => {
-                                tracing::debug!(event = "callback_receiver", task = "handler_pool", step = "req_rx_closed", 
-                                    "Request channel closed");
-                                req_rx_closed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            tracing::debug!(event = "callback_receiver", task = "handler_pool", step = "exit", "Handler pool future exiting");
-            Ok::<(), CallbackError>(())
-        });
-        // Rest of the method remains the same...
-        let cancellation_token_writer = cancellation_token.clone();
-        let writer_task = tokio::spawn(async move {
-            let mut writer = LengthPrefixedWrite::new(write_half.expect("write_half missing in CallbackReceiver"));
-            
-            loop {
-                tokio::select! {
-                    _ = cancellation_token_writer.cancelled() => {
-                        trace!(event = "callback_receiver", task = "writer", step = "shutdown_signal", 
-                            "Writer received shutdown, exiting");
-                        break;
-                    }
-                    
-                    message = reply_rx.recv() => {
-                        match message {
-                            Some(reply_envelope) => {
-                                // Process write directly, one at a time
-                                let result = writer.write_msg(&reply_envelope).await;
-                                if let Err(e) = result {
-                                    tracing::error!(event = "callback_receiver", task = "writer", 
-                                        step = "write_error", correlation_id = reply_envelope.correlation_id, 
-                                        error = ?e, "Failed to write reply envelope to socket");
-                                    // Don't break on errors - just log them and continue
-                                    
-                                    // Track error in metrics
-                                    crate::metrics::MetricsHandle::callback().track_error("write_failed");
-                                } else {
-                                    tracing::debug!(event = "callback_receiver", task = "writer", 
-                                        step = "reply_written", correlation_id = reply_envelope.correlation_id,
-                                        "Wrote reply envelope to socket");
-                                }
-                            },
-                            None => {
-                                trace!(event = "callback_receiver", task = "writer", step = "channel_closed", 
-                                    "Reply channel closed, exiting");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            
-            trace!(event = "callback_receiver", task = "writer", step = "exit", "Writer task exiting");
-            Ok::<(), CallbackError>(())
-        });
-        drop(reply_tx);
-        let (reader_res, handler_res, writer_res) = tokio::try_join!(reader_task, handler_pool, writer_task)
-            .map_err(|e| CallbackError::Ipc(std::io::Error::new(std::io::ErrorKind::Other, format!("Join error: {e}"))))?;
-        reader_res?;
-        handler_res?;
-        writer_res?;
-        Ok(())
+        // Test routing by module name (should work if only one handler in module)
+        let result = dispatcher.handle_callback("trading", &serialized, 3, TracingContext::default()).await;
+        assert!(result.is_ok());
     }
 }
 

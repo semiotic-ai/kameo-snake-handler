@@ -26,7 +26,7 @@ run:
 	PATH=crates/kameo-snake-testing/python/venv/bin:$$PATH \
 	PYTHON_GIL=1 \
 	PYO3_PYTHON=$$PYTHON_BIN \
-	cargo run --release -p kameo-snake-testing -- $(ARGS)
+	cargo run --release -p kameo-snake-testing --bin kameo-snake-testing -- $(ARGS)
 
 pyo3-async-test-venv:
 	$(PYTHON) -m venv kameo-pyo3-async-test/python/venv

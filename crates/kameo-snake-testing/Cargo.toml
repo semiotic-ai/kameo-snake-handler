@@ -9,6 +9,8 @@ license = { workspace = true }
 name = "kameo-snake-testing"
 path = "src/main.rs"
 
+
+
 [dependencies]
 kameo = { workspace = true }
 kameo_macros = { workspace = true }

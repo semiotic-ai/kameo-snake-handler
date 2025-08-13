@@ -1,8 +1,11 @@
 use kameo_child_process::KameoChildProcessMessage;
 use tracing::Level;
 use tracing_futures::Instrument;
-use kameo_child_process::callback::{NoopCallbackHandler, CallbackStreamHandler};
+use kameo_child_process::callback::{DynamicCallbackModule, TypedCallbackHandler};
 use std::time::Duration;
+use std::env::current_dir;
+
+use tokio_util::sync::CancellationToken;
 
 /// Builder for a Python child process
 /// NOTE: For PythonActor, use the macro-based entrypoint (setup_python_subprocess_system!). This builder is not supported for PythonActor.
@@ -51,50 +54,43 @@ where
         + Sync
         + 'static,
 {
-    pub fn get_actor(&self) -> kameo::actor::ActorRef<kameo_child_process::SubprocessIpcActor<M>> {
-        let idx = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.actors.len();
-        self.actors[idx].clone()
+    pub fn get_actor(&self) -> &kameo::actor::ActorRef<kameo_child_process::SubprocessIpcActor<M>> {
+        let index = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % self.actors.len();
+        &self.actors[index]
     }
-    pub fn all(&self) -> &[kameo::actor::ActorRef<kameo_child_process::SubprocessIpcActor<M>>] {
-        &self.actors
+    
+    pub fn actor_count(&self) -> usize {
+        self.actors.len()
     }
-    pub async fn shutdown(mut self) {
-        if let Some(write_tx) = self.write_tx.take() {
-            drop(write_tx); // Close the channel to signal writer task
-        }
+    
+    pub fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.kill();
         }
     }
 }
 
-/// Builder for spawning Python child processes with unified streaming support.
+/// Builder for Python child processes with dynamic callback support.
 /// 
-/// This builder provides a fluent interface for configuring and spawning Python subprocesses
-/// that can handle both synchronous and streaming messages. It manages the entire lifecycle
-/// of Python subprocesses, including environment setup, process spawning, and actor pool creation.
-/// 
-/// ## Builder Features
-/// 
-/// - **Python Configuration**: Environment setup, paths, and module configuration
-/// - **Callback Handling**: Configurable callback message handling
-/// - **Process Management**: Automatic subprocess lifecycle management
-/// - **Actor Pool Creation**: Spawn multiple actors for load balancing
-/// - **Streaming Support**: Full support for the unified streaming protocol
+/// This builder supports multiple strongly-typed callback handlers, each responsible
+/// for a specific callback type. Handlers are registered by module and type name,
+/// allowing for flexible organization and automatic routing.
 /// 
 /// ## Generic Parameters
 /// 
 /// - `M`: Main message type for request/response communication
-/// - `C`: Callback message type for bidirectional communication
-/// - `H`: Callback handler type (defaults to `NoopCallbackHandler<C>`)
 /// 
 /// ## Usage Example
 /// 
 /// ```rust
 /// // Create builder with Python configuration
-/// let pool = PythonChildProcessBuilder::<MyMessage, MyCallback>::new(config)
-///     .with_callback_handler(MyCallbackHandler)
+/// let mut builder = PythonChildProcessBuilder::<MyMessage>::new(config);
+/// 
+/// // Add multiple callback handlers
+/// builder
+///     .with_callback_handler("trading", DataFetchHandler)
+///     .with_callback_handler("trading", TraderHandler)
+///     .with_callback_handler("weather", WeatherHandler)
 ///     .log_level(Level::DEBUG)
 ///     .spawn_pool(4, None)
 ///     .await?;
@@ -118,7 +114,7 @@ where
 /// 4. **Actor Pool**: Create multiple actors for concurrent processing
 /// 5. **Communication**: Handle both sync and streaming messages
 /// 6. **Shutdown**: Graceful cleanup of processes and resources
-pub struct PythonChildProcessBuilder<M, C, H = NoopCallbackHandler<C>>
+pub struct PythonChildProcessBuilder<M>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     <M as KameoChildProcessMessage>::Ok: serde::Serialize
@@ -129,20 +125,18 @@ where
         + Send
         + Sync
         + 'static,
-    C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
-    H: CallbackStreamHandler<C> + Clone + Send + Sync + 'static,
 {
     /// Python configuration for subprocess setup
     python_config: crate::PythonConfig,
     /// Logging level for the subprocess
     log_level: Level,
-    /// Handler for callback messages
-    callback_handler: H,
-    /// Phantom data for message and callback types
-    _phantom: std::marker::PhantomData<(M, C)>,
+    /// Dynamic callback module for managing multiple typed handlers
+    callback_module: DynamicCallbackModule,
+    /// Phantom data for message type
+    _phantom: std::marker::PhantomData<M>,
 }
 
-impl<M, C> PythonChildProcessBuilder<M, C, NoopCallbackHandler<C>>
+impl<M> PythonChildProcessBuilder<M>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     <M as KameoChildProcessMessage>::Ok: serde::Serialize
@@ -153,7 +147,6 @@ where
         + Send
         + Sync
         + 'static,
-    C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
 {
     /// Creates a new builder with the given Python configuration and message types.
     pub fn new(python_config: crate::PythonConfig) -> Self {
@@ -173,37 +166,53 @@ where
         Self {
             python_config,
             log_level: Level::INFO,
-            callback_handler: NoopCallbackHandler::<C>::default(),
+            callback_module: DynamicCallbackModule::new(),
             _phantom: std::marker::PhantomData,
         }
     }
-}
-
-impl<M, C, H> PythonChildProcessBuilder<M, C, H>
-where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
-    <M as KameoChildProcessMessage>::Ok: serde::Serialize
-        + for<'de> serde::Deserialize<'de>
-        + bincode::Encode
-        + bincode::Decode<()> 
-        + std::fmt::Debug
-        + Send
-        + Sync
-        + 'static,
-    C: Send + Sync + Clone + 'static + bincode::Encode + bincode::Decode<()> + std::fmt::Debug,
-    H: CallbackStreamHandler<C> + Clone + Send + Sync + 'static,
-{
-    /// Sets the callback handler.
-    pub fn with_callback_handler<T>(self, handler: T) -> PythonChildProcessBuilder<M, C, T>
+    
+    /// Adds a typed callback handler for a specific module and type.
+    /// 
+    /// # Arguments
+    /// * `module_name` - The module name for organizing handlers (e.g., "trading", "weather")
+    /// * `handler` - The typed callback handler implementing `TypedCallbackHandler<C>`
+    /// 
+    /// # Example
+    /// ```rust
+    /// builder.with_callback_handler("trading", DataFetchHandler)
+    /// ```
+    pub fn with_callback_handler<C, H>(mut self, module_name: &str, handler: H) -> Self
     where
-        T: CallbackStreamHandler<C> + Clone + Send + Sync + 'static,
+        C: Send + Sync + bincode::Decode<()> + 'static,
+        H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
-        PythonChildProcessBuilder {
-            python_config: self.python_config,
-            log_level: self.log_level,
-            callback_handler: handler,
-            _phantom: std::marker::PhantomData,
+        if let Err(e) = self.callback_module.register_handler(module_name, handler) {
+            tracing::warn!("Failed to register callback handler: {}", e);
         }
+        self
+    }
+    
+    /// Adds a typed callback handler with automatic module discovery.
+    /// 
+    /// This method uses reflection to automatically determine the module name
+    /// from the handler's type information.
+    /// 
+    /// # Arguments
+    /// * `handler` - The typed callback handler implementing `TypedCallbackHandler<C>`
+    /// 
+    /// # Example
+    /// ```rust
+    /// builder.auto_callback_handler(DataFetchHandler)
+    /// ```
+    pub fn auto_callback_handler<C, H>(mut self, handler: H) -> Self
+    where
+        C: Send + Sync + bincode::Decode<()> + 'static,
+        H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
+    {
+        if let Err(e) = self.callback_module.auto_register_handler(handler) {
+            tracing::warn!("Failed to auto-register callback handler: {}", e);
+        }
+        self
     }
 
     pub fn log_level(mut self, level: Level) -> Self {
@@ -218,9 +227,10 @@ where
     ) -> std::io::Result<PythonChildProcessActorPool<M>>
     {
         use kameo_child_process::spawn_subprocess_ipc_actor;
-        use kameo_child_process::callback::CallbackReceiver;
+        use kameo_child_process::callback::TypedCallbackReceiver;
         use tokio::net::UnixListener;
         let _parent_config = parent_config.unwrap_or_default();
+        
         // Serialize the PythonConfig as JSON for the child
         let config_json = serde_json::to_string(&self.python_config).map_err(|e| {
             std::io::Error::new(
@@ -228,14 +238,24 @@ where
                 format!("Failed to serialize PythonConfig: {e}"),
             )
         })?;
+        
+        // Serialize the callback registry for creating Python modules
+        let callback_registry_json = serde_json::to_string(self.callback_module.get_registry()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize callback registry: {e}"),
+            )
+        })?;
+        
         // Set up the Unix domain sockets
-        let actor_name = std::any::type_name::<crate::PythonActor<M, C>>();
+        let actor_name = std::any::type_name::<crate::PythonActor<M, ()>>();
         let request_socket_path = kameo_child_process::handshake::unique_socket_path(&format!("{}-req", actor_name));
         let callback_socket_path = kameo_child_process::handshake::unique_socket_path(&format!("{}-cb", actor_name));
         let request_endpoint = request_socket_path.to_string_lossy().to_string();
         let callback_endpoint = callback_socket_path.to_string_lossy().to_string();
         let request_incoming = UnixListener::bind(&request_endpoint)?;
         let callback_incoming = UnixListener::bind(&callback_endpoint)?;
+        
         // Spawn child process
         let current_exe = std::env::current_exe()?;
         let mut cmd = tokio::process::Command::new(current_exe);
@@ -259,19 +279,21 @@ where
             // Set Python-specific OTEL environment variables
             cmd.env("PYTHONPATH", format!("{}:{}", 
                 std::env::var("PYTHONPATH").unwrap_or_default(),
-                std::env::current_dir()?.join("crates/kameo-snake-testing/python").to_string_lossy()
+                current_dir()?.join("crates/kameo-snake-testing/python").to_string_lossy()
             ));
         }
         cmd.env("KAMEO_CHILD_ACTOR", actor_name);
         cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());
         cmd.env("KAMEO_CALLBACK_SOCKET", callback_socket_path.to_string_lossy().as_ref());
         cmd.env("KAMEO_PYTHON_CONFIG", config_json);
+        cmd.env("KAMEO_CALLBACK_REGISTRY", callback_registry_json);
         if let Ok(rust_log) = std::env::var("RUST_LOG") {
             cmd.env("RUST_LOG", rust_log);
         }
         cmd.stdout(std::process::Stdio::inherit());
         cmd.stderr(std::process::Stdio::inherit());
         let child = cmd.spawn()?;
+        
         // Accept request connection and perform handshake
         let (mut request_conn, _addr) = tokio::time::timeout(
             Duration::from_secs(30),
@@ -280,30 +302,46 @@ where
         kameo_child_process::perform_handshake::<M>(&mut request_conn, true).await.map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("Handshake failed: {e:?}"))
         })?;
+        
         // Accept callback connection
         let (callback_conn, _addr) = tokio::time::timeout(
             Duration::from_secs(30),
             callback_incoming.accept(),
         ).await??;
-        // Backend and callback receiver setup (copied from backend builder)
+        
+        // Backend and callback receiver setup
         let backend = kameo_child_process::SubprocessIpcBackend::from_duplex(
             kameo_child_process::DuplexUnixStream::new(request_conn)
         );
-        let receiver = CallbackReceiver::<C, H>::from_duplex(
-            kameo_child_process::DuplexUnixStream::new(callback_conn),
-            self.callback_handler.clone(),
+        
+        // Create the typed callback receiver with our dynamic module
+        let callback_module = std::sync::Arc::new(self.callback_module);
+        let (read_half, write_half) = kameo_child_process::DuplexUnixStream::new(callback_conn).into_split();
+        let reader = kameo_child_process::framing::LengthPrefixedRead::new(read_half);
+        let writer = kameo_child_process::framing::LengthPrefixedWrite::new(write_half);
+        
+        // Create a cancellation token for the callback receiver
+        let cancellation_token = CancellationToken::new();
+        let receiver = TypedCallbackReceiver::new(
+            callback_module,
+            reader,
+            writer,
+            cancellation_token.clone(),
         );
+        
         let mut actors = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
             actors.push(spawn_subprocess_ipc_actor(backend.clone()));
         }
+        
+        // Spawn the callback receiver
         tokio::spawn(receiver.run().instrument(tracing::Span::current()));
+        
         Ok(PythonChildProcessActorPool {
             actors,
             next: std::sync::atomic::AtomicUsize::new(0),
             child: Some(child),
             write_tx: None, // No longer needed
-            // callback_shutdown: None, // No longer needed
         })
     }
 }

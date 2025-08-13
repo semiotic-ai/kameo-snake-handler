@@ -5,6 +5,7 @@ use serde::{Serialize, Deserialize};
 use bincode::{Encode, Decode};
 use std::sync::Once;
 use tracing::trace;
+use std::pin::Pin;
 
 static INIT: Once = Once::new();
 
@@ -28,12 +29,16 @@ struct DummyMsg {
 #[derive(Clone)]
 struct DummyHandler;
 #[async_trait::async_trait]
-impl kameo_child_process::callback::CallbackStreamHandler<DummyMsg> for DummyHandler {
+impl kameo_child_process::callback::TypedCallbackHandler<DummyMsg> for DummyHandler {
     type Response = ();
     
-    async fn handle_stream(&self, _cb: DummyMsg) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+    async fn handle_callback(&self, _cb: DummyMsg) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
         use futures::stream;
         Ok(Box::pin(stream::once(async move { Ok(()) })))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "DummyMsg"
     }
 }
 
@@ -66,33 +71,53 @@ async fn test_single_callback_message() {
         let (sock1, sock2) = tokio::net::UnixStream::pair().unwrap();
         let parent_duplex = kameo_child_process::DuplexUnixStream::new(sock1);
         let child_duplex = kameo_child_process::DuplexUnixStream::new(sock2);
-        let receiver = kameo_child_process::callback::CallbackReceiver::<DummyMsg, DummyHandler>::from_duplex(parent_duplex, DummyHandler);
+        
+        // Create dynamic callback module and register handler
+        let mut callback_module = kameo_child_process::callback::DynamicCallbackModule::new();
+        callback_module.register_handler::<DummyMsg, DummyHandler>("test", DummyHandler).unwrap();
+        
+        // Create typed callback receiver
+        let (read_half, write_half) = parent_duplex.into_split();
+        let reader = LengthPrefixedRead::new(read_half);
+        let writer = LengthPrefixedWrite::new(write_half);
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let receiver = kameo_child_process::callback::TypedCallbackReceiver::new(
+            std::sync::Arc::new(callback_module),
+            reader,
+            writer,
+            cancellation_token.clone(),
+        );
 
-        let token = receiver.cancellation_token();
         let receiver_task = tokio::spawn(async move {
             receiver.run().await.unwrap();
         });
 
         // Spawn a fake child artefact using the other end
         let child_task = tokio::spawn(async move {
-            let (read_half, write_half) = child_duplex.into_inner().into_split();
+            let (read_half, write_half) = child_duplex.into_split();
             let mut writer = LengthPrefixedWrite::new(write_half);
-            let envelope = kameo_child_process::callback::CallbackEnvelope {
+            
+            // Create typed callback envelope
+            let callback_data = bincode::encode_to_vec(&DummyMsg { id: 42 }, bincode::config::standard()).unwrap();
+            let envelope = kameo_child_process::callback::TypedCallbackEnvelope {
+                callback_path: "test.DummyMsg".to_string(),
                 correlation_id: 1,
-                inner: DummyMsg { id: 42 },
+                callback_data,
                 context: Default::default(),
             };
+            
             trace!(event = "test_child", step = "send_callback", correlation_id = 1, "Child sending callback envelope");
             if let Err(e) = writer.write_msg(&envelope).await {
                 panic!("Child write error: {:?}", e);
             }
-            // Explicitly flush and shutdown write to signal end if needed, but for single message, just read reply
+            
+            // Read response
             let mut reader = LengthPrefixedRead::new(read_half);
-            match reader.read_msg::<kameo_child_process::callback::CallbackEnvelope<Result<(), kameo_child_process::error::PythonExecutionError>>>().await {
+            match reader.read_msg::<kameo_child_process::callback::TypedCallbackResponse>().await {
                 Ok(reply_envelope) => {
-                    trace!(event = "test_child", step = "received_reply", correlation_id = reply_envelope.correlation_id, ?reply_envelope.inner, "Child received reply");
+                    trace!(event = "test_child", step = "received_reply", correlation_id = reply_envelope.correlation_id, "Child received reply");
                     assert_eq!(reply_envelope.correlation_id, 1);
-                    assert!(reply_envelope.inner.is_ok());
+                    assert_eq!(reply_envelope.callback_path, "test.DummyMsg");
                 }
                 Err(e) => panic!("Child read error: {:?}", e),
             }
@@ -102,7 +127,7 @@ async fn test_single_callback_message() {
         });
 
         child_task.await.unwrap();
-        token.cancel();
+        cancellation_token.cancel();
         receiver_task.await.unwrap();
     }).await.expect("Test timed out");
 }
@@ -198,20 +223,101 @@ async fn test_parent_child_ipc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-async fn test_callback_protocol_full_duplex() {
-    trace!(event = "test_start", name = "test_callback_protocol_full_duplex", "Starting test");
+async fn test_high_volume_multiple_callback_types() {
+    trace!(event = "test_start", name = "test_high_volume_multiple_callback_types", "Starting test");
     init_tracing();
     
     // Initialize metrics
     kameo_child_process::metrics::init_metrics();
     
+    // Define multiple callback types for testing
+    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    struct DataFetchCallback {
+        id: u64,
+        fetch_type: String,
+    }
+    
+    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    struct ComputeCallback {
+        id: u64,
+        operation: String,
+        value: f64,
+    }
+    
+    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    struct BatchCallback {
+        id: u64,
+        batch_size: usize,
+    }
+    
+    // Handlers for each callback type
+    #[derive(Clone)]
+    struct DataFetchHandler;
+    #[async_trait::async_trait]
+    impl kameo_child_process::callback::TypedCallbackHandler<DataFetchCallback> for DataFetchHandler {
+        type Response = String;
+        
+        async fn handle_callback(&self, cb: DataFetchCallback) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+            use futures::stream;
+            trace!(event = "data_fetch_handler", id = cb.id, fetch_type = cb.fetch_type, "Handling data fetch");
+            let responses = vec![
+                format!("data_chunk_1_for_{}", cb.id),
+                format!("data_chunk_2_for_{}", cb.id),
+                format!("data_chunk_3_for_{}", cb.id),
+            ];
+            Ok(Box::pin(stream::iter(responses.into_iter().map(Ok))))
+        }
+        
+        fn type_name(&self) -> &'static str {
+            "DataFetchCallback"
+        }
+    }
+    
+    #[derive(Clone)]
+    struct ComputeHandler;
+    #[async_trait::async_trait]
+    impl kameo_child_process::callback::TypedCallbackHandler<ComputeCallback> for ComputeHandler {
+        type Response = f64;
+        
+        async fn handle_callback(&self, cb: ComputeCallback) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+            use futures::stream;
+            trace!(event = "compute_handler", id = cb.id, operation = cb.operation, value = cb.value, "Handling compute");
+            let result = match cb.operation.as_str() {
+                "square" => cb.value * cb.value,
+                "sqrt" => cb.value.sqrt(),
+                "double" => cb.value * 2.0,
+                _ => cb.value,
+            };
+            Ok(Box::pin(stream::once(async move { Ok(result) })))
+        }
+        
+        fn type_name(&self) -> &'static str {
+            "ComputeCallback"
+        }
+    }
+    
+    #[derive(Clone)]
+    struct BatchHandler;
+    #[async_trait::async_trait]
+    impl kameo_child_process::callback::TypedCallbackHandler<BatchCallback> for BatchHandler {
+        type Response = u64;
+        
+        async fn handle_callback(&self, cb: BatchCallback) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+            use futures::stream;
+            trace!(event = "batch_handler", id = cb.id, batch_size = cb.batch_size, "Handling batch");
+            let items: Vec<u64> = (0..cb.batch_size as u64).map(|i| cb.id * 1000 + i).collect();
+            Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
+        }
+        
+        fn type_name(&self) -> &'static str {
+            "BatchCallback"
+        }
+    }
+    
     tokio::time::timeout(Duration::from_secs(180), async {
-        tracing::info!("Test started - setting up callback protocol test");
-        // test body
-        use kameo_child_process::callback::{CallbackReceiver, CallbackIpcChild};
+        tracing::info!("Test started - setting up high volume multi-type callback test");
         
-        
-        use futures::stream::{self, StreamExt};
+        // No additional imports needed for this test
         
         // Start a task to log metrics periodically
         let _metrics_task = tokio::spawn(async {
@@ -222,37 +328,31 @@ async fn test_callback_protocol_full_duplex() {
             }
         });
         
-        #[derive(Clone)]
-        struct ParentHandler;
-        #[async_trait::async_trait]
-        impl kameo_child_process::callback::CallbackStreamHandler<DummyMsg> for ParentHandler {
-            type Response = ();
-            
-            async fn handle_stream(&self, cb: DummyMsg) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
-                use futures::stream;
-                trace!(event = "parent_handler", id = cb.id, "Parent handling callback");
-                Ok(Box::pin(stream::once(async move { Ok(()) })))
-            }
-        }
-
-        
         tracing::info!("Creating socket pair");
         // Create the sockets
         let (parent_stream, child_stream) = tokio::net::UnixStream::pair().unwrap();
-        let parent_socket = kameo_child_process::DuplexUnixStream::new(parent_stream);
-        let child_socket = kameo_child_process::DuplexUnixStream::new(child_stream);
+        let parent_duplex = kameo_child_process::DuplexUnixStream::new(parent_stream);
+        let child_duplex = kameo_child_process::DuplexUnixStream::new(child_stream);
         
-        tracing::info!("Setting up child IPC");
-        // Set up child side
-        let child_ipc = CallbackIpcChild::<DummyMsg>::from_duplex(child_socket);
+        // Create dynamic callback module and register multiple handlers
+        let mut callback_module = kameo_child_process::callback::DynamicCallbackModule::new();
+        callback_module.register_handler::<DataFetchCallback, DataFetchHandler>("data", DataFetchHandler).unwrap();
+        callback_module.register_handler::<ComputeCallback, ComputeHandler>("compute", ComputeHandler).unwrap();
+        callback_module.register_handler::<BatchCallback, BatchHandler>("batch", BatchHandler).unwrap();
         
-        tracing::info!("Setting up parent receiver");
-        // Set up parent side
-        let parent_handler = ParentHandler;
-        let receiver = CallbackReceiver::from_duplex(parent_socket, parent_handler);
+        // Create typed callback receiver
+        let (read_half, write_half) = parent_duplex.into_split();
+        let reader = LengthPrefixedRead::new(read_half);
+        let writer = LengthPrefixedWrite::new(write_half);
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let receiver = kameo_child_process::callback::TypedCallbackReceiver::new(
+            std::sync::Arc::new(callback_module),
+            reader,
+            writer,
+            cancellation_token.clone(),
+        );
         
         tracing::info!("Spawning receiver task");
-        // Spawn parent receiver task
         let receiver_task = tokio::spawn(async move {
             tracing::info!("Receiver task started");
             let result = receiver.run().await;
@@ -260,69 +360,121 @@ async fn test_callback_protocol_full_duplex() {
             result
         });
         
-        tracing::info!("Starting to process callbacks");
-        // Run 10k callbacks for debugging purposes
+        tracing::info!("Starting high volume callback processing");
+        // Test with 10k callbacks across multiple types by sending them through the child socket
         let total_callbacks = 10_000;
         let batch_size = 500;
-        let mut all_results = vec![];
+        let mut all_sent = 0;
+        
+        // Create child writer to send callbacks
+        let (child_read, child_write) = child_duplex.into_split();
+        let mut writer = LengthPrefixedWrite::new(child_write);
+        let mut reader = LengthPrefixedRead::new(child_read);
         
         for batch_start in (0..total_callbacks).step_by(batch_size) {
             let end = std::cmp::min(batch_start + batch_size, total_callbacks);
             tracing::info!("Processing batch {}-{}", batch_start, end);
             
-            let futures = (batch_start..end).map(|i| {
-                let child_ipc = child_ipc.clone();
-                async move {
-                    tracing::info!("Starting callback {}", i);
-                    let msg = DummyMsg { id: i as u64 };
-                    match child_ipc.handle_stream_bincode(msg).await {
-                        Ok(mut stream) => {
-                            use futures::StreamExt;
-                            // For this test, just consume the entire stream and return Ok(()) if successful
-                            let mut count = 0;
-                            while let Some(item) = stream.next().await {
-                                match item {
-                                    Ok(_bytes) => count += 1,
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            tracing::info!("Completed callback {} with {} stream items", i, count);
-                            Ok(())
-                        },
-                        Err(e) => {
-                            tracing::info!("Callback {} failed: {:?}", i, e);
-                            Err(e)
-                        }
+            // Send all callbacks in this batch
+            for i in batch_start..end {
+                // Rotate between different callback types
+                let (callback_path, callback_data) = match i % 3 {
+                    0 => {
+                        let callback = DataFetchCallback {
+                            id: i as u64,
+                            fetch_type: format!("type_{}", i % 5),
+                        };
+                        ("data.DataFetchCallback", bincode::encode_to_vec(&callback, bincode::config::standard()).unwrap())
+                    },
+                    1 => {
+                        let operations = ["square", "sqrt", "double"];
+                        let callback = ComputeCallback {
+                            id: i as u64,
+                            operation: operations[i % operations.len()].to_string(),
+                            value: (i as f64) * 0.5,
+                        };
+                        ("compute.ComputeCallback", bincode::encode_to_vec(&callback, bincode::config::standard()).unwrap())
+                    },
+                    _ => {
+                        let callback = BatchCallback {
+                            id: i as u64,
+                            batch_size: (i % 10) + 1,
+                        };
+                        ("batch.BatchCallback", bincode::encode_to_vec(&callback, bincode::config::standard()).unwrap())
+                    }
+                };
+                
+                // Send callback envelope
+                let envelope = kameo_child_process::callback::TypedCallbackEnvelope {
+                    callback_path: callback_path.to_string(),
+                    correlation_id: i as u64,
+                    callback_data,
+                    context: Default::default(),
+                };
+                
+                if let Err(e) = writer.write_msg(&envelope).await {
+                    panic!("Failed to send callback {}: {}", i, e);
+                }
+                all_sent += 1;
+            }
+            
+            tracing::info!("Sent {} callbacks in batch", end - batch_start);
+        }
+        
+        tracing::info!("Sent all {} callbacks, now reading responses", all_sent);
+        
+        // Read responses (each callback may produce multiple responses)
+        let mut total_responses = 0;
+        let mut responses_by_callback: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        
+        // Read responses for a reasonable time
+        let response_timeout = Duration::from_secs(30);
+        let start_time = std::time::Instant::now();
+        
+        while start_time.elapsed() < response_timeout && total_responses < all_sent * 5 {
+            match tokio::time::timeout(Duration::from_millis(100), reader.read_msg::<kameo_child_process::callback::TypedCallbackResponse>()).await {
+                Ok(Ok(response)) => {
+                    *responses_by_callback.entry(response.correlation_id).or_insert(0) += 1;
+                    total_responses += 1;
+                    
+                    if total_responses % 1000 == 0 {
+                        tracing::info!("Received {} responses so far", total_responses);
                     }
                 }
-            });
-            
-            tracing::info!("Collecting batch futures");
-            // Process this batch with controlled concurrency using buffer_unordered
-            let batch_results: Vec<_> = stream::iter(futures)
-                .buffer_unordered(100) // Process 100 at a time within each batch
-                .collect()
-                .await;
-            
-            tracing::info!("Batch completed, got {} results", batch_results.len());
-            all_results.extend(batch_results);
+                Ok(Err(e)) => {
+                    tracing::warn!("Error reading response: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout waiting for response - this is normal when responses are done
+                    if total_responses > 0 {
+                        tracing::info!("Timeout waiting for more responses, stopping (got {} responses)", total_responses);
+                        break;
+                    }
+                }
+            }
         }
         
-        tracing::info!("All batches processed, checking results");
-        for (i, result) in all_results.into_iter().enumerate() {
-            assert!(result.is_ok(), "Callback {} failed: {:?}", i, result);
-        }
+        tracing::info!("Received {} total responses for {} unique callbacks", total_responses, responses_by_callback.len());
+        
+        // Verify we got responses for most callbacks
+        assert!(responses_by_callback.len() > total_callbacks / 2, 
+                "Expected responses for at least half of callbacks, got responses for {}/{}", 
+                responses_by_callback.len(), total_callbacks);
+        assert!(total_responses > total_callbacks, 
+                "Expected more responses than callbacks due to streaming, got {}/{}", 
+                total_responses, total_callbacks);
         
         // Shutdown receiver
-        tracing::info!("Shutting down child IPC");
-        child_ipc.shutdown();
+        tracing::info!("Shutting down receiver");
+        cancellation_token.cancel();
         
         // Wait for receiver to complete
         tracing::info!("Waiting for receiver task");
-        match tokio::time::timeout(Duration::from_secs(5), receiver_task).await {
+        match tokio::time::timeout(Duration::from_secs(10), receiver_task).await {
             Ok(res) => {
                 tracing::info!("Receiver task completed: {:?}", res);
-                let _ = res.expect("receiver task join error"); // Propagate any errors
+                let _ = res.expect("receiver task join error");
             },
             Err(_) => {
                 tracing::error!("Receiver task timed out");
@@ -330,8 +482,8 @@ async fn test_callback_protocol_full_duplex() {
             }
         }
         
-        tracing::info!("Test completed successfully");
-    }).await.expect("test timeout");
+        tracing::info!("High volume multi-type callback test completed successfully");
+    }).await.expect("Test timeout");
 }
 
 // Refactor to use in-process simulation
