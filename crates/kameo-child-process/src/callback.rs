@@ -302,6 +302,7 @@ pub struct TypedCallbackResponse {
     pub response_type: String,        // e.g., "DataFetchResponse" 
     pub response_data: Vec<u8>,      // Serialized response data
     pub correlation_id: u64,
+    pub is_final: bool,              // true if this is the last response in the stream
 }
 
 /// Main callback receiver that handles typed callbacks
@@ -387,6 +388,7 @@ impl TypedCallbackReceiver {
                                                         response_type: response_type_name.clone(),
                                                         response_data,
                                                         correlation_id,
+                                                        is_final: false, // Not the final response
                                                     };
                                                     
                                                     // Send response back through the channel
@@ -401,6 +403,19 @@ impl TypedCallbackReceiver {
                                                 }
                                             }
                                         }
+                                        
+                                        // Send final termination signal after stream ends
+                                        let final_response = TypedCallbackResponse {
+                                            callback_path: callback_path.clone(),
+                                            response_type: "StreamTermination".to_string(),
+                                            response_data: Vec::new(), // Empty data for termination signal
+                                            correlation_id,
+                                            is_final: true, // This is the final response
+                                        };
+                                        if let Err(e) = response_tx.send(final_response) {
+                                            error!("Failed to send final response through channel: {}", e);
+                                        }
+                                        trace!("Sent stream termination signal for callback {}", callback_path);
                                     }
                                     Err(e) => {
                                         error!("Failed to handle callback {}: {}", callback_path, e);
@@ -410,6 +425,7 @@ impl TypedCallbackReceiver {
                                             response_type: "ErrorResponse".to_string(),
                                             response_data: bincode::encode_to_vec(&e, bincode::config::standard()).unwrap_or_default(),
                                             correlation_id,
+                                            is_final: true, // Error responses are also final
                                         };
                                         if let Err(e) = response_tx.send(error_response) {
                                             error!("Failed to send error response through channel: {}", e);

@@ -169,6 +169,13 @@ macro_rules! setup_python_subprocess_system {
                                         return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
                                     }
                                     
+                                    // Check if this is the final response (stream termination)
+                                    if response.is_final {
+                                        tracing::info!("🏁 Received final response for correlation_id {}, terminating stream", correlation_id);
+                                        exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                                    }
+                                    
                                     // Increment count and return response
                                     let item_count = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                                     tracing::info!("🎯 Yielding response item {} for correlation_id {}", item_count, correlation_id);
@@ -179,6 +186,7 @@ macro_rules! setup_python_subprocess_system {
                                             "callback_path": response.callback_path,
                                             "response_type": response.response_type,
                                             "item_number": item_count,
+                                            "is_final": response.is_final,
                                             "data": String::from_utf8_lossy(&response.response_data)
                                         });
                                         use kameo_snake_handler::serde_py::to_pyobject;
