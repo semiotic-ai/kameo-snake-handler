@@ -1,3 +1,50 @@
+/// Setup macro for Python subprocess systems with dynamic callback support.
+/// 
+/// This macro generates the main entry point for Python subprocess binaries. It handles
+/// the complex initialization required for Python-Rust interop, callback systems, and
+/// process lifecycle management.
+/// 
+/// ## Architecture Overview
+/// 
+/// The macro creates a multi-actor system where:
+/// - **Parent Process**: Rust application with DynamicCallbackModule for handling callbacks
+/// - **Child Process**: Python subprocess with kameo module injected for IPC communication
+/// - **Callback System**: Bidirectional streaming communication over Unix sockets
+/// 
+/// ## Generated Structure
+/// 
+/// 1. **Actor Registration**: Registers actor types based on message types
+/// 2. **Child Initialization**: Sets up Python runtime, injects kameo module, establishes IPC
+/// 3. **Callback Infrastructure**: Creates dynamic Python modules based on registered handlers
+/// 4. **Process Lifecycle**: Handles startup, communication, and graceful shutdown
+/// 
+/// ## Python Side Integration
+/// 
+/// The macro automatically creates:
+/// - `kameo.callback_handle(path, data)` - Legacy string-based callback API
+/// - `kameo.{module}.{HandlerType}(data)` - Elegant module-based callback API
+/// 
+/// ## Usage Example
+/// 
+/// ```rust
+/// kameo_snake_handler::setup_python_subprocess_system! {
+///     actor = (MyMessage),
+///     child_init = {
+///         // Child process initialization
+///         tracing_subscriber::fmt().init();
+///         kameo_child_process::RuntimeConfig {
+///             flavor: kameo_child_process::RuntimeFlavor::MultiThread,
+///             worker_threads: Some(2),
+///         }
+///     },
+///     parent_init = {
+///         // Parent process initialization
+///         tracing_subscriber::fmt().init();
+///         tokio::runtime::Builder::new_multi_thread().build()?
+///             .block_on(async { Ok(()) })?
+///     }
+/// }
+/// ```
 #[macro_export]
 macro_rules! setup_python_subprocess_system {
     (
@@ -28,16 +75,45 @@ macro_rules! setup_python_subprocess_system {
                         // In the new dynamic callback system, callbacks are handled by the parent process
                         // through DynamicCallbackModule, so we don't need static callback handlers here
                         
+                        /// Core callback handler injected into Python as `kameo.callback_handle`.
+                        /// 
+                        /// This function bridges Python callback requests to the Rust parent process
+                        /// via IPC over Unix sockets. It implements the dynamic callback protocol
+                        /// where Python specifies the handler path and the parent routes the request
+                        /// to the appropriate typed handler.
+                        /// 
+                        /// ## Protocol Flow
+                        /// 
+                        /// 1. **Python Request**: Python calls with (callback_path, data)
+                        /// 2. **Serialization**: Convert Python data to TypedCallbackEnvelope
+                        /// 3. **IPC Send**: Send envelope over shared Unix socket to parent
+                        /// 4. **Response Stream**: Return CallbackAsyncIterator for streaming responses
+                        /// 
+                        /// ## Connection Management
+                        /// 
+                        /// Uses a shared Unix socket connection stored in CALLBACK_CONNECTION.
+                        /// The connection is established once during child startup and reused
+                        /// for all callback requests from this child process.
+                        /// 
+                        /// ## Arguments
+                        /// 
+                        /// - `callback_path`: Handler path like "module.HandlerType" 
+                        /// - `py_msg`: Python message data to be sent to the handler
+                        /// 
+                        /// ## Returns
+                        /// 
+                        /// CallbackAsyncIterator that can be used with Python's `async for`
+                        /// to receive streaming responses from the Rust handler.
                         #[pyo3::pyfunction]
                         fn callback_handle_inner<'py>(py: pyo3::Python<'py>, callback_path: &str, py_msg: &pyo3::Bound<'py, pyo3::PyAny>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-                            // Convert Python message to callback data
+                            // Convert Python message to callback data using our serde integration
                             let callback_data: serde_json::Value = match kameo_snake_handler::serde_py::from_pyobject(py_msg) {
                                 Ok(data) => data,
                                 Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to convert Python message: {e}"))),
                             };
                             
-                            // Create TypedCallbackEnvelope
-                            // Generate correlation ID for this callback
+                            // Generate unique correlation ID for request/response matching
+                            // Using nanosecond timestamp ensures uniqueness within a process
                             let correlation_id = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -93,11 +169,43 @@ macro_rules! setup_python_subprocess_system {
                             })?.unbind())
                         }
                         
+                        /// Python async iterator for streaming callback responses.
+                        /// 
+                        /// This struct implements Python's async iterator protocol (__aiter__, __anext__)
+                        /// to provide a native Python interface for receiving streaming responses from
+                        /// Rust callback handlers in the parent process.
+                        /// 
+                        /// ## Protocol Implementation
+                        /// 
+                        /// - **__aiter__()**: Returns self (required by Python async iterator protocol)
+                        /// - **__anext__()**: Reads next response from Unix socket, handles stream termination
+                        /// 
+                        /// ## Response Handling
+                        /// 
+                        /// 1. Reads TypedCallbackResponse messages from the shared Unix socket
+                        /// 2. Filters responses by correlation_id to handle concurrent callbacks
+                        /// 3. Deserializes response data and yields to Python
+                        /// 4. Handles stream termination via `is_final` flag
+                        /// 
+                        /// ## Connection Sharing
+                        /// 
+                        /// Uses Arc<Mutex<UnixStream>> to safely share the callback socket between
+                        /// multiple concurrent callback requests from the same child process.
+                        /// 
+                        /// ## State Management
+                        /// 
+                        /// - `exhausted`: Atomic flag indicating stream completion
+                        /// - `count`: Atomic counter for received response items
+                        /// - `correlation_id`: Unique ID for filtering responses to this callback
                         #[pyo3::pyclass]
                         struct CallbackAsyncIterator {
+                            /// Shared connection to parent process for reading responses
                             callback_conn: std::sync::Arc<tokio::sync::Mutex<tokio::net::UnixStream>>,
+                            /// Unique ID for this callback request (filters responses)
                             correlation_id: u64,
+                            /// Atomic flag indicating if the stream has been exhausted
                             exhausted: Arc<std::sync::atomic::AtomicBool>,
+                            /// Atomic counter for the number of items received
                             count: Arc<std::sync::atomic::AtomicUsize>,
                         }
                         

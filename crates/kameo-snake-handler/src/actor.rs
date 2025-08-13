@@ -1,4 +1,5 @@
 use kameo_child_process::error::PythonExecutionError;
+use kameo_child_process::TracingContext;
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
@@ -191,8 +192,28 @@ impl PythonMessageHandler {
         })
     }
     
-
-    
+    /// Shared OTEL setup logic for Python function calls.
+    /// 
+    /// This method handles the complex OTEL context setup that's shared between sync and async calls.
+    /// It extracts trace context, sets up Python OTEL context, and creates carrier dicts.
+    /// The caller is responsible for importing the run_with_otel_context function and making the call.
+    fn prepare_otel_context(
+        tracing_context: Option<&TracingContext>,
+    ) -> opentelemetry::Context {
+        // Get context to inject (from envelope if present, else current)
+        let context_to_inject = if let Some(tc) = tracing_context {
+            tc.extract_parent()
+        } else {
+            opentelemetry::Context::current()
+        };
+        
+        // Setup Python OTEL context
+        if let Err(e) = crate::tracing_utils::setup_python_otel_context(&context_to_inject) {
+            tracing::error!("Failed to setup Python OTEL context: {:?}", e);
+        }
+        
+        context_to_inject
+    }
 
 }
 
@@ -758,18 +779,9 @@ impl PythonMessageHandler {
             
             async {
                 let fut_result = Python::with_gil(|py| {
-                if self.config.enable_otel_propagation {
-                        // Get context to inject (from envelope if present, else current)
-                    let context_to_inject = if let Some(ref tc) = tracing_context {
-                        tc.extract_parent()
-                    } else {
-                            opentelemetry::Context::current()
-                        };
-                        
-                        // Setup Python OTEL context
-                        if let Err(e) = crate::tracing_utils::setup_python_otel_context(&context_to_inject) {
-                            tracing::error!("Failed to setup Python OTEL context: {:?}", e);
-                        }
+                    if self.config.enable_otel_propagation {
+                        // Use the shared OTEL setup logic
+                        let context_to_inject = Self::prepare_otel_context(tracing_context.as_ref());
                         
                         // Extract trace context to carrier format
                         let mut carrier = std::collections::HashMap::new();
@@ -793,14 +805,14 @@ impl PythonMessageHandler {
                                 match py.import("__main__") {
                                     Ok(main) => match main.getattr("run_with_otel_context") {
                                         Ok(func) => func,
-                            Err(e) => {
+                                        Err(e) => {
                                             return Err(PythonExecutionError::CallError {
                                                 function: function_name.clone(),
                                                 message: format!("Failed to get run_with_otel_context: {}", e),
                                             });
                                         }
-                            },
-                            Err(e) => {
+                                    },
+                                    Err(e) => {
                                         return Err(PythonExecutionError::CallError {
                                             function: function_name.clone(),
                                             message: format!("Failed to import __main__: {}", e),
@@ -832,20 +844,20 @@ impl PythonMessageHandler {
                             Ok(fut) => Ok(fut),
                             Err(e) => Err(PythonExecutionError::from(e)),
                         }
-                } else {
+                    } else {
                         // OTEL propagation disabled - call function directly
-                    let py_func = py_function.bind(py);
-                    let coro = match py_func.call1((py_msg,)) {
+                        let py_func = py_function.bind(py);
+                        let coro = match py_func.call1((py_msg,)) {
                             Ok(result) => result,
-                        Err(e) => {
-                            return Err(PythonExecutionError::CallError {
-                                function: function_name.clone(),
-                                message: e.to_string(),
+                            Err(e) => {
+                                return Err(PythonExecutionError::CallError {
+                                    function: function_name.clone(),
+                                    message: e.to_string(),
                                 });
-                        }
-                    };
-                    match into_future(coro) {
-                        Ok(fut) => Ok(fut),
+                            }
+                        };
+                        match into_future(coro) {
+                            Ok(fut) => Ok(fut),
                             Err(e) => Err(PythonExecutionError::from(e)),
                         }
                     }
@@ -886,18 +898,9 @@ except Exception:
             
             async {
                 let result = Python::with_gil(|py| {
-                if self.config.enable_otel_propagation {
-                        // Get context to inject (from envelope if present, else current)
-                    let context_to_inject = if let Some(ref tc) = tracing_context {
-                        tc.extract_parent()
-                    } else {
-                            opentelemetry::Context::current()
-                    };
-                    
-                        // Setup Python OTEL context
-                    if let Err(e) = crate::tracing_utils::setup_python_otel_context(&context_to_inject) {
-                            tracing::error!("Failed to setup Python OTEL context: {:?}", e);
-                        }
+                    if self.config.enable_otel_propagation {
+                        // Use the shared OTEL setup logic
+                        let context_to_inject = Self::prepare_otel_context(tracing_context.as_ref());
                         
                         // Extract trace context to carrier format
                         let mut carrier = std::collections::HashMap::new();
@@ -957,15 +960,15 @@ except Exception:
                         }
                     } else {
                         // OTEL propagation disabled - call function directly
-                    let py_func = py_function.bind(py);
-                    match py_func.call1((py_msg,)) {
-                        Ok(result) => Ok(result.into()),
-                        Err(e) => {
-                            Err(PythonExecutionError::CallError {
-                                function: function_name.clone(),
-                                message: e.to_string(),
-                            })
-                        },
+                        let py_func = py_function.bind(py);
+                        match py_func.call1((py_msg,)) {
+                            Ok(result) => Ok(result.into()),
+                            Err(e) => {
+                                Err(PythonExecutionError::CallError {
+                                    function: function_name.clone(),
+                                    message: e.to_string(),
+                                })
+                            },
                         }
                     }
                 });

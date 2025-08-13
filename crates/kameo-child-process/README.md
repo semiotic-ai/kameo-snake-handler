@@ -1,18 +1,22 @@
 # kameo-child-process
 
-A Rust crate for robust, async, protocol-correct child process management and IPC.
+A Rust crate for robust, async, protocol-correct child process management and IPC with dynamic callback routing.
 
-This crate provides the generic process/IPC/actor/callback engine for the Kameo system.
+This crate provides the generic process/IPC/actor/callback engine for the Kameo system, supporting both synchronous and streaming communication patterns.
+
 ---
 
 ## Features
 
-- **SubprocessActor**: Actor for managing a child process and async IPC.
-- **ChildProcessBuilder**: Builder for configuring and spawning child process actors.
-- **Callback system**: Typed, async callback IPC between parent and child.
-- **Handshake protocol**: Strict, traceable handshake for process startup.
-- **Error types**: Rich, typed error handling for all protocol and IPC failures.
-- **Tracing**: Deep, async-aware tracing for all message flows and errors.
+- **SubprocessIpcBackend**: Core IPC backend for parent-child communication over Unix sockets
+- **SubprocessIpcActor**: Kameo actor wrapper providing async message handling
+- **DynamicCallbackModule**: Runtime callback registration with automatic routing and type safety
+- **TypedCallbackHandler**: Strongly-typed, streaming callback handlers
+- **Unified Streaming Protocol**: All responses treated as streams for consistency
+- **Handshake Protocol**: Strict connection establishment with timeout handling
+- **Error Handling**: Rich, typed error propagation across process boundaries
+- **Distributed Tracing**: OpenTelemetry integration with span propagation
+- **Metrics Collection**: Performance monitoring with correlation ID tracking
 
 ---
 
@@ -55,19 +59,32 @@ sequenceDiagram
 
 ---
 
-### 3. Callback Flow (if used)
+### 3. Dynamic Callback System
 
 ```mermaid
 sequenceDiagram
     participant Child as Child Process
-    participant Callback as Callback Handler
+    participant Parent as Parent Process
+    participant DynamicModule as DynamicCallbackModule
+    participant Handler as TypedCallbackHandler
 
-    Child->>Callback: CallbackHandle.ask(callback_msg)
-    Callback->>Child: Callback reply
+    Child->>Parent: TypedCallbackEnvelope(path="trading.DataFetch", data=...)
+    Parent->>DynamicModule: Route by callback_path
+    DynamicModule->>Handler: handle_callback(typed_data)
+    Handler-->>DynamicModule: Stream<Response>
+    DynamicModule-->>Parent: Stream<TypedCallbackResponse>
+    Parent-->>Child: TypedCallbackResponse(is_final=false)
+    Parent-->>Child: TypedCallbackResponse(is_final=false)  
+    Parent-->>Child: TypedCallbackResponse(is_final=true)
 ```
 
-- The child can send callback requests to the parent (or a callback handler) using the callback socket.
-- The callback handler processes the request and replies.
+**Key Features:**
+
+- **Dynamic Routing**: Callbacks routed by path (e.g., "trading.DataFetch") to registered handlers
+- **Type Safety**: Each handler strongly typed for request/response types
+- **Streaming Responses**: All handlers return async streams, supporting both single and multi-item responses
+- **Connection Sharing**: Single Unix socket shared across multiple concurrent callback requests
+- **Correlation IDs**: Responses matched to requests via unique correlation identifiers
 
 ---
 
@@ -79,26 +96,102 @@ sequenceDiagram
 
 ## Key Types & Traits
 
-- **SubprocessActor**: The main actor for a child process.
-- **ChildProcessBuilder**: Fluent builder for configuring and spawning actors.
-- **CallbackHandler / NoopCallbackHandler**: Trait and default impl for handling callback messages.
-- **ChildCallbackMessage**: Trait for callback message types.
-- **ProtocolError, SubprocessActorError**: Rich error types for all protocol and IPC failures.
+### Core IPC Components
+
+- **`SubprocessIpcBackend<M>`**: Core IPC backend managing Unix socket communication and multiplexing
+- **`SubprocessIpcActor<M>`**: Kameo actor wrapper providing async message interface
+- **`KameoChildProcessMessage`**: Trait for message types with associated response types
+
+### Dynamic Callback System
+
+- **`DynamicCallbackModule`**: Runtime callback registration and routing by module/type path
+- **`TypedCallbackHandler<C>`**: Trait for strongly-typed callback handlers with streaming responses
+- **`TypedCallbackReceiver`**: Component that receives and dispatches callback requests
+- **`TypedCallbackEnvelope`**: Request envelope with callback path, correlation ID, and serialized data
+- **`TypedCallbackResponse`**: Response envelope with streaming termination flag (`is_final`)
+
+### Protocol Types
+
+- **`Control<T>`**: Protocol control messages (Handshake, Sync, Stream, StreamEnd)
+- **`MultiplexEnvelope<T>`**: Message wrapper with correlation ID and tracing context
+- **`ReplySlot<R>`**: Unified slot for both sync and streaming response handling
+
+### Error Types
+
+- **`PythonExecutionError`**: Rich error types for execution, serialization, and IPC failures
+- **`SubprocessIpcBackendError`**: Protocol and connection-level error types
 
 ---
 
-## Example: Spawning a Child Process
+## Example: Using the Dynamic Callback System
+
+### Rust Parent Process
 
 ```rust
-use kameo_child_process::{ChildProcessBuilder, NoopCallbackHandler, SubprocessActor, KameoChildProcessMessage};
+use kameo_child_process::callback::{DynamicCallbackModule, TypedCallbackHandler};
+use serde::{Serialize, Deserialize};
+use bincode::{Encode, Decode};
 
-let builder = ChildProcessBuilder::<SubprocessActor<MyMsg, MyCallback, MyError>, MyMsg, MyCallback, MyError>::new()
-    .with_actor_name("my_actor")
-    .log_level(tracing::Level::INFO);
+// Define your callback types
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+struct DataFetchRequest {
+    symbol: String,
+    start_date: String,
+}
 
-let (actor_ref, callback_receiver) = builder.spawn(NoopCallbackHandler).await?;
-tokio::spawn(callback_receiver.run());
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+struct DataFetchResponse {
+    data: Vec<f64>,
+    timestamp: String,
+}
+
+// Implement the handler
+struct DataFetchHandler;
+
+#[async_trait::async_trait]
+impl TypedCallbackHandler<DataFetchRequest> for DataFetchHandler {
+    type Response = DataFetchResponse;
+    
+    async fn handle_callback(
+        &self, 
+        request: DataFetchRequest
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        // Return streaming responses
+        let responses = (0..5).map(|i| {
+            Ok(DataFetchResponse {
+                data: vec![100.0 + i as f64; 10],
+                timestamp: format!("2024-01-{:02}", i + 1),
+            })
+        });
+        Ok(Box::pin(futures::stream::iter(responses)))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "DataFetch"
+    }
+}
+
+// Register handler and spawn subprocess
+let mut callback_module = DynamicCallbackModule::new();
+callback_module.register_handler("trading", DataFetchHandler)?;
+
+// Use with subprocess (see kameo-snake-handler crate for Python integration)
 ```
+
+### Dynamic Routing
+
+Callbacks are automatically routed based on the path:
+
+- `"trading.DataFetch"` → `DataFetchHandler` in "trading" module
+- `"weather.CurrentConditions"` → `CurrentConditionsHandler` in "weather" module
+- etc.
+
+Handlers can return:
+
+- **Single responses**: Stream with one item
+- **Multiple responses**: Stream with many items
+- **Empty responses**: Empty stream
+- **Errors**: Error variants in stream items
 
 ---
 

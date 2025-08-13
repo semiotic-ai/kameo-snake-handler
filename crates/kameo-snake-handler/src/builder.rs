@@ -23,6 +23,11 @@ impl Default for ParentActorLoopConfig {
 }
 
 // --- Actor Pool for Python Child Process ---
+/// Pool of Python child process actors for load balancing and concurrency.
+/// 
+/// This struct manages multiple actor instances connected to the same Python subprocess,
+/// enabling concurrent message processing while maintaining a single process lifecycle.
+/// The pool uses round-robin selection for load balancing across actors.
 pub struct PythonChildProcessActorPool<M>
 where
     M: kameo_child_process::KameoChildProcessMessage + Send + Sync + 'static,
@@ -35,11 +40,12 @@ where
         + Sync
         + 'static,
 {
+    /// Pool of actor references for round-robin load balancing
     actors: Vec<kameo::actor::ActorRef<kameo_child_process::SubprocessIpcActor<M>>>,
+    /// Atomic counter for round-robin actor selection
     next: std::sync::atomic::AtomicUsize,
+    /// Handle to the child process for lifecycle management
     child: Option<tokio::process::Child>,
-    write_tx: Option<tokio::sync::mpsc::UnboundedSender<kameo_child_process::WriteRequest<M>>>,
-    // callback_shutdown: Option<tokio::sync::Notify>,
 }
 
 impl<M> PythonChildProcessActorPool<M>
@@ -341,7 +347,6 @@ where
             actors,
             next: std::sync::atomic::AtomicUsize::new(0),
             child: Some(child),
-            write_tx: None, // No longer needed
         })
     }
 }

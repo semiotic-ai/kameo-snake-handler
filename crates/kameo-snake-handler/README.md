@@ -8,85 +8,78 @@ This crate provides the Python-specific process actor, configuration, error hand
 
 ## Features
 
-- **PythonActor**: Actor for running Python modules/functions as async subprocesses.
-- **PythonChildProcessBuilder**: Builder for configuring and spawning Python child processes.
-- **PythonConfig**: Typed config for Python environment, module, function, and async/sync mode.
-- **serde_py**: Robust (de)serialization between Rust and Python types.
-- **Error handling**: Rich, typed error types for all Python execution and protocol failures.
-- **Tracing**: Deep, async-aware tracing for all message flows, errors, and Python calls.
-- **setup_python_subprocess_system! macro**: Boilerplate-free entrypoint for Python subprocesses.
+- **Dynamic Callback System**: Runtime registration of strongly-typed callback handlers with automatic Python module generation
+- **Elegant Python API**: Both legacy (`kameo.callback_handle()`) and modern (`kameo.module.HandlerType()`) callback interfaces
+- **Streaming Support**: All callback responses are streams, supporting both single-item and multi-item patterns
+- **PythonChildProcessBuilder**: Builder for configuring Python processes with callback handler registration
+- **Connection Sharing**: Single Unix socket efficiently handles multiple concurrent callback requests
+- **Type Safety**: End-to-end type safety from Python requests to Rust handlers and back
+- **PythonConfig**: Comprehensive configuration for Python environment, modules, and execution mode
+- **serde_py**: Robust bidirectional serialization between Rust and Python types
+- **Error Handling**: Rich, typed error propagation across the Python-Rust boundary
+- **Distributed Tracing**: OpenTelemetry integration with span propagation across processes
+- **setup_python_subprocess_system! macro**: Zero-boilerplate entry point with dynamic module creation
 
 ---
 
 ## The `setup_python_subprocess_system!` Macro
 
-This macro provides a boilerplate-free entrypoint for Python subprocesses. It sets up the async runtime, loads the Python config, and runs the actor loop. **You must use this macro in your `main.rs` for any Python subprocess binary.**
+This macro provides a zero-boilerplate entry point for Python subprocesses with dynamic callback systems. It automatically:
 
-### Advanced Usage: Multiple Actors and Custom Initialization
+- **Sets up Python runtime** with PyO3 and async integration
+- **Establishes IPC channels** for both requests and callbacks
+- **Creates dynamic Python modules** based on registered callback handlers
+- **Injects kameo module** with both legacy and modern callback APIs
+- **Handles process lifecycle** including graceful shutdown
 
-You can use the macro in an advanced form to:
-
-- Register multiple actors (with different message/callback types)
-- Provide custom initialization logic for the child and parent (e.g., tracing, runtime config, etc.)
-
-**Example:**
+**Simple Usage:**
 
 ```rust
 kameo_snake_handler::setup_python_subprocess_system! {
-    actors = {
-        (PythonActor<TestMessage, TestCallbackMessage>, TestMessage, TestCallbackMessage),
-        // You can add more actor/message/callback tuples here
-    },
-    child_init = {{
-        // This block runs in the child process before the actor loop starts
-        tracing_subscriber::fmt()
-            .with_env_filter("debug")
-            .with_file(true)
-            .with_line_number(true)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .init();
+    actor = (MyMessage),
+    child_init = {
+        tracing_subscriber::fmt().init();
         kameo_child_process::RuntimeConfig {
             flavor: kameo_child_process::RuntimeFlavor::MultiThread,
             worker_threads: Some(2),
         }
-    }},
+    },
     parent_init = {
-        // This block runs in the parent process before any actors are spawned
-        tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .with_file(true)
-            .with_line_number(true)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .init();
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("parent-thread")
-            .enable_all()
-            .build()?;
-
-        runtime.block_on(async {
-            // Main application loop, this stuff is usually boilerplated in with tokio::main
-            Ok::<(), Box<dyn std::error::Error>>(())
-        })?
+        tracing_subscriber::fmt().init();
+        tokio::runtime::Builder::new_multi_thread().build()?
+            .block_on(async { Ok(()) })?
     }
 }
 ```
 
-#### Key Points
+### Generated Python API
 
-- **actors**: Register one or more actor/message/callback type tuples. Each tuple is `(ActorType, MessageType, CallbackType)`.
-- **child_init**: A block of code run in the child process before the actor loop. Use this to set up tracing, runtime config, etc, it is deliberately limited and only returns a runtime config.
-- **parent_init**: A block of code run in the parent process before any actors are spawned. Use this to set up tracing, the tokio runtime, etc.
+The macro automatically creates a rich Python API based on your registered callback handlers:
 
-#### Requirements
+```python
+import kameo
 
-- All types must implement the required traits.
-- The macro must be used at the root of your binary crate (not inside a function).
-- The macro handles all the tricky details of runtime, GIL, and protocol setup.
+# Legacy string-based API (still supported)
+response = await kameo.callback_handle('trading.DataFetch', {
+    'symbol': 'AAPL', 
+    'period': '1d'
+})
 
+# Modern module-based API (recommended)
+async for item in kameo.trading.DataFetch({
+    'symbol': 'AAPL',
+    'period': '1d'  
+}):
+    print(f"Received data: {item}")
+```
+
+### Key Features
+
+- **Dynamic Module Creation**: Python modules created automatically from Rust handler registration
+- **Type-Safe Routing**: Requests routed to correct handlers based on module.Type path
+- **Streaming Responses**: All handlers return async iterators for uniform interface
+- **Connection Reuse**: Single Unix socket efficiently handles multiple concurrent callbacks
+- **Error Propagation**: Python exceptions and Rust errors properly converted and propagated
 
 ---
 
@@ -144,83 +137,146 @@ sequenceDiagram
 
 ---
 
-## Callback Usage
+## Dynamic Callback System
 
-Callbacks allow the Python subprocess to request information or actions from the Rust parent asynchronously. The callback is injected as `kameo.callback_handle` in the Python environment.
+The dynamic callback system allows Python subprocesses to invoke strongly-typed Rust handlers with automatic routing and streaming responses.
 
 ```mermaid
 sequenceDiagram
-    participant Child as Python Subprocess
-    participant Callback as Rust CallbackHandler
+    participant Python as Python Subprocess
+    participant Macro as setup_python_subprocess_system!
+    participant Module as DynamicCallbackModule  
+    participant Handler as TypedCallbackHandler
 
-    Child->>Callback: kameo.callback_handle(msg)
-    Callback->>Child: Callback reply
+    Python->>Macro: kameo.trading.DataFetch(request)
+    Macro->>Module: TypedCallbackEnvelope(path="trading.DataFetch")
+    Module->>Handler: handle_callback(typed_request)
+    Handler-->>Module: Stream<DataFetchResponse>
+    Module-->>Macro: Stream<TypedCallbackResponse>
+    Macro-->>Python: CallbackAsyncIterator
+    
+    loop Streaming Responses
+        Python->>Macro: iterator.__anext__()
+        Macro-->>Python: response_item
+    end
 ```
 
-### Rust: Defining and Using a CallbackHandler
+### Rust: Defining Callback Handlers
 
 ```rust
-use kameo_snake_handler::{PythonChildProcessBuilder, PythonConfig, PythonExecutionError};
-use kameo_child_process::{CallbackHandler, ChildCallbackMessage};
+use kameo_snake_handler::{PythonChildProcessBuilder, PythonConfig};
+use kameo_child_process::callback::TypedCallbackHandler;
+use serde::{Serialize, Deserialize};
+use bincode::{Encode, Decode};
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct MyCallbackMessage {
-    pub question: String,
+// Define your callback request/response types
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct DataFetchRequest {
+    pub symbol: String,
+    pub period: String,
 }
 
-impl ChildCallbackMessage for MyCallbackMessage {
-    type Reply = String;
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct DataFetchResponse {
+    pub timestamp: String,
+    pub price: f64,
+    pub volume: u64,
 }
 
-pub struct MyCallbackHandler;
+// Implement the handler
+pub struct DataFetchHandler;
 
 #[async_trait::async_trait]
-impl CallbackHandler<MyCallbackMessage> for MyCallbackHandler {
-    async fn handle(&mut self, callback: MyCallbackMessage) -> String {
-        println!("Received callback from Python: {}", callback.question);
-        "This is the Rust callback reply!".to_string()
+impl TypedCallbackHandler<DataFetchRequest> for DataFetchHandler {
+    type Response = DataFetchResponse;
+    
+    async fn handle_callback(
+        &self, 
+        request: DataFetchRequest
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        // Simulate fetching historical data (streaming response)
+        let responses = (0..10).map(move |i| {
+            Ok(DataFetchResponse {
+                timestamp: format!("2024-01-{:02}T10:{:02}:00Z", i + 1, i * 5),
+                price: 150.0 + (i as f64 * 2.5),
+                volume: 1000000 + (i * 50000),
+            })
+        });
+        
+        Ok(Box::pin(futures::stream::iter(responses)))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "DataFetch"
     }
 }
 
-// Spawning the Python child with a callback handler
+// Register handlers and spawn subprocess
 let config = PythonConfig {
-    python_path: vec!["/path/to/site-packages".to_string()],
-    module_name: "my_module".to_string(),
-    function_name: "my_func".to_string(),
+    python_path: vec!["python3".to_string()],
+    module_name: "my_trading_module".to_string(),
+    function_name: "handle_message".to_string(),
     env_vars: vec![],
     is_async: true,
-    module_path: ".".to_string(),
+    enable_otel_propagation: false,
 };
 
-let builder = PythonChildProcessBuilder::new(config)
-    .log_level(tracing::Level::INFO)
-    .with_callback_handler(MyCallbackHandler);
-
-let actor_ref = builder.spawn::<MyMessage>().await?;
+let pool = PythonChildProcessBuilder::<MyMessage>::new(config)
+    .with_callback_handler("trading", DataFetchHandler)
+    .with_callback_handler("trading", OrderHandler) 
+    .with_callback_handler("weather", WeatherHandler)
+    .spawn_pool(2, None)
+    .await?;
 ```
 
-### Python: Using the Injected Callback
+### Python: Using the Dynamic Callback API
 
 ```python
-# my_module.py
+# my_trading_module.py
 import kameo
 
-def handle_message(message):
-    # Synchronous callback example
-    reply = kameo.callback_handle({"question": "What is your name, Rust?"})
-    print(f"Rust replied: {reply}")
-    return {"status": "ok", "reply": reply}
-
-async def handle_message_async(message):
-    # Asynchronous callback example
-    reply = await kameo.callback_handle({"question": "What is your async name, Rust?"})
-    print(f"Rust replied (async): {reply}")
-    return {"status": "ok", "reply": reply}
+async def handle_message(message):
+    # Modern module-based API (recommended)
+    print("Fetching market data...")
+    async for data_point in kameo.trading.DataFetch({
+        'symbol': 'AAPL',
+        'period': '1d'
+    }):
+        print(f"Price: ${data_point['price']}, Volume: {data_point['volume']}")
+    
+    # Multiple callback types in same module
+    order_result = kameo.trading.OrderHandler({
+        'action': 'buy',
+        'symbol': 'AAPL', 
+        'quantity': 100
+    })
+    async for result in order_result:
+        print(f"Order status: {result}")
+    
+    # Different modules
+    weather_data = kameo.weather.CurrentConditions({'location': 'NYC'})
+    async for conditions in weather_data:
+        print(f"Weather: {conditions}")
+    
+    # Legacy API still works
+    legacy_response = await kameo.callback_handle('trading.DataFetch', {
+        'symbol': 'GOOGL',
+        'period': '1h'
+    })
+    async for item in legacy_response:
+        print(f"Legacy response: {item}")
+    
+    return {"status": "completed"}
 ```
 
-- The `kameo.callback_handle` function is injected into the Python environment.
-- Use it directly for sync or async callbacks.
-- The Rust `CallbackHandler` receives the message and returns a reply.
+### Callback System Features
+
+- **Type Safety**: Full end-to-end type safety from Python → Rust → Python
+- **Dynamic Routing**: Automatic routing based on module.TypeName paths
+- **Streaming Responses**: All callbacks return async iterators for uniform interface
+- **Multiple Modules**: Organize handlers into logical modules (trading, weather, etc.)
+- **Concurrent Callbacks**: Multiple callbacks can run concurrently using the same connection
+- **Backwards Compatibility**: Legacy `callback_handle()` API still supported
 
 ---
 
@@ -232,25 +288,155 @@ async def handle_message_async(message):
 
 ---
 
-## Example: Spawning a Python Child Process (No Callback)
+## Complete Example: Trading System with Dynamic Callbacks
+
+### Rust Parent Process
 
 ```rust
-use kameo_snake_handler::{PythonChildProcessBuilder, PythonConfig, PythonExecutionError};
+use kameo_snake_handler::{PythonChildProcessBuilder, PythonConfig};
+use kameo_child_process::callback::TypedCallbackHandler;
+use serde::{Serialize, Deserialize};
+use bincode::{Encode, Decode};
 
-let config = PythonConfig {
-    python_path: vec!["/path/to/site-packages".to_string()],
-    module_name: "my_module".to_string(),
-    function_name: "my_func".to_string(),
-    env_vars: vec![],
-    is_async: true,
-    module_path: ".".to_string(),
-};
+// Define message types for main communication
+#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+pub struct TradeOrder {
+    pub symbol: String,
+    pub quantity: u32,
+    pub order_type: String,
+}
 
-let builder = PythonChildProcessBuilder::new(config)
-    .log_level(tracing::Level::INFO);
+impl kameo_child_process::KameoChildProcessMessage for TradeOrder {
+    type Ok = TradeResult;
+}
 
-let actor_ref = builder.spawn::<MyMessage>().await?;
+#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+pub struct TradeResult {
+    pub order_id: String,
+    pub status: String,
+    pub executed_price: f64,
+}
+
+// Define callback types for data requests
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct MarketDataRequest {
+    pub symbol: String,
+    pub timeframe: String,
+}
+
+#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+pub struct PriceData {
+    pub timestamp: String,
+    pub price: f64,
+    pub volume: u64,
+}
+
+// Implement callback handler
+pub struct MarketDataHandler;
+
+#[async_trait::async_trait]
+impl TypedCallbackHandler<MarketDataRequest> for MarketDataHandler {
+    type Response = PriceData;
+    
+    async fn handle_callback(&self, request: MarketDataRequest) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, kameo_child_process::error::PythonExecutionError>> + Send>>, kameo_child_process::error::PythonExecutionError> {
+        // Simulate real-time market data stream
+        let symbol = request.symbol.clone();
+        let data_stream = futures::stream::iter((0..100).map(move |i| {
+            Ok(PriceData {
+                timestamp: format!("2024-01-01T10:{:02}:00Z", i),
+                price: 150.0 + (i as f64 * 0.1),
+                volume: 1000 + (i * 10),
+            })
+        }));
+        Ok(Box::pin(data_stream))
+    }
+    
+    fn type_name(&self) -> &'static str {
+        "MarketData"
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Configure Python subprocess
+    let config = PythonConfig {
+        python_path: vec!["python3".to_string()],
+        module_name: "trading_strategy".to_string(),
+        function_name: "execute_trade".to_string(),
+        env_vars: vec![],
+        is_async: true,
+        enable_otel_propagation: false,
+    };
+
+    // Spawn subprocess with callback handlers
+    let pool = PythonChildProcessBuilder::<TradeOrder>::new(config)
+        .with_callback_handler("market", MarketDataHandler)
+        .spawn_pool(2, None)
+        .await?;
+
+    // Send trade order to Python
+    let actor = pool.get_actor();
+    let trade_result = actor.ask(TradeOrder {
+        symbol: "AAPL".to_string(),
+        quantity: 100,
+        order_type: "market".to_string(),
+    }).await?;
+
+    println!("Trade executed: {:?}", trade_result);
+    Ok(())
+}
 ```
+
+### Python Strategy Implementation
+
+```python
+# trading_strategy.py
+import kameo
+import asyncio
+
+async def execute_trade(order):
+    """
+    Main trading function that uses callbacks to get market data
+    """
+    symbol = order['symbol']
+    quantity = order['quantity']
+    
+    print(f"Executing trade for {quantity} shares of {symbol}")
+    
+    # Get real-time market data using the elegant callback API
+    print("Fetching market data...")
+    prices = []
+    async for price_data in kameo.market.MarketData({
+        'symbol': symbol,
+        'timeframe': '1m'
+    }):
+        prices.append(price_data['price'])
+        print(f"Current price: ${price_data['price']}")
+        
+        # Simple strategy: buy when we have enough data
+        if len(prices) >= 5:
+            avg_price = sum(prices[-5:]) / 5
+            current_price = price_data['price']
+            
+            if current_price < avg_price * 0.99:  # 1% below average
+                print(f"Good buy signal! Executing at ${current_price}")
+                break
+    
+    # Return trade result
+    return {
+        'order_id': f"ORD-{symbol}-{quantity}",
+        'status': 'executed',
+        'executed_price': current_price
+    }
+```
+
+This example demonstrates:
+
+- **Type-safe communication** between Rust and Python
+- **Dynamic callback registration** with the `market` module
+- **Streaming responses** from callback handlers
+- **Elegant Python API** using `kameo.market.MarketData()`
+- **Real-world use case** of a trading system with market data callbacks
 
 ---
 
@@ -279,4 +465,4 @@ let actor_ref = builder.spawn::<MyMessage>().await?;
 ## See Also
 
 - For generic process management, see `kameo-child-process`.
-- For integration tests and examples, see `kameo-snake-testing`. 
+- For integration tests and examples, see `kameo-snake-testing`.

@@ -26,11 +26,57 @@ impl Default for TracingContext {
     }
 }
 
-/// New: Dynamic module-based callback system
-/// This allows handlers to be registered in modules and automatically discovered
+/// Dynamic callback module that manages multiple typed handlers for flexible routing.
+/// 
+/// This module implements a sophisticated callback system that allows Python child processes
+/// to invoke different strongly-typed Rust handlers in the parent process. The system supports:
+/// 
+/// ## Key Features
+/// 
+/// - **Dynamic Registration**: Handlers can be registered at runtime by module and type
+/// - **Type Safety**: Each handler is strongly typed for both request and response
+/// - **Streaming Support**: All handlers return streaming responses via async iterators
+/// - **Module Organization**: Handlers are organized into logical modules for better namespace management
+/// - **Automatic Routing**: Requests are automatically routed to the correct handler based on callback path
+/// 
+/// ## Architecture
+/// 
+/// ```text
+/// Python Child Process           Rust Parent Process
+/// ┌─────────────────┐           ┌──────────────────────┐
+/// │ kameo.basic.    │   IPC     │ DynamicCallback      │
+/// │ TestCallback()  │ ────────> │ Module               │
+/// │                 │           │ ┌──────────────────┐ │
+/// │ kameo.trading.  │           │ │ "basic"          │ │
+/// │ DataFetch()     │           │ │ ├─TestCallback   │ │
+/// └─────────────────┘           │ │ └─OtherHandler   │ │
+///                               │ │ "trading"        │ │
+///                               │ │ ├─DataFetch      │ │
+///                               │ │ └─TraderHandler  │ │
+///                               │ └──────────────────┘ │
+///                               └──────────────────────┘
+/// ```
+/// 
+/// ## Registration Process
+/// 
+/// 1. **Builder Phase**: Handlers registered via `PythonChildProcessBuilder::with_callback_handler()`
+/// 2. **Module Creation**: Registry serialized and passed to child process 
+/// 3. **Python Integration**: Child creates dynamic Python modules based on registry
+/// 4. **Runtime Routing**: Requests routed via callback path (e.g., "trading.DataFetch")
+/// 
+/// ## Type Safety Guarantees
+/// 
+/// - Request types are validated at handler registration time
+/// - Response types are enforced through the `TypedCallbackHandler` trait
+/// - Serialization/deserialization errors are properly propagated
+/// - Invalid callback paths result in clear error messages
 pub struct DynamicCallbackModule {
+    /// Map of callback_path -> handler implementation
+    /// Key format: "{module}.{type_name}" (e.g., "trading.DataFetch")
     handlers: HashMap<String, Box<dyn CallbackHandlerTrait + Send + Sync>>,
-    module_registry: HashMap<String, Vec<String>>, // module_name -> handler_types
+    /// Registry of module_name -> list of handler type names
+    /// Used for Python module generation and introspection
+    module_registry: HashMap<String, Vec<String>>,
 }
 
 impl DynamicCallbackModule {
@@ -487,6 +533,7 @@ macro_rules! callback_module {
                 Ok(())
             }
             
+            #[allow(dead_code)]
             pub fn available_handlers() -> Vec<&'static str> {
                 vec![$(
                     stringify!($handler)
@@ -536,7 +583,7 @@ mod tests {
     impl TypedCallbackHandler<DataFetchRequest> for DataFetchHandler {
         type Response = DataFetchResponse;
         
-        async fn handle_callback(&self, callback: DataFetchRequest) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        async fn handle_callback(&self, _callback: DataFetchRequest) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
             let response = DataFetchResponse {
                 data: vec![100.0, 101.0, 102.0],
                 timestamps: vec!["2024-01-01".to_string(), "2024-01-02".to_string(), "2024-01-03".to_string()],
