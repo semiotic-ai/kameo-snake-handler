@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace};
+use tracing::{error, trace};
+use std::fmt::Debug;
 
 /// Simple tracing context for now - we can enhance this later
 #[derive(Clone, Debug, Serialize, Deserialize, Encode, Decode)]
@@ -201,8 +202,35 @@ impl DynamicCallbackModule {
         }
         
         trace!(event = "handle_callback_not_found", callback_path, correlation_id, "No handler found for callback path");
+        
+        // Provide detailed debugging information for missing handlers
+        let available_callbacks = self.available_callbacks();
+        let available_modules = self.available_modules();
+        
+        // Show what routing attempts were made
+        let routing_attempts = vec![
+            format!("1. Exact match: '{}'", callback_path),
+            format!("2. Type-based routing: '{}' (in any module)", callback_path),
+            format!("3. Module-based routing: '{}' (with single handler)", callback_path),
+        ];
+        
         Err(PythonExecutionError::ExecutionError {
-            message: format!("No handler found for callback path: {}", callback_path)
+            message: format!(
+                "No handler found for callback path: '{}' (correlation_id: {})\n\
+                 Routing attempts made:\n{}\n\
+                 Available callbacks: {}\n\
+                 Available modules: {}\n\
+                 This usually indicates:\n\
+                 - The callback handler was not registered\n\
+                 - A typo in the callback path\n\
+                 - The handler was registered with a different module name\n\
+                 - The Python code is calling the wrong callback path\n\
+                 - The callback path format doesn't match the expected pattern",
+                callback_path, correlation_id,
+                routing_attempts.join("\n"),
+                if available_callbacks.is_empty() { "none".to_string() } else { available_callbacks.join(", ") },
+                if available_modules.is_empty() { "none".to_string() } else { available_modules.join(", ") }
+            )
         })
     }
     
@@ -272,7 +300,7 @@ pub trait TypedCallbackHandler<C>: Send + Sync + 'static
 where
     C: Send + Sync + Decode<()> + 'static,
 {
-    type Response: Encode + Send + 'static;
+    type Response: Encode + Send + Debug + 'static;
     
     /// Handle a callback of the specific type
     async fn handle_callback(&self, callback: C) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError>;
@@ -341,8 +369,25 @@ where
                 },
                 Err(e) => {
                     trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, error = %e, "Failed to deserialize callback data");
+                    
+                    // Provide detailed debugging information for deserialization failures
+                    let data_hex = data.iter().take(100).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+                    let data_preview = if data.len() > 100 {
+                        format!("{}... (truncated, total {} bytes)", data_hex, data.len())
+                    } else {
+                        format!("{} ({} bytes)", data_hex, data.len())
+                    };
+                    
                     return Err(PythonExecutionError::ExecutionError {
-                        message: format!("Failed to deserialize callback: {}", e)
+                        message: format!(
+                            "Failed to deserialize callback data for handler '{}' (correlation_id: {}): {}\n\
+                             Expected type: {}\n\
+                             Raw data (hex): {}\n\
+                             This usually indicates a type mismatch between Python and Rust or corrupted data.",
+                            handler_type, correlation_id, e,
+                            std::any::type_name::<C>(),
+                            data_preview
+                        )
                     });
                 }
             };
@@ -364,11 +409,20 @@ where
             trace!(event = "handler_wrapper_stream_convert_start", handler_type, correlation_id, "Converting response stream to serialized format");
             
             // Convert the response stream to a stream of serialized data
-            let serialized_stream = response_stream.map(|result| {
+            let handler_type_clone = handler_type.to_string();
+            let serialized_stream = response_stream.map(move |result| {
                 result.and_then(|response| {
                     bincode::encode_to_vec(&response, bincode::config::standard())
                         .map_err(|e| PythonExecutionError::ExecutionError {
-                            message: format!("Failed to serialize response: {}", e)
+                            message: format!(
+                                "Failed to serialize response for handler '{}' (correlation_id: {}): {}\n\
+                                 Response type: {}\n\
+                                 Response value: {:?}\n\
+                                 This usually indicates a serialization issue with the response type.",
+                                handler_type_clone, correlation_id, e,
+                                std::any::type_name::<H::Response>(),
+                                response
+                            )
                         })
                 })
             });
@@ -422,7 +476,7 @@ impl TypedCallbackReceiver {
     }
     
     pub async fn run(mut self) -> Result<(), PythonExecutionError> {
-        info!("Starting typed callback receiver");
+        tracing::info!(event = "callback_receiver_start", "Starting typed callback receiver");
         
         let mut active_tasks: usize = 0;
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -435,7 +489,7 @@ impl TypedCallbackReceiver {
             // Check for cancellation
             _ = self.cancellation_token.cancelled() => {
                 trace!(event = "callback_receiver_cancellation", "Cancellation requested, shutting down callback receiver");
-                info!("Cancellation requested, shutting down callback receiver");
+                tracing::info!(event = "callback_receiver_cancellation", "Cancellation requested, shutting down callback receiver");
                         break;
             }
             
@@ -558,7 +612,7 @@ impl TypedCallbackReceiver {
                             }
                             Err(e) => {
                                 if let std::io::ErrorKind::UnexpectedEof = e.kind() {
-                                info!("EOF received, shutting down callback receiver");
+                                tracing::info!(event = "callback_receiver_eof", "EOF received, shutting down callback receiver");
                                 break;
                                 } else {
                                 error!("Error reading callback message: {}", e);
@@ -595,7 +649,7 @@ impl TypedCallbackReceiver {
         }
         
         trace!(event = "callback_receiver_shutdown_complete", "All tasks completed, shutdown finished");
-        info!("Typed callback receiver shutdown complete");
+        tracing::info!(event = "callback_receiver_shutdown_complete", "Typed callback receiver shutdown complete");
         Ok(())
     }
 }

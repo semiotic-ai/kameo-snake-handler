@@ -464,7 +464,7 @@ macro_rules! setup_python_subprocess_system {
                                 tracing::debug!("Setting up dynamic callback system for child process");
                                 // In the new dynamic callback system, we don't need to set up static callback handlers
                                 // The parent process will handle callbacks through the DynamicCallbackModule
-                                info!("Child connected to both sockets and ready for dynamic callbacks");
+                                tracing::info!(event = "child_ready", "Child connected to both sockets and ready for dynamic callbacks");
                                 kameo_snake_handler::child_process_main_with_python_actor::<$msg, ()>(actor, request_conn, None).await.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
                             };
                             pyo3_async_runtimes::tokio::run(py, async_block.instrument(root_span))

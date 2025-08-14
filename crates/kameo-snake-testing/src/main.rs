@@ -150,7 +150,7 @@ impl TypedCallbackHandler<TestCallbackMessage> for TestCallbackHandler {
     
     async fn handle_callback(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
-        tracing::info!(event = "test_callback", value = callback.value, "TestCallbackHandler received callback");
+        tracing::info!(event = "test_callback_received", value = callback.value, "TestCallbackHandler received callback");
         let response = TestResponse::CallbackRoundtripResult { value: callback.value + 1 };
         Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
@@ -167,7 +167,7 @@ impl TypedCallbackHandler<TraderCallbackMessage> for TestCallbackHandler {
     
     async fn handle_callback(&self, callback: TraderCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
-        tracing::info!(event = "trader_callback", value = callback.value, "TestCallbackHandler received trader callback");
+        tracing::info!(event = "trader_callback_received", value = callback.value, "TestCallbackHandler received trader callback");
         let response = TraderResponse::OrderResult { result: format!("Order processed with value {}", callback.value) };
         Ok(Box::pin(stream::once(async move { Ok(response) })))
     }
@@ -184,7 +184,7 @@ impl TypedCallbackHandler<BenchCallback> for TestCallbackHandler {
     
     async fn handle_callback(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
-        tracing::info!(event = "bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "TestCallbackHandler received bench callback");
+        tracing::info!(event = "bench_callback_received", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, "TestCallbackHandler received bench callback");
         if callback.rust_sleep_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms));
         }
@@ -210,7 +210,7 @@ impl TypedCallbackHandler<BenchCallback> for CountingCallbackHandler {
     async fn handle_callback(&self, callback: BenchCallback) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
         let counter = self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        tracing::info!(event = "counting_bench_callback", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, counter, "CountingCallbackHandler received bench callback");
+        tracing::info!(event = "counting_bench_callback_received", id = callback.id, rust_sleep_ms = callback.rust_sleep_ms, counter, "CountingCallbackHandler received bench callback");
         if callback.rust_sleep_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms));
         }
@@ -234,7 +234,7 @@ impl TypedCallbackHandler<TestCallbackMessage> for StreamingCallbackHandler {
     
     async fn handle_callback(&self, callback: TestCallbackMessage) -> Result<Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>, PythonExecutionError> {
         use futures::stream;
-        tracing::info!(event = "streaming_callback", value = callback.value, "🌊 StreamingCallbackHandler starting stream with {} items", callback.value);
+        tracing::info!(event = "streaming_callback_start", value = callback.value, "StreamingCallbackHandler starting stream");
         
         // Generate a stream of TestResponse objects based on the callback value
         let count = callback.value.max(1).min(10); // Limit to reasonable range
@@ -242,7 +242,7 @@ impl TypedCallbackHandler<TestCallbackMessage> for StreamingCallbackHandler {
             .map(move |i| {
                 let response_value = callback.value + i + 1; // Generate meaningful response data
                 let response = TestResponse::CallbackRoundtripResult { value: response_value };
-                tracing::info!(event = "streaming_callback", value = callback.value, item = i, response_value, "📤 StreamingCallbackHandler sending stream item {}/{} with response: {:?}", i + 1, count, response);
+                                    tracing::debug!(event = "streaming_callback_item", value = callback.value, item_index = i, total_items = count, ?response, "StreamingCallbackHandler sending stream item");
                 Ok(response)
             });
         
@@ -256,7 +256,7 @@ impl TypedCallbackHandler<TestCallbackMessage> for StreamingCallbackHandler {
 
 
 async fn run_streaming_callback_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🧪 ==== STREAMING CALLBACK TEST ====");
+    tracing::info!(event = "streaming_callback_test_start", "Starting streaming callback test");
     
     let config = PythonConfig {
         python_path: python_path.clone(),
@@ -277,12 +277,12 @@ async fn run_streaming_callback_test(python_path: Vec<String>) -> Result<(), Box
     let actor = pool.get_actor().clone();
     
     // Test callback with value=5, should generate 5 stream items
-    info!("🔄 Testing callback with value=5 (should generate 5 stream items)");
+    tracing::info!(event = "streaming_callback_test_execute", callback_value = 5, "Executing streaming callback test");
     let response = actor.ask(TestMessage::CallbackRoundtrip { value: 5 }).await?;
-    info!("✅ Streaming callback test completed: {:?}", response);
+    tracing::info!(event = "streaming_callback_test_complete", ?response, "Streaming callback test completed");
     
     pool.shutdown();
-    info!("🏁 Streaming callback test finished");
+    tracing::info!(event = "streaming_callback_test_finish", "Streaming callback test finished");
     Ok(())
 }
 
@@ -594,7 +594,7 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
 }
 
 async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    info!("==== STREAMING TESTS ====");
+    tracing::info!(event = "streaming_tests_start", "Starting streaming tests");
     
     let test_span = tracing::info_span!("streaming-test-run");
     let _test_guard = test_span.enter();
@@ -614,7 +614,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     let streaming_ref: kameo::prelude::ActorRef<kameo_child_process::SubprocessIpcActor<TestMessage>> = streaming_pool.get_actor().clone();
 
     // Test 1: Fibonacci stream
-    info!("Test 1: Fibonacci stream");
+    tracing::info!(event = "streaming_test_start", test_name = "fibonacci", count = 10, "Starting Fibonacci stream test");
     let mut stream = streaming_ref.send_stream(TestMessage::StreamFibonacci { count: 10 })
         .await?;
     
@@ -624,17 +624,17 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
             match result {
                 Ok(TestResponse::StreamItem { index, value }) => {
                     items.push((index, value));
-                    info!("Received Fibonacci item: index={}, value={}", index, value);
+                    tracing::debug!(event = "fibonacci_item_received", index, value, "Received Fibonacci item");
                 }
                 Ok(TestResponse::StreamError { index, error }) => {
-                    error!("Received stream error: index={}, error={}", index, error);
+                    tracing::error!(event = "fibonacci_stream_error", index, error = %error, "Received stream error");
                     break;
                 }
                 Ok(other) => {
-                    info!("Received unexpected response: {:?}", other);
+                    tracing::warn!(event = "fibonacci_unexpected_response", ?other, "Received unexpected response");
                 }
                 Err(e) => {
-                    error!("Stream error: {:?}", e);
+                    tracing::error!(event = "fibonacci_stream_error", ?e, "Stream error");
                     break;
                 }
             }
@@ -645,7 +645,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     match timeout(Duration::from_secs(30), stream_future).await {
         Ok(_) => {},
         Err(_) => {
-            error!("Fibonacci stream timed out after 30 seconds");
+            tracing::error!(event = "fibonacci_stream_timeout", "Fibonacci stream timed out after 30 seconds");
         }
     }
     
@@ -656,7 +656,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     assert_eq!(items[3].1, 2, "Fourth Fibonacci number should be 2");
 
     // Test 2: Random numbers stream
-    info!("Test 2: Random numbers stream");
+    tracing::info!(event = "streaming_test_start", test_name = "random_numbers", count = 5, max_value = 100, "Starting random numbers stream test");
     let mut stream = streaming_ref.send_stream(TestMessage::StreamRandomNumbers { count: 5, max_value: 100 })
         .await?;
     
@@ -666,17 +666,17 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
             match result {
                 Ok(TestResponse::StreamItem { index, value }) => {
                     items.push((index, value));
-                    info!("Received random number: index={}, value={}", index, value);
+                    tracing::debug!(event = "random_number_received", index, value, "Received random number");
                 }
                 Ok(TestResponse::StreamError { index, error }) => {
-                    error!("Received stream error: index={}, error={}", index, error);
+                    tracing::error!(event = "random_stream_error", index, error = %error, "Received stream error");
                     break;
                 }
                 Ok(other) => {
-                    info!("Received unexpected response: {:?}", other);
+                    tracing::warn!(event = "random_unexpected_response", ?other, "Received unexpected response");
                 }
                 Err(e) => {
-                    error!("Stream error: {:?}", e);
+                    tracing::error!(event = "random_stream_error", ?e, "Stream error");
                     break;
                 }
             }
@@ -687,7 +687,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     match timeout(Duration::from_secs(30), stream_future).await {
         Ok(_) => {},
         Err(_) => {
-            error!("Random numbers stream timed out after 30 seconds");
+            tracing::error!(event = "random_stream_timeout", "Random numbers stream timed out after 30 seconds");
         }
     }
     
@@ -697,7 +697,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     }
 
     // Test 3: Stream with delays
-    info!("Test 3: Stream with delays");
+    tracing::info!(event = "streaming_test_start", test_name = "delays", count = 3, delay_ms = 50, "Starting delayed stream test");
     let start = std::time::Instant::now();
     let mut stream = streaming_ref.send_stream(TestMessage::StreamWithDelays { count: 3, delay_ms: 50 })
         .await?;
@@ -708,17 +708,17 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
             match result {
                 Ok(TestResponse::StreamItem { index, value }) => {
                     items.push((index, value));
-                    info!("Received delayed item: index={}, value={}", index, value);
+                    tracing::debug!(event = "delayed_item_received", index, value, "Received delayed item");
                 }
                 Ok(TestResponse::StreamError { index, error }) => {
-                    error!("Received stream error: index={}, error={}", index, error);
+                    tracing::error!(event = "delayed_stream_error", index, error = %error, "Received stream error");
                     break;
                 }
                 Ok(other) => {
-                    info!("Received unexpected response: {:?}", other);
+                    tracing::warn!(event = "delayed_unexpected_response", ?other, "Received unexpected response");
                 }
                 Err(e) => {
-                    error!("Stream error: {:?}", e);
+                    tracing::error!(event = "delayed_stream_error", ?e, "Stream error");
                     break;
                 }
             }
@@ -729,7 +729,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     match timeout(Duration::from_secs(30), stream_future).await {
         Ok(_) => {},
         Err(_) => {
-            error!("Delayed stream timed out after 30 seconds");
+            tracing::error!(event = "delayed_stream_timeout", "Delayed stream timed out after 30 seconds");
         }
     }
     
@@ -738,7 +738,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     assert!(elapsed >= std::time::Duration::from_millis(100), "Should have delays");
 
     // Test 4: Stream with errors
-    info!("Test 4: Stream with errors");
+    tracing::info!(event = "streaming_test_start", test_name = "errors", count = 5, error_at = 2, "Starting error stream test");
     let mut stream = streaming_ref.send_stream(TestMessage::StreamWithErrors { count: 5, error_at: Some(2) })
         .await?;
     
@@ -749,18 +749,18 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
             match result {
                 Ok(TestResponse::StreamItem { index, value }) => {
                     items.push((index, value));
-                    info!("Received item before error: index={}, value={}", index, value);
+                    tracing::debug!(event = "error_stream_item_received", index, value, "Received item before error");
                 }
                 Ok(TestResponse::StreamError { index, error }) => {
                     error_received = true;
-                    info!("Received expected error: index={}, error={}", index, error);
+                    tracing::info!(event = "error_stream_error_received", index, error = %error, "Received expected error");
                     break;
                 }
                 Ok(other) => {
-                    info!("Received unexpected response: {:?}", other);
+                    tracing::warn!(event = "error_stream_unexpected_response", ?other, "Received unexpected response");
                 }
                 Err(e) => {
-                    error!("Stream error: {:?}", e);
+                    tracing::error!(event = "error_stream_error", ?e, "Stream error");
                     break;
                 }
             }
@@ -771,7 +771,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     match timeout(Duration::from_secs(30), stream_future).await {
         Ok(_) => {},
         Err(_) => {
-            error!("Error stream timed out after 30 seconds");
+            tracing::error!(event = "error_stream_timeout", "Error stream timed out after 30 seconds");
         }
     }
     
@@ -779,7 +779,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     assert_eq!(items.len(), 2, "Should receive 2 items before error");
 
     // Test 5: Large dataset stream
-    info!("Test 5: Large dataset stream");
+    tracing::info!(event = "streaming_test_start", test_name = "large_dataset", count = 10, "Starting large dataset stream test");
     let mut stream = streaming_ref.send_stream(TestMessage::StreamLargeDataset { count: 10 })
         .await?;
     
@@ -789,17 +789,17 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
             match result {
                 Ok(TestResponse::StreamItem { index, value }) => {
                     items.push((index, value));
-                    info!("Received large dataset item: index={}, value={}", index, value);
+                    tracing::debug!(event = "large_dataset_item_received", index, value, "Received large dataset item");
                 }
                 Ok(TestResponse::StreamError { index, error }) => {
-                    error!("Received stream error: index={}, error={}", index, error);
+                    tracing::error!(event = "large_dataset_stream_error", index, error = %error, "Received stream error");
                     break;
                 }
                 Ok(other) => {
-                    info!("Received unexpected response: {:?}", other);
+                    tracing::warn!(event = "large_dataset_unexpected_response", ?other, "Received unexpected response");
                 }
                 Err(e) => {
-                    error!("Stream error: {:?}", e);
+                    tracing::error!(event = "large_dataset_stream_error", ?e, "Stream error");
                     break;
                 }
             }
@@ -810,7 +810,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
     match timeout(Duration::from_secs(30), stream_future).await {
         Ok(_) => {},
         Err(_) => {
-            error!("Large dataset stream timed out after 30 seconds");
+            tracing::error!(event = "large_dataset_stream_timeout", "Large dataset stream timed out after 30 seconds");
         }
     }
     
@@ -820,7 +820,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
 }
 
 async fn run_streaming_throughput_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    info!("==== STREAMING THROUGHPUT TEST ====");
+    tracing::info!(event = "streaming_throughput_test_start", "Starting streaming throughput test");
     
     const N: usize = 1000;
     const STREAM_SIZE: u32 = 10;
@@ -909,7 +909,7 @@ async fn run_streaming_throughput_test(python_path: Vec<String>) -> Result<(), B
 }
 
 async fn run_streaming_error_handling_test(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
-    info!("==== STREAMING ERROR HANDLING TEST ====");
+    tracing::info!(event = "streaming_error_handling_test_start", "Starting streaming error handling test");
     
     let streaming_config = PythonConfig {
         python_path: python_path.clone(),
@@ -926,7 +926,7 @@ async fn run_streaming_error_handling_test(python_path: Vec<String>) -> Result<(
     let streaming_ref = streaming_pool.get_actor();
 
     // Test 1: Error at first item
-    info!("Test 1: Error at first item");
+    tracing::info!(event = "error_handling_test_start", test_name = "error_at_first", "Starting error at first item test");
     let stream_result = streaming_ref.send_stream(TestMessage::StreamWithErrors { count: 5, error_at: Some(0) })
         .await;
     match stream_result {
@@ -944,7 +944,7 @@ async fn run_streaming_error_handling_test(python_path: Vec<String>) -> Result<(
     }
 
     // Test 2: Error at last item
-    info!("Test 2: Error at last item");
+    tracing::info!(event = "error_handling_test_start", test_name = "error_at_last", "Starting error at last item test");
     let stream_result = streaming_ref.send_stream(TestMessage::StreamWithErrors { count: 5, error_at: Some(4) })
         .await;
     match stream_result {
@@ -962,7 +962,7 @@ async fn run_streaming_error_handling_test(python_path: Vec<String>) -> Result<(
     }
 
     // Test 3: No error (should complete successfully)
-    info!("Test 3: No error (should complete successfully)");
+    tracing::info!(event = "error_handling_test_start", test_name = "no_error", "Starting no error test");
     let stream_result = streaming_ref.send_stream(TestMessage::StreamWithErrors { count: 3, error_at: None })
         .await;
     match stream_result {
@@ -986,7 +986,7 @@ async fn run_invalid_config_tests(
     python_path: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Test 8: Invalid module test
-    info!("Test 8: Invalid module test");
+    tracing::info!(event = "error_handling_test_start", test_name = "invalid_module", "Starting invalid module test");
     let invalid_module_config = PythonConfig {
         python_path: python_path.clone(),
         module_name: "non_existent_module".to_string(),
@@ -1004,11 +1004,11 @@ async fn run_invalid_config_tests(
     .await;
     match spawn_result {
         Ok(_actor_ref) => panic!("Spawning with invalid module should fail"),
-        Err(e) => info!("Received expected error on spawn: {}", e),
+        Err(e) => tracing::info!(event = "invalid_module_expected_error", ?e, "Received expected error on spawn"),
     }
 
     // Test 9: Invalid function test
-    info!("Test 9: Invalid function test");
+    tracing::info!(event = "error_handling_test_start", test_name = "invalid_function", "Starting invalid function test");
     let invalid_function_config = PythonConfig {
         python_path: python_path.clone(),
         module_name: "logic".to_string(),
@@ -1025,11 +1025,11 @@ async fn run_invalid_config_tests(
     .await;
     match spawn_result {
         Ok(_actor_ref) => panic!("Spawning with invalid function should fail"),
-        Err(e) => info!("Received expected error on spawn: {}", e),
+        Err(e) => tracing::info!(event = "invalid_function_expected_error", ?e, "Received expected error on spawn"),
     }
 
     // Test 10: Invalid path test
-    info!("Test 10: Invalid path test");
+    tracing::info!(event = "error_handling_test_start", test_name = "invalid_path", "Starting invalid path test");
     let invalid_path_config = PythonConfig {
         python_path: python_path.clone(),
         module_name: "logic".to_string(),
@@ -1046,7 +1046,7 @@ async fn run_invalid_config_tests(
     .await;
     match spawn_result {
         Ok(_actor_ref) => panic!("Spawning with invalid path should fail"),
-        Err(e) => info!("Received expected error on spawn: {}", e),
+        Err(e) => tracing::info!(event = "invalid_path_expected_error", ?e, "Received expected error on spawn"),
     }
 
     Ok(())
@@ -1081,7 +1081,7 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
             tracing::info!("Trader demo succeeded with order result");
         }
         Ok(TraderResponse::Error { error }) => {
-            tracing::info!("Trader demo completed with error (expected without API key): {}", error);
+            tracing::info!(event = "trader_demo_error", error = %error, "Trader demo completed with error (expected without API key)");
         }
         Err(e) => {
             panic!("Trader demo failed with error: {:?}", e);
