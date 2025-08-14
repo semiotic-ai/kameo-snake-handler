@@ -69,6 +69,8 @@ mod tests {
     use proptest::prelude::*;
     use proptest::strategy::{BoxedStrategy, Strategy};
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
+    use serde_json::{Number, Value};
     use std::collections::HashMap;
 
     mod nested_option_helper {
@@ -547,6 +549,27 @@ mod tests {
 
     proptest! {
         #[test]
+        fn test_json_value_roundtrip(value in json_value_strategy()) {
+            let py_obj = Python::with_gil(|py| to_pyobject(py, &value).unwrap());
+            let roundtrip: Value = Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
+            prop_assert_eq!(value, roundtrip)
+        }
+
+        #[test]
+        fn test_structs_with_json_fields_roundtrip(item in json_fields_strategy()) {
+            let py_obj = Python::with_gil(|py| to_pyobject(py, &item).unwrap());
+            let roundtrip: JsonFields = Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
+            prop_assert_eq!(item, roundtrip)
+        }
+
+        #[test]
+        fn test_enums_with_json_fields_roundtrip(item in json_enum_strategy2()) {
+            let py_obj = Python::with_gil(|py| to_pyobject(py, &item).unwrap());
+            let roundtrip: JsonEnum = Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
+            prop_assert_eq!(item, roundtrip)
+        }
+
+        #[test]
         fn test_all_primitives_roundtrip(test_struct in all_primitives_strategy()) {
             let py_obj = Python::with_gil(|py| to_pyobject(py, &test_struct).unwrap());
             let roundtrip = Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
@@ -605,5 +628,244 @@ mod tests {
                 assert_eq!(value, roundtrip);
             });
         }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct NestedJson {
+        info: Value,
+        list: Vec<Value>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    enum JsonVariant {
+        Unit,
+        Newtype(Value),
+        Tuple(i32, Value, String),
+        Struct { meta: Value },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct ComplexJsonHolder {
+        id: u64,
+        name: String,
+        flag: bool,
+        score: f64,
+        data: Value,
+        extra: Option<Value>,
+        tags: Vec<Value>,
+        props: std::collections::HashMap<String, Value>,
+        nested: Option<NestedJson>,
+        variant: JsonVariant,
+    }
+
+    #[test]
+    fn test_explicit_complex_json_roundtrip() {
+        let mut props = std::collections::HashMap::new();
+        props.insert("k1".to_string(), json!(123));
+        props.insert("k2".to_string(), json!(["a", "b"]));
+
+        let holder = ComplexJsonHolder {
+            id: 42,
+            name: "tester".to_string(),
+            flag: true,
+            score: 12.5,
+            data: json!({
+                "a": 1,
+                "b": [true, "x", {"k": 2.5}],
+                "c": null
+            }),
+            extra: Some(json!(["alpha", {"z": false}])),
+            tags: vec![json!(1), json!("x"), json!({"n": 3})],
+            props,
+            nested: Some(NestedJson {
+                info: json!({"inner": [1, 2, 3]}),
+                list: vec![json!(true), json!("s")],
+            }),
+            variant: JsonVariant::Struct {
+                meta: json!({"level": 2}),
+            },
+        };
+
+        let py_obj = Python::with_gil(|py| to_pyobject(py, &holder).unwrap());
+        let roundtrip: ComplexJsonHolder =
+            Python::with_gil(|py| from_pyobject(py_obj.bind(py)).unwrap());
+        assert_eq!(holder, roundtrip);
+    }
+
+    #[test]
+    fn test_explicit_complex_json_via_python_json_loads() {
+        let mut props = std::collections::HashMap::new();
+        props.insert("k1".to_string(), json!(123));
+        props.insert("k2".to_string(), json!(["a", "b"]));
+
+        let holder = ComplexJsonHolder {
+            id: 42,
+            name: "tester".to_string(),
+            flag: true,
+            score: 12.5,
+            data: json!({
+                "a": 1,
+                "b": [true, "x", {"k": 2.5}],
+                "c": null
+            }),
+            extra: Some(json!(["alpha", {"z": false}])),
+            tags: vec![json!(1), json!("x"), json!({"n": 3})],
+            props,
+            nested: Some(NestedJson {
+                info: json!({"inner": [1, 2, 3]}),
+                list: vec![json!(true), json!("s")],
+            }),
+            variant: JsonVariant::Struct {
+                meta: json!({"level": 2}),
+            },
+        };
+
+        // Serialize to JSON text in Rust, parse with Python json.loads, then deserialize back in Rust
+        let json_text = serde_json::to_string(&holder).unwrap();
+        let roundtrip: ComplexJsonHolder = Python::with_gil(|py| {
+            let json_mod = py.import("json").unwrap();
+            let py_obj = json_mod.call_method1("loads", (json_text,)).unwrap();
+            from_pyobject(&py_obj).unwrap()
+        });
+        assert_eq!(holder, roundtrip);
+    }
+
+    #[test]
+    fn test_explicit_complex_json_python_dumps_matches_serde() {
+        let mut props = std::collections::HashMap::new();
+        props.insert("k1".to_string(), json!(123));
+        props.insert("k2".to_string(), json!(["a", "b"]));
+
+        let holder = ComplexJsonHolder {
+            id: 42,
+            name: "tester".to_string(),
+            flag: true,
+            score: 12.5,
+            data: json!({
+                "a": 1,
+                "b": [true, "x", {"k": 2.5}],
+                "c": null
+            }),
+            extra: Some(json!(["alpha", {"z": false}])),
+            tags: vec![json!(1), json!("x"), json!({"n": 3})],
+            props,
+            nested: Some(NestedJson {
+                info: json!({"inner": [1, 2, 3]}),
+                list: vec![json!(true), json!("s")],
+            }),
+            variant: JsonVariant::Struct {
+                meta: json!({"level": 2}),
+            },
+        };
+
+        let (py_json_text, rust_value): (String, Value) = Python::with_gil(|py| {
+            let py_obj = to_pyobject(py, &holder).unwrap();
+            let json_mod = py.import("json").unwrap();
+            let py_dumped: String = json_mod
+                .call_method1("dumps", (py_obj,))
+                .unwrap()
+                .extract()
+                .unwrap();
+            (py_dumped, serde_json::to_value(&holder).unwrap())
+        });
+        let py_value: Value = serde_json::from_str(&py_json_text).unwrap();
+        assert_eq!(py_value, rust_value);
+    }
+
+    // JSON Value generator restricted to values representable by serde_json and Python
+    fn json_number_strategy() -> BoxedStrategy<Number> {
+        prop_oneof![
+            any::<i64>().prop_map(Number::from),
+            any::<u64>().prop_map(Number::from),
+            any::<f64>()
+                .prop_filter("finite f64", |v| v.is_finite())
+                .prop_map(|v| Number::from_f64(v).expect("finite")),
+        ]
+        .boxed()
+    }
+
+    fn json_value_strategy() -> BoxedStrategy<Value> {
+        json_value_strategy_inner(0)
+    }
+
+    fn json_value_strategy_inner(depth: u32) -> BoxedStrategy<Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<String>().prop_map(Value::String),
+            json_number_strategy().prop_map(Value::Number),
+        ];
+
+        if depth >= 3 {
+            return leaf.boxed();
+        }
+
+        let array = vec(json_value_strategy_inner(depth + 1), 0..4).prop_map(Value::Array);
+        let object = hash_map(any::<String>(), json_value_strategy_inner(depth + 1), 0..4)
+            .prop_map(|m| Value::Object(m.into_iter().collect()));
+
+        prop_oneof![leaf, array, object].boxed()
+    }
+
+    // Same as json_value_strategy but excludes top-level Null, to avoid the
+    // None <-> Some(Value::Null) ambiguity when wrapped in Option<Value>.
+    fn json_value_nonnull_strategy() -> BoxedStrategy<Value> {
+        let nonnull_leaf = prop_oneof![
+            any::<bool>().prop_map(Value::Bool),
+            any::<String>().prop_map(Value::String),
+            json_number_strategy().prop_map(Value::Number),
+        ];
+
+        let array = vec(json_value_strategy_inner(1), 0..4).prop_map(Value::Array);
+        let object = hash_map(any::<String>(), json_value_strategy_inner(1), 0..4)
+            .prop_map(|m| Value::Object(m.into_iter().collect()));
+
+        prop_oneof![nonnull_leaf, array, object].boxed()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct JsonFields {
+        id: i32,
+        meta: Value,
+        array: Vec<Value>,
+        map: std::collections::HashMap<String, Value>,
+        maybe: Option<Value>,
+    }
+
+    fn json_fields_strategy() -> BoxedStrategy<JsonFields> {
+        (
+            any::<i32>(),
+            json_value_strategy(),
+            vec(json_value_strategy(), 0..4),
+            hash_map(any::<String>(), json_value_strategy(), 0..4),
+            prop::option::of(json_value_nonnull_strategy()),
+        )
+            .prop_map(|(id, meta, array, map, maybe)| JsonFields {
+                id,
+                meta,
+                array,
+                map,
+                maybe,
+            })
+            .boxed()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    enum JsonEnum {
+        Unit,
+        NewType(Value),
+        Tuple(i32, Value),
+        Struct { name: String, payload: Value },
+    }
+
+    fn json_enum_strategy2() -> BoxedStrategy<JsonEnum> {
+        prop_oneof![
+            Just(JsonEnum::Unit),
+            json_value_strategy().prop_map(JsonEnum::NewType),
+            (any::<i32>(), json_value_strategy()).prop_map(|(i, v)| JsonEnum::Tuple(i, v)),
+            (any::<String>(), json_value_strategy())
+                .prop_map(|(name, payload)| JsonEnum::Struct { name, payload }),
+        ]
+        .boxed()
     }
 }

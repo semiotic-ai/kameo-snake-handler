@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tracing::{debug, instrument};
 use uuid::Uuid;
-use tokio::net::{UnixListener, UnixStream};
 
 pub fn unique_socket_path(actor_name: &str) -> PathBuf {
     let mut path = std::path::PathBuf::from("/tmp");
@@ -58,7 +58,10 @@ pub async fn child_request() -> std::io::Result<Box<UnixStream>> {
 #[instrument(fields(actor_name = ?std::env::var("KAMEO_CHILD_ACTOR").ok()), parent = tracing::Span::current())]
 pub async fn child_callback() -> std::io::Result<Box<UnixStream>> {
     let socket_path = std::env::var("KAMEO_CALLBACK_SOCKET").map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "KAMEO_CALLBACK_SOCKET not set")
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "KAMEO_CALLBACK_SOCKET not set",
+        )
     })?;
     let stream = UnixStream::connect(&socket_path).await?;
     Ok(Box::new(stream))

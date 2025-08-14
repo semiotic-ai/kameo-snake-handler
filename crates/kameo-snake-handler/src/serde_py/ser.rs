@@ -138,7 +138,11 @@ impl<'py> serde::Serializer for PythonSerializer<'py> {
         Ok(variant.into_bound_py_any(self.py)?.into())
     }
 
-    fn serialize_newtype_struct<T: ?Sized + Serialize>(self, _name: &'static str, value: &T) -> Result<Self::Ok> {
+    fn serialize_newtype_struct<T: ?Sized + Serialize>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<Self::Ok> {
         value.serialize(self)
     }
 
@@ -353,7 +357,11 @@ impl SerializeStruct for PythonMapSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<()> {
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
         let value = value.serialize(PythonSerializer::new(self.py))?;
         self.dict.set_item(key, value).map_err(|e| {
             Error::Serialization(format!("failed to set struct field '{}': {}", key, e))
@@ -374,7 +382,11 @@ impl SerializeStructVariant for PythonMapSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, value: &T) -> Result<()> {
+    fn serialize_field<T: ?Sized + Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
         let value = value.serialize(PythonSerializer::new(self.py))?;
         self.dict.set_item(key, value).map_err(|e| {
             Error::Serialization(format!("failed to set variant field '{}': {}", key, e))

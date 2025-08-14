@@ -1,13 +1,13 @@
 //! Python-specific tracing utilities for OpenTelemetry span management.
-//! 
+//!
 //! This module provides encapsulated functions for creating and managing spans
 //! in Python subprocess communication, ensuring proper parent-child relationships
 //! and trace context propagation between Rust and Python.
 
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::Context as OtelContext;
 use tracing::info_span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use opentelemetry::Context as OtelContext;
-use opentelemetry::propagation::TextMapPropagator;
 // Removed unused imports
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -205,17 +205,17 @@ def run_with_otel_context(carrier, user_func, *args, **kwargs):
 "#;
 
 /// Create a Python message handler span with proper context.
-/// 
+///
 /// This span represents the Python message handler processing a message
 /// and should be nested under the ipc-child-receive span.
-/// 
+///
 /// # Arguments
 /// * `correlation_id` - Unique identifier for this message
 /// * `message_type` - Type name of the message being processed
 /// * `function_name` - Name of the Python function being called
 /// * `is_async` - Whether the Python function is async
 /// * `parent_span` - The parent span (ipc-child-receive) to nest under
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_python_message_handler_span(
@@ -236,94 +236,79 @@ pub fn create_python_message_handler_span(
 }
 
 /// Create a Python serialization span.
-/// 
+///
 /// This span represents the serialization of a Rust message to Python format.
-/// 
+///
 /// # Arguments
 /// * `message_type` - Type name of the message being serialized
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_python_serialize_span(message_type: &'static str) -> tracing::Span {
-    info_span!(
-        "python_serialize_message",
-        message_type = message_type,
-    )
+    info_span!("python_serialize_message", message_type = message_type,)
 }
 
 /// Create a Python async call span.
-/// 
+///
 /// This span represents the execution of an async Python function.
-/// 
+///
 /// # Arguments
 /// * `function_name` - Name of the Python function being called
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_python_async_call_span(function_name: &str) -> tracing::Span {
-    info_span!(
-        "python_async_call",
-        function_name = function_name,
-    )
+    info_span!("python_async_call", function_name = function_name,)
 }
 
 /// Create a Python sync call span.
-/// 
+///
 /// This span represents the execution of a sync Python function.
-/// 
+///
 /// # Arguments
 /// * `function_name` - Name of the Python function being called
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_python_sync_call_span(function_name: &str) -> tracing::Span {
-    info_span!(
-        "python_sync_call",
-        function_name = function_name,
-    )
+    info_span!("python_sync_call", function_name = function_name,)
 }
 
 /// Create a Python deserialization span.
-/// 
+///
 /// This span represents the deserialization of a Python result to Rust format.
-/// 
+///
 /// # Arguments
 /// * `result_type` - Type name of the result being deserialized
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_python_deserialize_span(result_type: &'static str) -> tracing::Span {
-    info_span!(
-        "python_deserialize_result",
-        result_type = result_type,
-    )
+    info_span!("python_deserialize_result", result_type = result_type,)
 }
 
 /// Create a callback handle span.
-/// 
+///
 /// This span represents the handling of a callback message from Python.
-/// 
+///
 /// # Arguments
 /// * `correlation_id` - Unique identifier for this callback
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_callback_handle_span(correlation_id: u64) -> tracing::Span {
-    info_span!(
-        "handle",
-        correlation_id = correlation_id,
-    )
+    info_span!("handle", correlation_id = correlation_id,)
 }
 
 /// Create an ipc-child-receive span with proper parent context.
-/// 
+///
 /// This span represents the child process receiving a message from the parent.
-/// 
+///
 /// # Arguments
 /// * `correlation_id` - Unique identifier for this message
 /// * `message_type` - Type name of the message being received
 /// * `parent_cx` - OTEL context extracted from the envelope
-/// 
+///
 /// # Returns
 /// A span that can be used with .instrument()
 pub fn create_ipc_child_receive_span(
@@ -344,7 +329,7 @@ pub fn create_ipc_child_receive_span(
 }
 
 /// Set up OpenTelemetry context in Python using pyo3.
-/// 
+///
 /// This function uses pyo3 to directly call OpenTelemetry functions in Python
 /// to set up the trace context before calling the user's function.
 /// This makes trace context handling completely orthogonal to the user's Python code.
@@ -352,7 +337,7 @@ pub fn setup_python_otel_context(context: &OtelContext) -> Result<(), Box<dyn st
     tracing::debug!("setup_python_otel_context CALLED");
     Python::with_gil(|py| {
         tracing::debug!("Setting up Python OTEL context using pyo3");
-        
+
         // Initialize Python OpenTelemetry SDK if not already initialized
         let init_code = r#"
 import opentelemetry
@@ -420,29 +405,33 @@ else:
 
 # Console exporter removed - only use OTLP exporter for consistency with Rust
 "#;
-        
-        match py.run(std::ffi::CString::new(init_code).unwrap().as_c_str(), None, None) {
+
+        match py.run(
+            std::ffi::CString::new(init_code).unwrap().as_c_str(),
+            None,
+            None,
+        ) {
             Ok(_) => {
                 tracing::debug!("Successfully executed Python OpenTelemetry SDK initialization");
-            },
+            }
             Err(e) => {
-            tracing::error!("Failed to initialize Python OpenTelemetry SDK: {:?}", e);
+                tracing::error!("Failed to initialize Python OpenTelemetry SDK: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
-        
+
         // Extract trace context to carrier format
         let mut carrier = std::collections::HashMap::new();
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
-        
+
         // Debug: Check what's in the context before injection
         tracing::debug!("About to inject context: {:?}", context);
-        
+
         // Always try to inject context - propagator will handle empty contexts gracefully
         propagator.inject_context(context, &mut carrier);
-        
+
         tracing::debug!("Extracted trace context to carrier: {:?}", carrier);
-        
+
         // Debug: Check if carrier is empty
         if carrier.is_empty() {
             tracing::debug!("Carrier is empty - no active span context to propagate");
@@ -452,43 +441,41 @@ else:
                 tracing::debug!("Carrier item: {} = {}", key, value);
             }
         }
-        
 
-        
         // Import OpenTelemetry modules
         let otel_trace = match py.import("opentelemetry.trace") {
             Ok(module) => {
                 tracing::debug!("Successfully imported opentelemetry.trace");
                 module
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to import opentelemetry.trace: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
-        
+
         let _otel_context = match py.import("opentelemetry.context") {
             Ok(module) => {
                 tracing::debug!("Successfully imported opentelemetry.context");
                 module
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to import opentelemetry.context: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
-        
+
         let otel_propagate = match py.import("opentelemetry.propagate") {
             Ok(module) => {
                 tracing::debug!("Successfully imported opentelemetry.propagate");
                 module
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to import opentelemetry.propagate: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
-        
+
         // Create a Python dict from the carrier
         let carrier_dict = PyDict::new(py);
         for (key, value) in carrier {
@@ -498,26 +485,27 @@ else:
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         }
-        
+
         tracing::debug!("Created carrier dict: {:?}", carrier_dict);
-        
+
         // Clone carrier_dict for debug code
         let carrier_dict_clone = carrier_dict.clone();
-        
+
         // Extract the context using OpenTelemetry's extract function
         let _extracted_context = match otel_propagate.call_method1("extract", (carrier_dict,)) {
             Ok(context) => {
                 tracing::debug!("Successfully extracted context: {:?}", context);
                 context
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to extract context: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
-        
+
         // Debug: Check what's in the extracted context (but don't attach globally)
-        let debug_code = format!(r#"
+        let debug_code = format!(
+            r#"
 import opentelemetry.trace as trace
 import opentelemetry.propagate as otel_propagate
 
@@ -533,28 +521,36 @@ print(f"[DEBUG] Python extracted_context: {{extracted_context}}")
 current_span = trace.get_current_span()
 span_context = current_span.get_span_context()
 print(f"[DEBUG] Current span (should be default): current_span={{current_span}} trace_id=0x{{span_context.trace_id:032x}} span_id=0x{{span_context.span_id:016x}} is_remote={{span_context.is_remote}}")
-"#, carrier_dict = carrier_dict_clone);
-        
-        let _ = py.run(std::ffi::CString::new(debug_code).unwrap().as_c_str(), None, None).map_err(|e| {
-            tracing::error!("Failed to run debug code: {:?}", e);
-            e
-        })?;
-        
+"#,
+            carrier_dict = carrier_dict_clone
+        );
+
+        let _ = py
+            .run(
+                std::ffi::CString::new(debug_code).unwrap().as_c_str(),
+                None,
+                None,
+            )
+            .map_err(|e| {
+                tracing::error!("Failed to run debug code: {:?}", e);
+                e
+            })?;
+
         // Get the current tracer
         let _tracer = match otel_trace.call_method1("get_tracer", ("kameo_snake_handler",)) {
             Ok(tracer) => {
                 tracing::debug!("Successfully got tracer: {:?}", tracer);
                 tracer
-            },
+            }
             Err(e) => {
                 tracing::error!("Failed to get tracer: {:?}", e);
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
         };
-        
+
         // DO NOT attach context globally here - it will be attached per-message in PY_OTEL_RUNNER
         tracing::debug!("Context setup complete - context will be attached per-message");
-        
+
         // Force flush any pending spans to ensure they are exported
         let flush_code = r#"
 try:
@@ -567,29 +563,35 @@ try:
 except Exception as e:
     print(f"[DEBUG] Force flush failed: {e}")
 "#;
-        
-        let _ = py.run(std::ffi::CString::new(flush_code).unwrap().as_c_str(), None, None).map_err(|e| {
-            tracing::error!("Failed to force flush Python spans: {:?}", e);
-            e
-        })?;
-        
+
+        let _ = py
+            .run(
+                std::ffi::CString::new(flush_code).unwrap().as_c_str(),
+                None,
+                None,
+            )
+            .map_err(|e| {
+                tracing::error!("Failed to force flush Python spans: {:?}", e);
+                e
+            })?;
+
         tracing::debug!("Successfully set up Python OTEL context using pyo3");
         Ok(())
     })
 }
 
 /// Create a complete Python message processing span hierarchy.
-/// 
+///
 /// This function creates all the necessary spans for Python message processing
 /// with proper parent-child relationships and context propagation.
-/// 
+///
 /// # Arguments
 /// * `correlation_id` - Unique identifier for this message
 /// * `message_type` - Type name of the message being processed
 /// * `function_name` - Name of the Python function being called
 /// * `is_async` - Whether the Python function is async
 /// * `parent_span` - The parent span (ipc-child-receive) to nest under
-/// 
+///
 /// # Returns
 /// A tuple of spans that can be used with .instrument()
 pub fn create_python_processing_spans(
@@ -611,7 +613,7 @@ pub fn create_python_processing_spans(
         is_async,
         parent_span,
     );
-    
+
     let serialize_span = create_python_serialize_span(message_type);
     let call_span = if is_async {
         create_python_async_call_span(function_name)
@@ -619,6 +621,11 @@ pub fn create_python_processing_spans(
         create_python_sync_call_span(function_name)
     };
     let deserialize_span = create_python_deserialize_span(message_type);
-    
-    (message_handler_span, serialize_span, call_span, deserialize_span)
-} 
+
+    (
+        message_handler_span,
+        serialize_span,
+        call_span,
+        deserialize_span,
+    )
+}

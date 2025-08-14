@@ -1,14 +1,15 @@
 use bincode::{Decode, Encode};
+#[cfg(feature = "python")]
+use pyo3::exceptions::{
+    PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
+    PyValueError,
+};
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io;
 use thiserror::Error;
 use tracing::error;
-#[cfg(feature = "python")]
-use pyo3::exceptions::{
-    PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError, PyValueError
-};
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
 
 #[derive(Debug, Error)]
 pub enum SubprocessIpcBackendError {
@@ -48,12 +49,18 @@ impl From<SubprocessIpcBackendError> for SubprocessIpcBackendIpcError {
             SubprocessIpcBackendError::ConnectionClosed => Self::ConnectionClosed,
             SubprocessIpcBackendError::UnknownActorType { actor_name } => {
                 Self::UnknownActorType { actor_name }
-            },
+            }
             SubprocessIpcBackendError::Ipc(err) => Self::Protocol(format!("IPC error: {err}")),
-            SubprocessIpcBackendError::Serialization(err) => Self::Protocol(format!("Serialization error: {err}")),
-            SubprocessIpcBackendError::Deserialization(err) => Self::Protocol(format!("Deserialization error: {err}")),
+            SubprocessIpcBackendError::Serialization(err) => {
+                Self::Protocol(format!("Serialization error: {err}"))
+            }
+            SubprocessIpcBackendError::Deserialization(err) => {
+                Self::Protocol(format!("Deserialization error: {err}"))
+            }
             SubprocessIpcBackendError::Shutdown => Self::Protocol("Shutdown".to_string()),
-            SubprocessIpcBackendError::Panicked { reason } => Self::Protocol(format!("Panicked: {reason}")),
+            SubprocessIpcBackendError::Panicked { reason } => {
+                Self::Protocol(format!("Panicked: {reason}"))
+            }
         }
     }
 }
@@ -103,14 +110,12 @@ pub enum PythonExecutionError {
     #[error("Child process terminated unexpectedly")]
     ChildProcessTerminated,
     #[error("OpenTelemetry dependency error: missing packages {missing_packages:?} in Python paths {python_paths:?}")]
-    OtelDependencyError { 
+    OtelDependencyError {
         missing_packages: Vec<String>,
         python_paths: Vec<String>,
     },
     #[error("OpenTelemetry functionality error: {details}")]
-    OtelFunctionalityError { 
-        details: String,
-    },
+    OtelFunctionalityError { details: String },
 }
 
 #[cfg(feature = "python")]

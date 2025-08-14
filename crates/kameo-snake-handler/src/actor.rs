@@ -1,44 +1,40 @@
-use kameo_child_process::error::PythonExecutionError;
-use kameo_child_process::TracingContext;
 use anyhow::Result;
 use async_trait::async_trait;
 use bincode::{Decode, Encode};
 use kameo::actor::Actor;
 use kameo::message::Message;
+use kameo_child_process::error::PythonExecutionError;
 use kameo_child_process::ChildProcessMessageHandler;
-use kameo_child_process::{
-    KameoChildProcessMessage, RuntimeAware,
-};
+use kameo_child_process::TracingContext;
+use kameo_child_process::{KameoChildProcessMessage, RuntimeAware};
+use opentelemetry::propagation::TextMapPropagator;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use opentelemetry::propagation::TextMapPropagator;
-
 
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::instrument;
 use tracing_futures::Instrument;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::pin::Pin;
-use std::future::Future;
-
 
 /// Configuration for Python subprocess execution.
-/// 
+///
 /// This struct defines all the configuration options needed to spawn and configure
 /// a Python subprocess that can handle both synchronous and streaming messages.
-/// 
+///
 /// ## Configuration Options
-/// 
+///
 /// - **Python Environment**: Paths, environment variables, and module configuration
 /// - **Function Specification**: Module name, function name, and file path
 /// - **Async Support**: Whether the Python function is async or sync
 /// - **Process Management**: Automatic environment setup and path management
 /// - **OpenTelemetry Integration**: Trace context propagation between Rust and Python
-/// 
+///
 /// ## Usage Example
-/// 
-/// ```rust
+///
+/// ```rust,ignore
 /// let config = PythonConfig {
 ///     python_path: vec![
 ///         "/usr/bin/python3".to_string(),
@@ -55,32 +51,32 @@ use std::future::Future;
 ///     validate_otel_dependencies: true,  // Validate OTEL packages on startup
 /// };
 /// ```
-/// 
+///
 /// ## Python Function Requirements
-/// 
+///
 /// ### Sync Functions
 /// ```python
 /// def process_data(message: dict) -> dict:
 ///     return {"result": "processed", "data": message["input"]}
 /// ```
-/// 
+///
 /// ### Async Generators (Streaming)
 /// ```python
 /// async def process_data(message: dict) -> AsyncGenerator[dict, None]:
 ///     for i in range(5):
 ///         yield {"index": i, "data": message["input"]}
 /// ```
-/// 
+///
 /// ## OpenTelemetry Integration
-/// 
+///
 /// When `enable_otel_propagation` is true, trace context will be automatically
 /// propagated between Rust and Python processes. This requires the following
 /// Python packages to be installed:
-/// 
+///
 /// - `opentelemetry`
 /// - `opentelemetry-api`
 /// - `opentelemetry-sdk`
-/// 
+///
 /// The system will validate these dependencies if `validate_otel_dependencies` is true.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct PythonConfig {
@@ -95,7 +91,7 @@ pub struct PythonConfig {
     /// Whether the Python function is async (for streaming support)
     pub is_async: bool,
     /// Enable OpenTelemetry trace context propagation
-    /// 
+    ///
     /// When enabled, trace context will be automatically propagated between
     /// Rust and Python processes. This requires the `opentelemetry` Python
     /// package to be installed in the Python environment.
@@ -116,51 +112,51 @@ impl Default for PythonConfig {
 }
 
 /// Kameo actor for Python subprocess communication with unified streaming support.
-/// 
+///
 /// This actor manages communication with Python subprocesses, handling both synchronous
 /// and streaming message patterns. It integrates with the unified streaming protocol
 /// and provides seamless Python function execution.
-/// 
+///
 /// ## Actor Features
-/// 
+///
 /// - **Python Integration**: Direct execution of Python functions with PyO3
 /// - **Streaming Support**: Native support for Python async generators
 /// - **Type Conversion**: Automatic serialization between Rust and Python types
 /// - **Error Handling**: Python exceptions converted to Rust errors
 /// - **Concurrency Control**: Tracks concurrent task execution
-/// 
+///
 /// ## Message Handling
-/// 
+///
 /// - **Sync Messages**: Calls Python functions that return single values
 /// - **Stream Messages**: Calls Python async generators that yield multiple values
 /// - **Error Propagation**: Python exceptions properly converted and propagated
 /// - **Type Safety**: Full type safety through the message system
-/// 
+///
 /// ## Usage
-/// 
-/// ```rust
+///
+/// ```rust,ignore
 /// // Create actor with Python configuration
 /// let actor = PythonActor::new(config, py_function);
-/// 
+///
 /// // Send sync message
 /// let response = actor.ask(MyMessage { data: "hello" }).await?;
-/// 
+///
 /// // Send streaming message
 /// let stream = actor.send_stream(MyMessage { data: "stream" }).await?;
 /// while let Some(item) = stream.next().await {
 ///     println!("Python response: {:?}", item?);
 /// }
 /// ```
-/// 
+///
 /// ## Python Side
-/// 
+///
 /// The actor calls Python functions with the following signatures:
-/// 
+///
 /// ```python
 /// # Sync function
 /// def my_function(message: dict) -> dict:
 ///     return {"result": "processed"}
-/// 
+///
 /// # Async generator (streaming)
 /// async def my_function(message: dict) -> AsyncGenerator[dict, None]:
 ///     for i in range(5):
@@ -191,30 +187,27 @@ impl PythonMessageHandler {
             config: self.config.clone(),
         })
     }
-    
+
     /// Shared OTEL setup logic for Python function calls.
-    /// 
+    ///
     /// This method handles the complex OTEL context setup that's shared between sync and async calls.
     /// It extracts trace context, sets up Python OTEL context, and creates carrier dicts.
     /// The caller is responsible for importing the run_with_otel_context function and making the call.
-    fn prepare_otel_context(
-        tracing_context: Option<&TracingContext>,
-    ) -> opentelemetry::Context {
+    fn prepare_otel_context(tracing_context: Option<&TracingContext>) -> opentelemetry::Context {
         // Get context to inject (from envelope if present, else current)
         let context_to_inject = if let Some(tc) = tracing_context {
             tc.extract_parent()
         } else {
             opentelemetry::Context::current()
         };
-        
+
         // Setup Python OTEL context
         if let Err(e) = crate::tracing_utils::setup_python_otel_context(&context_to_inject) {
             tracing::error!("Failed to setup Python OTEL context: {:?}", e);
         }
-        
+
         context_to_inject
     }
-
 }
 
 impl Clone for PythonMessageHandler {
@@ -231,7 +224,10 @@ where
     E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
 {
     pub fn new(config: PythonConfig, py_function: Py<PyAny>) -> Self {
-        tracing::debug!("Storing reference to Python function in handler: {:?}", py_function);
+        tracing::debug!(
+            "Storing reference to Python function in handler: {:?}",
+            py_function
+        );
         let handler = PythonMessageHandler {
             py_function,
             config,
@@ -252,21 +248,41 @@ where
 {
     type Error = PythonExecutionError;
     #[allow(refining_impl_trait)]
-    fn on_start(&mut self, _actor_ref: kameo::actor::ActorRef<Self>) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+    fn on_start(
+        &mut self,
+        _actor_ref: kameo::actor::ActorRef<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(async move {
             tracing::info!(status = "started", actor_type = "PythonActor");
             Ok(())
         })
     }
     #[allow(refining_impl_trait)]
-    fn on_stop(&mut self, _actor_ref: kameo::actor::WeakActorRef<Self>, reason: kameo::error::ActorStopReason) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
+    fn on_stop(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        reason: kameo::error::ActorStopReason,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(async move {
             tracing::error!(status = "stopped", actor_type = "PythonActor", ?reason);
             Ok(())
         })
     }
     #[allow(refining_impl_trait)]
-    fn on_panic(&mut self, _actor_ref: kameo::actor::WeakActorRef<Self>, err: kameo::error::PanicError) -> Pin<Box<dyn Future<Output = Result<std::ops::ControlFlow<kameo::error::ActorStopReason>, Self::Error>> + Send>> {
+    fn on_panic(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        err: kameo::error::PanicError,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        std::ops::ControlFlow<kameo::error::ActorStopReason>,
+                        Self::Error,
+                    >,
+                > + Send,
+        >,
+    > {
         Box::pin(async move {
             tracing::error!(status = "panicked", actor_type = "PythonActor", ?err);
             Ok(std::ops::ControlFlow::Continue(()))
@@ -293,13 +309,26 @@ where
         let concurrent_tasks = self.concurrent_tasks.clone();
         if let Some(reply_sender) = reply_sender {
             concurrent_tasks.fetch_add(1, Ordering::SeqCst);
-            tracing::trace!(event = "actor_spawn", concurrent = concurrent_tasks.load(Ordering::SeqCst), "Spawning concurrent handler task for message");
+            tracing::trace!(
+                event = "actor_spawn",
+                concurrent = concurrent_tasks.load(Ordering::SeqCst),
+                "Spawning concurrent handler task for message"
+            );
             tokio::spawn(async move {
                 let result = handler.handle_child_message_impl(message, None).await;
-                tracing::trace!(event = "actor_reply", ?result, concurrent = concurrent_tasks.load(Ordering::SeqCst), "Sending reply from concurrent handler task");
+                tracing::trace!(
+                    event = "actor_reply",
+                    ?result,
+                    concurrent = concurrent_tasks.load(Ordering::SeqCst),
+                    "Sending reply from concurrent handler task"
+                );
                 reply_sender.send(result);
                 concurrent_tasks.fetch_sub(1, Ordering::SeqCst);
-                tracing::trace!(event = "actor_task_complete", concurrent = concurrent_tasks.load(Ordering::SeqCst), "Handler task complete");
+                tracing::trace!(
+                    event = "actor_task_complete",
+                    concurrent = concurrent_tasks.load(Ordering::SeqCst),
+                    "Handler task complete"
+                );
             });
         } else {
             tracing::warn!("No reply sender available for message (fire-and-forget)");
@@ -363,51 +392,61 @@ where
     async fn handle_child_message(&mut self, msg: M) -> Result<M::Ok, PythonExecutionError> {
         self.handle_child_message_impl(msg, None).await
     }
-    
-    async fn handle_child_message_with_context(&mut self, msg: M, context: kameo_child_process::TracingContext) -> Result<M::Ok, PythonExecutionError> {
+
+    async fn handle_child_message_with_context(
+        &mut self,
+        msg: M,
+        context: kameo_child_process::TracingContext,
+    ) -> Result<M::Ok, PythonExecutionError> {
         self.handle_child_message_impl(msg, Some(context)).await
     }
-    
+
     /// Handle a streaming message and return a stream of responses.
-    /// 
+    ///
     /// This method processes messages that should return multiple results over time.
     /// It supports both synchronous and asynchronous Python functions:
-    /// 
+    ///
     /// ## Sync Functions
-    /// 
+    ///
     /// For synchronous Python functions (`is_async = false`), the function is called
     /// once and its result is wrapped in a single-item stream for protocol consistency.
-    /// 
+    ///
     /// ## Async Functions (Streaming)
-    /// 
+    ///
     /// For asynchronous Python functions (`is_async = true`), the function is expected
     /// to be an async generator that yields multiple values. The function is called
     /// and its async generator is consumed using the `PythonAsyncGeneratorStream`.
-    /// 
+    ///
     /// ## Python Async Generator Protocol
-    /// 
+    ///
     /// The Python function should implement the async generator protocol:
     /// - Return an object with `__aiter__()` method
     /// - `__aiter__()` should return an async iterator
     /// - `__anext__()` should yield values or raise `StopAsyncIteration`
-    /// 
+    ///
     /// ## Error Handling
-    /// 
+    ///
     /// - Python exceptions are converted to `PythonExecutionError`
     /// - `StopAsyncIteration` is handled gracefully for stream completion
     /// - GIL-related errors are prevented through proper lock management
-    /// 
+    ///
     /// ## Example Python Function
-    /// 
+    ///
     /// ```python
     /// async def handle_message_streaming(message):
     ///     for i in range(10):
     ///         yield {"index": i, "value": i * 2}
     ///         await asyncio.sleep(0.1)
     /// ```
-    async fn handle_child_message_stream(&mut self, msg: M) -> Result<Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>, PythonExecutionError> {
+    async fn handle_child_message_stream(
+        &mut self,
+        msg: M,
+    ) -> Result<
+        Box<dyn futures::stream::Stream<Item = Result<M::Ok, PythonExecutionError>> + Send + Unpin>,
+        PythonExecutionError,
+    > {
         tracing::debug!(event = "handle_child_message_stream", function = %self.config.function_name, is_async = %self.config.is_async, "handle_child_message_stream called");
-        
+
         if !self.config.is_async {
             tracing::debug!(event = "non_async_stream", "Creating non-async stream");
             let result = self.handle_child_message_impl(msg, None).await;
@@ -415,37 +454,43 @@ where
             return Ok(Box::new(stream));
         }
 
-        tracing::debug!(event = "creating_async_stream", "Creating async generator stream");
+        tracing::debug!(
+            event = "creating_async_stream",
+            "Creating async generator stream"
+        );
         // Create a custom stream struct that handles GIL lifetimes properly
         let stream = PythonAsyncGeneratorStream::new(self.clone(), msg).await?;
-        tracing::debug!(event = "async_stream_created", "Async generator stream created");
+        tracing::debug!(
+            event = "async_stream_created",
+            "Async generator stream created"
+        );
         Ok(Box::new(stream))
     }
 }
 
 /// Custom stream struct for handling Python async generators with proper GIL management.
-/// 
+///
 /// This struct implements Rust's `Stream` trait to consume Python async generators.
 /// It manages the Python Global Interpreter Lock (GIL) correctly and handles the
 /// async generator lifecycle including creation, iteration, and cleanup.
-/// 
+///
 /// ## State Machine
-/// 
+///
 /// The stream uses a state machine to manage the async generator lifecycle:
 /// - `Initial`: Starting state, need to create the generator
 /// - `CreatingGenerator`: Async future for creating the generator
 /// - `Generator`: Generator created, have the async iterator ready
 /// - `GettingNext`: Async future for getting the next item
 /// - `Exhausted`: Generator has been fully consumed
-/// 
+///
 /// ## GIL Management
-/// 
+///
 /// All Python operations are wrapped in `Python::with_gil()` calls to ensure
 /// proper GIL acquisition and release. This prevents deadlocks and ensures
 /// thread safety when working with Python objects from Rust async contexts.
-/// 
+///
 /// ## Error Handling
-/// 
+///
 /// The stream properly handles Python exceptions including `StopAsyncIteration`
 /// for normal stream completion and other exceptions for error conditions.
 /// All errors are converted to `PythonExecutionError` for consistent error handling.
@@ -459,7 +504,7 @@ where
 }
 
 /// State machine for managing Python async generator lifecycle.
-/// 
+///
 /// This enum tracks the current state of the async generator stream,
 /// allowing the `Stream::poll_next` method to handle different phases
 /// of the generator's lifecycle correctly.
@@ -471,12 +516,19 @@ where
     Initial,
     /// Creating the generator (async future)
     CreatingGenerator {
-        fut: Pin<Box<dyn Future<Output = Result<(pyo3::PyObject, pyo3::Py<pyo3::PyAny>), PythonExecutionError>> + Send>>,
+        fut: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (pyo3::PyObject, pyo3::Py<pyo3::PyAny>),
+                            PythonExecutionError,
+                        >,
+                    > + Send,
+            >,
+        >,
     },
     /// Generator created, have the async iterator
-    Generator {
-        async_iter: pyo3::Py<pyo3::PyAny>,
-    },
+    Generator { async_iter: pyo3::Py<pyo3::PyAny> },
     /// Getting next item (async future)
     GettingNext {
         async_iter: pyo3::Py<pyo3::PyAny>,
@@ -521,33 +573,33 @@ where
     type Item = Result<M::Ok, PythonExecutionError>;
 
     /// Poll the stream for the next item from the Python async generator.
-    /// 
+    ///
     /// This method implements the core streaming logic using a state machine approach.
     /// It handles the transition between different states of the async generator lifecycle
     /// and ensures proper GIL management throughout the process.
-    /// 
+    ///
     /// ## State Transitions
-    /// 
+    ///
     /// 1. **Initial → CreatingGenerator**: Start creating the Python async generator
     /// 2. **CreatingGenerator → Generator**: Generator created, ready to iterate
     /// 3. **Generator → GettingNext**: Start getting the next item
     /// 4. **GettingNext → Generator**: Item received, ready for next iteration
     /// 5. **GettingNext → Exhausted**: Stream completed (StopAsyncIteration)
-    /// 
+    ///
     /// ## GIL Safety
-    /// 
+    ///
     /// All Python operations are wrapped in `Python::with_gil()` calls to ensure
     /// thread safety and prevent deadlocks. The GIL is acquired only when needed
     /// and released immediately after use.
-    /// 
+    ///
     /// ## Error Handling
-    /// 
+    ///
     /// - `StopAsyncIteration`: Normal stream completion, returns `None`
     /// - Other Python exceptions: Converted to `PythonExecutionError`
     /// - GIL errors: Prevented through proper lock management
-    /// 
+    ///
     /// ## Performance Considerations
-    /// 
+    ///
     /// - Uses `Pin<Box<dyn Future>>` for async operations within sync `poll_next`
     /// - Clones `Py<PyAny>` objects only when necessary
     /// - Minimizes GIL acquisition time
@@ -562,21 +614,30 @@ where
 
         match &mut self.state {
             PythonAsyncGeneratorState::Initial => {
-                tracing::debug!(event = "stream_initial_state", "Starting to create generator");
+                tracing::debug!(
+                    event = "stream_initial_state",
+                    "Starting to create generator"
+                );
                 // Start creating the generator
                 let handler = self.handler.clone();
-                let msg = self.msg.take().expect("Message should be available in Initial state");
-                
+                let msg = self
+                    .msg
+                    .take()
+                    .expect("Message should be available in Initial state");
+
                 let fut = async move {
                     let function_name = handler.config.function_name.clone();
                     let py_function = Python::with_gil(|py| handler.py_function.clone_ref(py));
-                    
+
                     // Serialize Rust message to Python object
-                    let py_msg = match Python::with_gil(|py| crate::serde_py::to_pyobject(py, &msg)) {
+                    let py_msg = match Python::with_gil(|py| crate::serde_py::to_pyobject(py, &msg))
+                    {
                         Ok(obj) => obj,
                         Err(e) => {
                             tracing::error!(event = "serialize_error", error = %e, "Failed to serialize Rust message to Python");
-                            return Err(PythonExecutionError::SerializationError { message: e.to_string() });
+                            return Err(PythonExecutionError::SerializationError {
+                                message: e.to_string(),
+                            });
                         }
                     };
 
@@ -586,9 +647,13 @@ where
                         tracing::debug!(event = "calling_python_function", function = %function_name, "Calling Python function directly");
                         let result = match py_func.call1((py_msg,)) {
                             Ok(result) => {
-                                tracing::debug!(event = "python_function_result", "Python function returned: {:?}", result);
+                                tracing::debug!(
+                                    event = "python_function_result",
+                                    "Python function returned: {:?}",
+                                    result
+                                );
                                 result
-                            },
+                            }
                             Err(e) => {
                                 return Err(PythonExecutionError::CallError {
                                     function: function_name.clone(),
@@ -596,42 +661,45 @@ where
                                 });
                             }
                         };
-                        
+
                         // Check if the result is an async generator
                         let is_async_gen = result.hasattr("__aiter__").unwrap_or(false);
                         if !is_async_gen {
                             return Err(PythonExecutionError::CallError {
                                 function: function_name.clone(),
-                                message: "Python function did not return an async generator".to_string(),
+                                message: "Python function did not return an async generator"
+                                    .to_string(),
                             });
                         }
-                        
+
                         // Get the async iterator by calling __aiter__()
                         let async_iter = match result.call_method0("__aiter__") {
                             Ok(obj) => {
-                                tracing::debug!(event = "got_aiter", "Got __aiter__ result: {:?}", obj);
+                                tracing::debug!(
+                                    event = "got_aiter",
+                                    "Got __aiter__ result: {:?}",
+                                    obj
+                                );
                                 obj.unbind()
-                            },
+                            }
                             Err(e) => {
                                 tracing::error!(event = "aiter_error", error = %e, "Failed to get __aiter__");
                                 return Err(PythonExecutionError::from(e));
                             }
                         };
-                        
+
                         Ok((result.into(), async_iter))
                     });
-                    
+
                     result
                 };
 
-                self.state = PythonAsyncGeneratorState::CreatingGenerator {
-                    fut: Box::pin(fut),
-                };
-                
+                self.state = PythonAsyncGeneratorState::CreatingGenerator { fut: Box::pin(fut) };
+
                 // Poll the future immediately
                 self.poll_next(cx)
             }
-            
+
             PythonAsyncGeneratorState::CreatingGenerator { fut } => {
                 match fut.as_mut().poll(cx) {
                     std::task::Poll::Ready(Ok((_gen, async_iter))) => {
@@ -639,23 +707,20 @@ where
                         // Start getting the first item
                         self.poll_next(cx)
                     }
-                    std::task::Poll::Ready(Err(e)) => {
-                        std::task::Poll::Ready(Some(Err(e)))
-                    }
-                    std::task::Poll::Pending => {
-                        std::task::Poll::Pending
-                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
                 }
             }
-            
+
             PythonAsyncGeneratorState::Generator { async_iter } => {
                 // Start getting the next item
                 let async_iter_clone = Python::with_gil(|py| async_iter.clone_ref(py));
-                
+
                 let fut = async move {
                     let next_fut = Python::with_gil(|py| {
                         let bound = async_iter_clone.bind(py);
-                        bound.call_method0("__anext__")
+                        bound
+                            .call_method0("__anext__")
                             .map(|coro| into_future(coro).unwrap())
                             .map_err(|e| PythonExecutionError::from(e))
                     });
@@ -703,80 +768,78 @@ where
                     async_iter: Python::with_gil(|py| async_iter.clone_ref(py)),
                     fut: Box::pin(fut),
                 };
-                
+
                 // Poll the future immediately
                 self.poll_next(cx)
             }
-            
+
             PythonAsyncGeneratorState::GettingNext { async_iter, fut } => {
                 match fut.as_mut().poll(cx) {
                     std::task::Poll::Ready(Ok(Some(item))) => {
                         // Store the async_iter back in the Generator state for the next iteration
                         let async_iter = Python::with_gil(|py| async_iter.clone_ref(py));
-                        self.state = PythonAsyncGeneratorState::Generator {
-                            async_iter,
-                        };
+                        self.state = PythonAsyncGeneratorState::Generator { async_iter };
                         std::task::Poll::Ready(Some(Ok(item)))
                     }
                     std::task::Poll::Ready(Ok(None)) => {
                         self.state = PythonAsyncGeneratorState::Exhausted;
                         std::task::Poll::Ready(None)
                     }
-                    std::task::Poll::Ready(Err(e)) => {
-                        std::task::Poll::Ready(Some(Err(e)))
-                    }
-                    std::task::Poll::Pending => {
-                        std::task::Poll::Pending
-                    }
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
                 }
             }
-            
-            PythonAsyncGeneratorState::Exhausted => {
-                std::task::Poll::Ready(None)
-            }
+
+            PythonAsyncGeneratorState::Exhausted => std::task::Poll::Ready(None),
         }
     }
 }
 
-impl<M> Unpin for PythonAsyncGeneratorStream<M>
-where
-    M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
-{}
+impl<M> Unpin for PythonAsyncGeneratorStream<M> where
+    M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static
+{
+}
 
 impl PythonMessageHandler {
-    pub async fn handle_child_message_impl<M>(&self, message: M, tracing_context: Option<kameo_child_process::TracingContext>) -> Result<M::Ok, PythonExecutionError>
+    pub async fn handle_child_message_impl<M>(
+        &self,
+        message: M,
+        tracing_context: Option<kameo_child_process::TracingContext>,
+    ) -> Result<M::Ok, PythonExecutionError>
     where
         M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
     {
         use pyo3::prelude::*;
         use pyo3_async_runtimes::tokio::into_future;
-        
+
         let is_async = self.config.is_async;
         let function_name = self.config.function_name.clone();
         let py_function = Python::with_gil(|py| self.py_function.clone_ref(py));
-        
+
         // Serialize Rust message to Python object
         let py_msg = {
-            let serialize_span = crate::tracing_utils::create_python_serialize_span(std::any::type_name::<M>());
-            async {
-                Python::with_gil(|py| crate::serde_py::to_pyobject(py, &message))
-            }.instrument(serialize_span).await
+            let serialize_span =
+                crate::tracing_utils::create_python_serialize_span(std::any::type_name::<M>());
+            async { Python::with_gil(|py| crate::serde_py::to_pyobject(py, &message)) }
+                .instrument(serialize_span)
+                .await
         };
-        
+
         let py_msg = match py_msg {
             Ok(obj) => obj,
             Err(e) => {
                 tracing::error!(event = "serialize_error", error = %e, "Failed to serialize Rust message to Python");
                 return Err(PythonExecutionError::SerializationError {
                     message: e.to_string(),
-                })
+                });
             }
         };
-        
+
         let result = if is_async {
             // Async Python function call
-            let async_call_span = crate::tracing_utils::create_python_async_call_span(&function_name);
-            
+            let async_call_span =
+                crate::tracing_utils::create_python_async_call_span(&function_name);
+
             async {
                 let fut_result = Python::with_gil(|py| {
                     if self.config.enable_otel_propagation {
@@ -895,18 +958,20 @@ except Exception:
         } else {
             // Sync Python function call
             let sync_call_span = crate::tracing_utils::create_python_sync_call_span(&function_name);
-            
+
             async {
                 let result = Python::with_gil(|py| {
                     if self.config.enable_otel_propagation {
                         // Use the shared OTEL setup logic
-                        let context_to_inject = Self::prepare_otel_context(tracing_context.as_ref());
-                        
+                        let context_to_inject =
+                            Self::prepare_otel_context(tracing_context.as_ref());
+
                         // Extract trace context to carrier format
                         let mut carrier = std::collections::HashMap::new();
-                        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+                        let propagator =
+                            opentelemetry_sdk::propagation::TraceContextPropagator::new();
                         propagator.inject_context(&context_to_inject, &mut carrier);
-                        
+
                         // Create Python dict from carrier
                         let carrier_dict = PyDict::new(py);
                         for (key, value) in carrier {
@@ -917,67 +982,73 @@ except Exception:
                                 });
                             }
                         }
-                        
+
                         // Import and call the run_with_otel_context helper
-                        let run_with_otel_context = match py.run(std::ffi::CString::new(crate::tracing_utils::PY_OTEL_RUNNER).unwrap().as_c_str(), None, None) {
-                            Ok(_) => {
-                                match py.import("__main__") {
-                                    Ok(main) => match main.getattr("run_with_otel_context") {
-                                        Ok(func) => func,
-                                        Err(e) => {
-                                            return Err(PythonExecutionError::CallError {
-                                                function: function_name.clone(),
-                                                message: format!("Failed to get run_with_otel_context: {}", e),
-                                            });
-                                        }
-                                    },
+                        let run_with_otel_context = match py.run(
+                            std::ffi::CString::new(crate::tracing_utils::PY_OTEL_RUNNER)
+                                .unwrap()
+                                .as_c_str(),
+                            None,
+                            None,
+                        ) {
+                            Ok(_) => match py.import("__main__") {
+                                Ok(main) => match main.getattr("run_with_otel_context") {
+                                    Ok(func) => func,
                                     Err(e) => {
                                         return Err(PythonExecutionError::CallError {
                                             function: function_name.clone(),
-                                            message: format!("Failed to import __main__: {}", e),
+                                            message: format!(
+                                                "Failed to get run_with_otel_context: {}",
+                                                e
+                                            ),
                                         });
                                     }
+                                },
+                                Err(e) => {
+                                    return Err(PythonExecutionError::CallError {
+                                        function: function_name.clone(),
+                                        message: format!("Failed to import __main__: {}", e),
+                                    });
                                 }
                             },
                             Err(e) => {
                                 return Err(PythonExecutionError::CallError {
                                     function: function_name.clone(),
-                                    message: format!("Failed to define run_with_otel_context: {}", e),
+                                    message: format!(
+                                        "Failed to define run_with_otel_context: {}",
+                                        e
+                                    ),
                                 });
                             }
                         };
-                        
+
                         // Call run_with_otel_context with carrier, user function, and message
                         let py_func = py_function.bind(py);
                         match run_with_otel_context.call1((carrier_dict, py_func, py_msg)) {
                             Ok(result) => Ok(result.into()),
-                            Err(e) => {
-                                Err(PythonExecutionError::CallError {
-                                    function: function_name.clone(),
-                                    message: e.to_string(),
-                                })
-                            },
+                            Err(e) => Err(PythonExecutionError::CallError {
+                                function: function_name.clone(),
+                                message: e.to_string(),
+                            }),
                         }
                     } else {
                         // OTEL propagation disabled - call function directly
                         let py_func = py_function.bind(py);
                         match py_func.call1((py_msg,)) {
                             Ok(result) => Ok(result.into()),
-                            Err(e) => {
-                                Err(PythonExecutionError::CallError {
-                                    function: function_name.clone(),
-                                    message: e.to_string(),
-                                })
-                            },
+                            Err(e) => Err(PythonExecutionError::CallError {
+                                function: function_name.clone(),
+                                message: e.to_string(),
+                            }),
                         }
                     }
                 });
-                
+
                 let result = match result {
                     Ok(obj) => obj,
                     Err(e) => return Err(e),
                 };
-                
+
                 // Force flush Python spans after function execution
                 Python::with_gil(|py| {
                     let flush_code = r#"
@@ -989,16 +1060,24 @@ try:
 except Exception:
     pass
 "#;
-                    let _ = py.run(std::ffi::CString::new(flush_code).unwrap().as_c_str(), None, None);
+                    let _ = py.run(
+                        std::ffi::CString::new(flush_code).unwrap().as_c_str(),
+                        None,
+                        None,
+                    );
                 });
-                
+
                 Ok(result)
-            }.instrument(sync_call_span).await?
+            }
+            .instrument(sync_call_span)
+            .await?
         };
-        
+
         // Deserialize Python result to Rust
         let rust_result = {
-            let deserialize_span = crate::tracing_utils::create_python_deserialize_span(std::any::type_name::<M::Ok>());
+            let deserialize_span = crate::tracing_utils::create_python_deserialize_span(
+                std::any::type_name::<M::Ok>(),
+            );
             async {
                 Python::with_gil(|py| {
                     let bound = result.bind(py);
@@ -1008,18 +1087,24 @@ except Exception:
                         }
                     })
                 })
-            }.instrument(deserialize_span).await
+            }
+            .instrument(deserialize_span)
+            .await
         };
-        
+
         match rust_result {
             Ok(reply) => {
-                tracing::debug!(event = "deserialize_success", ?reply, "Deserialized Python result to Rust");
+                tracing::debug!(
+                    event = "deserialize_success",
+                    ?reply,
+                    "Deserialized Python result to Rust"
+                );
                 Ok(reply)
-            },
+            }
             Err(e) => {
                 tracing::error!(event = "deserialize_error", error = %e, "Failed to deserialize Python result");
                 Err(e)
-            },
+            }
         }
     }
 }

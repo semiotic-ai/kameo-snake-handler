@@ -86,23 +86,42 @@ where
             if input.is_instance_of::<PyBool>() {
                 visitor.visit_bool(bool::extract_bound(input)?)
             } else if input.is_instance_of::<PyInt>() {
-                visitor.visit_i64(i64::extract_bound(input)?)
+                // Prefer signed when possible, then fall back to unsigned.
+                if let Ok(v) = i64::extract_bound(input) {
+                    visitor.visit_i64(v)
+                } else if let Ok(v) = u64::extract_bound(input) {
+                    visitor.visit_u64(v)
+                } else {
+                    Err(Error::Deserialization(
+                        "integer out of supported range for JSON".to_string(),
+                    ))
+                }
             } else if input.is_instance_of::<PyFloat>() {
                 visitor.visit_f64(f64::extract_bound(input)?)
             } else if input.is_instance_of::<PyString>() {
                 visitor.visit_string(String::extract_bound(input)?)
             } else if input.is_instance_of::<PyList>() {
                 let list = input.downcast::<PyList>()?;
-                visitor.visit_seq(SeqDeserializer { seq: list.clone(), idx: 0 })
+                visitor.visit_seq(SeqDeserializer {
+                    seq: list.clone(),
+                    idx: 0,
+                })
             } else if input.is_instance_of::<PyDict>() {
                 let dict = input.downcast::<PyDict>()?;
                 let mut keys = Vec::new();
                 for k in dict.keys().iter() {
                     keys.push(k.clone());
                 }
-                visitor.visit_map(MapDeserializer { map: dict.clone(), keys, current_idx: 0 })
+                visitor.visit_map(MapDeserializer {
+                    map: dict.clone(),
+                    keys,
+                    current_idx: 0,
+                })
             } else {
-                Err(Error::Deserialization(format!("unsupported Python type: {}", input.get_type().name()?)))
+                Err(Error::Deserialization(format!(
+                    "unsupported Python type: {}",
+                    input.get_type().name()?
+                )))
             }
         }
     }
