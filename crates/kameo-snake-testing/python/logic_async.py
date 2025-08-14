@@ -114,7 +114,10 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
                 return resp
             elif "CallbackRoundtrip" in message:
                 value = message["CallbackRoundtrip"]["value"]
-                await kameo.callback_handle({'value': value})
+                # Use the real callback system - this should work in integration tests
+                callback_iterator = await kameo.test.TestCallback({'value': value})
+                async for response in callback_iterator:
+                    logging.info(f"Received callback response: {response}")
                 return {'CallbackRoundtripResult': {'value': value + 1}}
             else:
                 raise LogicError(f"Unknown message type: {message}")

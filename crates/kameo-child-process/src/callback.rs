@@ -96,7 +96,10 @@ impl DynamicCallbackModule {
         let type_name = handler.type_name().to_string();
         let full_name = format!("{}.{}", module_name, type_name);
         
+        trace!(event = "register_handler_start", module_name, type_name, full_name, "Registering callback handler");
+        
         if self.handlers.contains_key(&full_name) {
+            trace!(event = "register_handler_conflict", full_name, "Handler already exists");
             return Err(format!("Handler for type '{}' already exists", full_name));
         }
         
@@ -112,8 +115,9 @@ impl DynamicCallbackModule {
         self.module_registry
             .entry(module_name.to_string())
             .or_insert_with(Vec::new)
-            .push(type_name);
+            .push(type_name.clone());
         
+        trace!(event = "register_handler_success", module_name, type_name, full_name, "Handler registered successfully");
         Ok(())
     }
     
@@ -124,9 +128,18 @@ impl DynamicCallbackModule {
         C: Send + Sync + Decode<()> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
+        trace!(event = "auto_register_handler_start", handler_type = std::any::type_name::<H>(), "Auto-registering handler");
+        
         // Extract module name from the handler's type
         let module_name = Self::extract_module_name::<H>();
-        self.register_handler(&module_name, handler)
+        trace!(event = "auto_register_handler_discovered", module_name, "Discovered module name from handler type");
+        
+        let result = self.register_handler(&module_name, handler);
+        match &result {
+            Ok(_) => trace!(event = "auto_register_handler_success", module_name, "Auto-registration successful"),
+            Err(e) => trace!(event = "auto_register_handler_failed", module_name, error = %e, "Auto-registration failed"),
+        }
+        result
     }
     
     /// Extract module name from a type using reflection
@@ -154,30 +167,40 @@ impl DynamicCallbackModule {
         correlation_id: u64,
         context: TracingContext,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError> {
+        trace!(event = "handle_callback_start", callback_path, correlation_id, data_size = callback_data.len(), "Handling callback request");
+        
         // Try exact match first
         if let Some(handler) = self.handlers.get(callback_path) {
+            trace!(event = "handle_callback_exact_match", callback_path, correlation_id, "Found exact handler match");
             return handler.handle_callback_typed(callback_data, correlation_id, context).await;
         }
+        
+        trace!(event = "handle_callback_no_exact_match", callback_path, correlation_id, "No exact match, trying type-based routing");
         
         // Try to find by type name in any module
         for (full_name, _) in &self.handlers {
             if full_name.ends_with(&format!(".{}", callback_path)) {
                 if let Some(handler) = self.handlers.get(full_name) {
+                    trace!(event = "handle_callback_type_match", callback_path, full_name, correlation_id, "Found handler by type name");
                     return handler.handle_callback_typed(callback_data, correlation_id, context).await;
                 }
             }
         }
+        
+        trace!(event = "handle_callback_no_type_match", callback_path, correlation_id, "No type match, trying module-based routing");
         
         // Try to find by module name
         if let Some(module_handlers) = self.module_registry.get(callback_path) {
             if module_handlers.len() == 1 {
                 let full_name = format!("{}.{}", callback_path, module_handlers[0]);
                 if let Some(handler) = self.handlers.get(&full_name) {
+                    trace!(event = "handle_callback_module_match", callback_path, full_name, correlation_id, "Found handler by module name");
                     return handler.handle_callback_typed(callback_data, correlation_id, context).await;
                 }
             }
         }
         
+        trace!(event = "handle_callback_not_found", callback_path, correlation_id, "No handler found for callback path");
         Err(PythonExecutionError::ExecutionError {
             message: format!("No handler found for callback path: {}", callback_path)
         })
@@ -300,22 +323,45 @@ where
     fn handle_callback_typed(
         &self,
         callback_data: &[u8],
-        _correlation_id: u64,
+        correlation_id: u64,
         _context: TracingContext,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>, PythonExecutionError>> + Send>> {
         let handler = self.handler.clone();
         let data = callback_data.to_vec();
+        let handler_type = self.handler.type_name();
         
         Box::pin(async move {
+            trace!(event = "handler_wrapper_start", handler_type, correlation_id, data_size = data.len(), "Starting handler wrapper execution");
+            
             // Deserialize the callback data to the specific type
-            let callback: C = bincode::decode_from_slice(&data, bincode::config::standard())
-                .map_err(|e| PythonExecutionError::ExecutionError {
-                    message: format!("Failed to deserialize callback: {}", e)
-                })?
-                .0;
+            let callback: C = match bincode::decode_from_slice(&data, bincode::config::standard()) {
+                Ok((callback, _)) => {
+                    trace!(event = "handler_wrapper_deserialize_success", handler_type, correlation_id, "Successfully deserialized callback data");
+                    callback
+                },
+                Err(e) => {
+                    trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, error = %e, "Failed to deserialize callback data");
+                    return Err(PythonExecutionError::ExecutionError {
+                        message: format!("Failed to deserialize callback: {}", e)
+                    });
+                }
+            };
+            
+            trace!(event = "handler_wrapper_call_start", handler_type, correlation_id, "Calling handler.handle_callback");
             
             // Handle the callback and get the response stream
-            let response_stream = handler.handle_callback(callback).await?;
+            let response_stream = match handler.handle_callback(callback).await {
+                Ok(stream) => {
+                    trace!(event = "handler_wrapper_call_success", handler_type, correlation_id, "Handler returned response stream");
+                    stream
+                },
+                Err(e) => {
+                    trace!(event = "handler_wrapper_call_failed", handler_type, correlation_id, error = %e, "Handler failed to process callback");
+                    return Err(e);
+                }
+            };
+            
+            trace!(event = "handler_wrapper_stream_convert_start", handler_type, correlation_id, "Converting response stream to serialized format");
             
             // Convert the response stream to a stream of serialized data
             let serialized_stream = response_stream.map(|result| {
@@ -327,6 +373,7 @@ where
                 })
             });
             
+            trace!(event = "handler_wrapper_complete", handler_type, correlation_id, "Handler wrapper execution completed successfully");
             Ok(Box::pin(serialized_stream) as Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>)
         })
     }
@@ -381,10 +428,13 @@ impl TypedCallbackReceiver {
         let mut tasks: Vec<JoinHandle<()>> = Vec::new();
         let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<TypedCallbackResponse>();
         
+        trace!(event = "callback_receiver_loop_start", "Starting main callback receiver loop");
+        
         loop {
             tokio::select! {
             // Check for cancellation
             _ = self.cancellation_token.cancelled() => {
+                trace!(event = "callback_receiver_cancellation", "Cancellation requested, shutting down callback receiver");
                 info!("Cancellation requested, shutting down callback receiver");
                         break;
             }
@@ -392,9 +442,15 @@ impl TypedCallbackReceiver {
             // Send responses back to Python
             response = response_rx.recv() => {
                 if let Some(response_envelope) = response {
-                    trace!("Sending response back to Python: {:?}", response_envelope);
+                    trace!(event = "callback_receiver_send_response", 
+                           callback_path = %response_envelope.callback_path,
+                           correlation_id = response_envelope.correlation_id,
+                           response_type = %response_envelope.response_type,
+                           is_final = response_envelope.is_final,
+                           response_size = response_envelope.response_data.len(),
+                           "Sending response back to Python");
                     if let Err(e) = self.writer.write_msg(&response_envelope).await {
-                        error!("Failed to send response: {}", e);
+                        error!(event = "callback_receiver_send_failed", error = %e, "Failed to send response");
                     }
                 }
             }
@@ -422,12 +478,20 @@ impl TypedCallbackReceiver {
                             };
                             
                             let task = tokio::spawn(async move {
+                                trace!(event = "callback_task_start", callback_path, correlation_id, "Starting callback handling task");
+                                
                                 match dispatcher.handle_callback(&callback_path, &callback_data, correlation_id, context).await {
                                     Ok(mut response_stream) => {
+                                        trace!(event = "callback_task_stream_start", callback_path, correlation_id, "Processing response stream");
+                                        
                                         // Process each response and wrap it in TypedCallbackResponse
+                                        let mut response_count = 0;
                                         while let Some(response_result) = response_stream.next().await {
                                             match response_result {
                                                 Ok(response_data) => {
+                                                    response_count += 1;
+                                                    trace!(event = "callback_task_response_item", callback_path, correlation_id, response_count, response_size = response_data.len(), "Processing response item");
+                                                    
                                                     // Create TypedCallbackResponse envelope with real type name
                                                     let response_envelope = TypedCallbackResponse {
                                                         callback_path: callback_path.clone(),
@@ -439,16 +503,19 @@ impl TypedCallbackReceiver {
                                                     
                                                     // Send response back through the channel
                                                     if let Err(e) = response_tx.send(response_envelope) {
-                                                        error!("Failed to send response through channel: {}", e);
+                                                        error!(event = "callback_task_channel_send_failed", callback_path, correlation_id, error = %e, "Failed to send response through channel");
+                                                    } else {
+                                                        trace!(event = "callback_task_response_sent", callback_path, correlation_id, response_count, "Response sent through channel");
                                                     }
-                                                    trace!("Sent response for callback {} through channel", callback_path);
                                                 }
                                                 Err(e) => {
-                                                    error!("Error in response stream: {}", e);
+                                                    error!(event = "callback_task_stream_error", callback_path, correlation_id, error = %e, "Error in response stream");
                                                     break;
                                                 }
                                             }
                                         }
+                                        
+                                        trace!(event = "callback_task_stream_complete", callback_path, correlation_id, response_count, "Response stream completed, sending termination");
                                         
                                         // Send final termination signal after stream ends
                                         let final_response = TypedCallbackResponse {
@@ -459,12 +526,14 @@ impl TypedCallbackReceiver {
                                             is_final: true, // This is the final response
                                         };
                                         if let Err(e) = response_tx.send(final_response) {
-                                            error!("Failed to send final response through channel: {}", e);
+                                            error!(event = "callback_task_final_send_failed", callback_path, correlation_id, error = %e, "Failed to send final response through channel");
+                                        } else {
+                                            trace!(event = "callback_task_termination_sent", callback_path, correlation_id, "Stream termination signal sent");
                                         }
-                                        trace!("Sent stream termination signal for callback {}", callback_path);
                                     }
                                     Err(e) => {
-                                        error!("Failed to handle callback {}: {}", callback_path, e);
+                                        error!(event = "callback_task_handler_failed", callback_path, correlation_id, error = %e, "Failed to handle callback");
+                                        
                                         // Send error response back to Python
                                         let error_response = TypedCallbackResponse {
                                             callback_path: callback_path.clone(),
@@ -474,10 +543,14 @@ impl TypedCallbackReceiver {
                                             is_final: true, // Error responses are also final
                                         };
                                         if let Err(e) = response_tx.send(error_response) {
-                                            error!("Failed to send error response through channel: {}", e);
+                                            error!(event = "callback_task_error_send_failed", callback_path, correlation_id, error = %e, "Failed to send error response through channel");
+                                        } else {
+                                            trace!(event = "callback_task_error_sent", callback_path, correlation_id, "Error response sent");
                                         }
                                     }
                                 }
+                                
+                                trace!(event = "callback_task_complete", callback_path, correlation_id, "Callback handling task completed");
                             });
                             
                             tasks.push(task);
@@ -500,19 +573,28 @@ impl TypedCallbackReceiver {
             if let Some(task_result) = tasks.iter().position(|task: &JoinHandle<()>| task.is_finished()) {
                 let task = tasks.swap_remove(task_result);
                 if let Err(e) = task.await {
-                    error!("Task failed: {}", e);
+                    error!(event = "callback_task_failed", error = %e, "Task failed during execution");
+                } else {
+                    trace!(event = "callback_task_completed", "Task completed successfully");
                 }
                 active_tasks = active_tasks.saturating_sub(1);
+                trace!(event = "callback_task_cleanup", active_tasks, "Task cleaned up, active tasks remaining");
             }
         }
         
         // Wait for remaining tasks to complete
-        for task in tasks {
+        trace!(event = "callback_receiver_shutdown_start", remaining_tasks = tasks.len(), "Starting shutdown, waiting for remaining tasks");
+        
+        for (i, task) in tasks.into_iter().enumerate() {
+            trace!(event = "callback_receiver_shutdown_task", task_index = i, "Waiting for task to complete during shutdown");
             if let Err(e) = task.await {
-                error!("Task failed during shutdown: {}", e);
+                error!(event = "callback_receiver_shutdown_task_failed", task_index = i, error = %e, "Task failed during shutdown");
+            } else {
+                trace!(event = "callback_receiver_shutdown_task_success", task_index = i, "Task completed successfully during shutdown");
             }
         }
         
+        trace!(event = "callback_receiver_shutdown_complete", "All tasks completed, shutdown finished");
         info!("Typed callback receiver shutdown complete");
         Ok(())
     }

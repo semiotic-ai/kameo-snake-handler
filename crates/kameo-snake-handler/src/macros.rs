@@ -335,8 +335,14 @@ macro_rules! setup_python_subprocess_system {
                             let config: kameo_snake_handler::PythonConfig = serde_json::from_str(&config_json).expect("Failed to parse KAMEO_PYTHON_CONFIG");
                             
                             // callback registry for creating Python modules
+                            tracing::info!("=== DYNAMIC MODULE CREATION START ===");
                             let callback_registry_json = std::env::var("KAMEO_CALLBACK_REGISTRY").expect("KAMEO_CALLBACK_REGISTRY must be set in child");
+                            tracing::info!("Raw callback registry JSON: {}", callback_registry_json);
                             let callback_registry: std::collections::HashMap<String, Vec<String>> = serde_json::from_str(&callback_registry_json).expect("Failed to parse KAMEO_CALLBACK_REGISTRY");
+                            tracing::info!("Parsed callback registry: {:?}", callback_registry);
+                            
+                            // Add more detailed logging for module creation
+                            tracing::info!("Creating dynamic Python modules from callback registry");
                             // sys.modules and kameo_mod
                             let sys = py.import("sys").expect("import sys");
                             let modules = sys.getattr("modules").expect("get sys.modules");
@@ -355,8 +361,9 @@ macro_rules! setup_python_subprocess_system {
                             tracing::debug!("Set callback_handle on kameo module");
                             
                             // Create dynamic module structure based on callback registry
+                            tracing::info!("Starting dynamic module creation for {} modules", callback_registry.len());
                             for (module_name, handler_types) in &callback_registry {
-                                tracing::debug!("Creating Python module: kameo.{}", module_name);
+                                tracing::info!("Creating Python module: kameo.{} with {} handler types", module_name, handler_types.len());
                                 
                                 // Create or get the submodule (e.g., kameo.test, kameo.basic, kameo.trader)
                                 let submodule = match kameo_mod.getattr(module_name) {
@@ -392,9 +399,11 @@ macro_rules! setup_python_subprocess_system {
                                     )?;
                                     
                                     submodule.setattr(handler_type, callback_fn)?;
-                                    tracing::debug!("Created callback function: kameo.{}.{}", module_name, handler_type);
+                                    tracing::info!("Created callback function: kameo.{}.{}", module_name, handler_type);
                                 }
+                                tracing::info!("Completed module: kameo.{}", module_name);
                             }
+                            tracing::info!("Dynamic module creation completed for all {} modules", callback_registry.len());
                             // sys.path
                             let sys_path = py.import("sys").expect("import sys").getattr("path").expect("get sys.path");
                             for path in &config.python_path {
@@ -419,6 +428,7 @@ macro_rules! setup_python_subprocess_system {
                             };
                             debug!(function = %config.function_name, "Located Python function");
                             let actor = kameo_snake_handler::PythonActor::<$msg, ()>::new(config, function);
+                            tracing::info!("=== ABOUT TO START CHILD PROCESS MAIN ===");
                             let async_block = async move {
                                 let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
                                     TelemetryExportConfig {

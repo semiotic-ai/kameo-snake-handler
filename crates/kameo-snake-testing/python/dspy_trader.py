@@ -54,9 +54,16 @@ async def order_item_tool(item: str, currency: int) -> str:
     import kameo
     print(f"[DEBUG] order_item TOOL called with item={item}, currency={currency}")
     
-    # Set callback attributes on the tool span
-    callback_result = await kameo.callback_handle({"value": currency})
-    print(f"[DEBUG] order_item TOOL got callback_result={callback_result}")
+    # Use the new typed callback system
+    callback_iterator = await kameo.trader.TraderCallback({"value": currency})
+    print(f"[DEBUG] order_item TOOL got callback_iterator={callback_iterator}")
+    
+    # Process the callback response
+    callback_result = None
+    async for response in callback_iterator:
+        print(f"[DEBUG] order_item TOOL callback response: {response}")
+        callback_result = response
+        break  # Just take the first response for now
     
     result = f"Order for {item} ({currency} units) complete: callback returned {callback_result}"
     return result

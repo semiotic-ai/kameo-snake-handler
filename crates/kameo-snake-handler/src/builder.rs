@@ -246,12 +246,15 @@ where
         })?;
         
         // Serialize the callback registry for creating Python modules
-        let callback_registry_json = serde_json::to_string(self.callback_module.get_registry()).map_err(|e| {
+        let callback_registry = self.callback_module.get_registry();
+        tracing::info!("Callback registry before serialization: {:?}", callback_registry);
+        let callback_registry_json = serde_json::to_string(&callback_registry).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to serialize callback registry: {e}"),
             )
         })?;
+        tracing::info!("Serialized callback registry JSON: {}", callback_registry_json);
         
         // Set up the Unix domain sockets
         let actor_name = std::any::type_name::<crate::PythonActor<M, ()>>();
@@ -292,7 +295,8 @@ where
         cmd.env("KAMEO_REQUEST_SOCKET", request_socket_path.to_string_lossy().as_ref());
         cmd.env("KAMEO_CALLBACK_SOCKET", callback_socket_path.to_string_lossy().as_ref());
         cmd.env("KAMEO_PYTHON_CONFIG", config_json);
-        cmd.env("KAMEO_CALLBACK_REGISTRY", callback_registry_json);
+        cmd.env("KAMEO_CALLBACK_REGISTRY", &callback_registry_json);
+        tracing::info!("Set KAMEO_CALLBACK_REGISTRY environment variable with {} bytes", callback_registry_json.len());
         if let Ok(rust_log) = std::env::var("RUST_LOG") {
             cmd.env("RUST_LOG", rust_log);
         }
