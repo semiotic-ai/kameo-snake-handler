@@ -5,7 +5,6 @@ use kameo::actor::Actor;
 use kameo::message::Message;
 use kameo_child_process::error::PythonExecutionError;
 use kameo_child_process::ChildProcessMessageHandler;
-use kameo_child_process::TracingContext;
 use kameo_child_process::{KameoChildProcessMessage, RuntimeAware};
 use opentelemetry::propagation::TextMapPropagator;
 use pyo3::prelude::*;
@@ -18,6 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::instrument;
 use tracing_futures::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Configuration for Python subprocess execution.
 ///
@@ -187,27 +187,6 @@ impl PythonMessageHandler {
             config: self.config.clone(),
         })
     }
-
-    /// Shared OTEL setup logic for Python function calls.
-    ///
-    /// This method handles the complex OTEL context setup that's shared between sync and async calls.
-    /// It extracts trace context, sets up Python OTEL context, and creates carrier dicts.
-    /// The caller is responsible for importing the run_with_otel_context function and making the call.
-    fn prepare_otel_context(tracing_context: Option<&TracingContext>) -> opentelemetry::Context {
-        // Get context to inject (from envelope if present, else current)
-        let context_to_inject = if let Some(tc) = tracing_context {
-            tc.extract_parent()
-        } else {
-            opentelemetry::Context::current()
-        };
-
-        // Setup Python OTEL context
-        if let Err(e) = crate::tracing_utils::setup_python_otel_context(&context_to_inject) {
-            tracing::error!("Failed to setup Python OTEL context: {:?}", e);
-        }
-
-        context_to_inject
-    }
 }
 
 impl Clone for PythonMessageHandler {
@@ -372,6 +351,11 @@ where
     let mut conn = request_conn;
     perform_handshake::<M>(&mut conn, false).await?;
     tracing::info!("running child actor loop");
+
+    // One-time Python OTEL SDK initialization to enable exporting Python spans
+    if let Err(e) = crate::tracing_utils::setup_python_otel_context(&opentelemetry::Context::new()) {
+        tracing::warn!(error = ?e, "Failed to initialize Python OpenTelemetry SDK");
+    }
     match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn, config).await {
         Ok(()) => {
             tracing::info!("Child process exited cleanly (no process::exit). Returning from child_process_main_with_python_actor.");
@@ -804,7 +788,7 @@ impl PythonMessageHandler {
     pub async fn handle_child_message_impl<M>(
         &self,
         message: M,
-        tracing_context: Option<kameo_child_process::TracingContext>,
+        _tracing_context: Option<kameo_child_process::TracingContext>,
     ) -> Result<M::Ok, PythonExecutionError>
     where
         M: KameoChildProcessMessage + Send + Sync + std::fmt::Debug + 'static,
@@ -843,8 +827,9 @@ impl PythonMessageHandler {
             async {
                 let fut_result = Python::with_gil(|py| {
                     if self.config.enable_otel_propagation {
-                        // Use the shared OTEL setup logic
-                        let context_to_inject = Self::prepare_otel_context(tracing_context.as_ref());
+                        // Inject the CURRENT Rust span context (python_async_call) so any Python spans
+                        // become children of this particular call.
+                        let context_to_inject = tracing::Span::current().context();
                         
                         // Extract trace context to carrier format
                         let mut carrier = std::collections::HashMap::new();
@@ -962,9 +947,9 @@ except Exception:
             async {
                 let result = Python::with_gil(|py| {
                     if self.config.enable_otel_propagation {
-                        // Use the shared OTEL setup logic
-                        let context_to_inject =
-                            Self::prepare_otel_context(tracing_context.as_ref());
+                        // Inject the CURRENT Rust span context (python_sync_call) so any Python spans
+                        // become children of this particular call.
+                        let context_to_inject = tracing::Span::current().context();
 
                         // Extract trace context to carrier format
                         let mut carrier = std::collections::HashMap::new();

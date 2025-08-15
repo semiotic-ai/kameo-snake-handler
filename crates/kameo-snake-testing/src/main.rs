@@ -141,6 +141,47 @@ pub struct TestCallbackMessage {
     pub value: u32,
 }
 
+// --- Complex streaming callback types ---
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct Dimensions {
+    pub width: u64,
+    pub height: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct EventItem {
+    pub kind: String,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+pub struct ComplexCallbackMessage {
+    pub value: u32,
+    pub labels: Vec<String>,
+    pub metadata: std::collections::BTreeMap<String, String>,
+    pub dimensions: Option<Dimensions>,
+    pub events: Vec<EventItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Encode, Decode)]
+pub enum ComplexStreamResponse {
+    Item {
+        index: u32,
+        computed_sum: u64,
+        tag: Option<String>,
+        meta_count: u32,
+        area: Option<u64>,
+        last_event: Option<String>,
+    },
+    Error {
+        index: u32,
+        message: String,
+    },
+    Complete {
+        total_items: u32,
+    },
+}
+
 #[derive(Clone)]
 pub struct TestCallbackHandler;
 
@@ -279,12 +320,12 @@ impl TypedCallbackHandler<BenchCallback> for CountingCallbackHandler {
 pub struct StreamingCallbackHandler;
 
 #[async_trait::async_trait]
-impl TypedCallbackHandler<TestCallbackMessage> for StreamingCallbackHandler {
-    type Response = TestResponse;
+impl TypedCallbackHandler<ComplexCallbackMessage> for StreamingCallbackHandler {
+    type Response = ComplexStreamResponse;
 
     async fn handle_callback(
         &self,
-        callback: TestCallbackMessage,
+        callback: ComplexCallbackMessage,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>,
         PythonExecutionError,
@@ -293,25 +334,46 @@ impl TypedCallbackHandler<TestCallbackMessage> for StreamingCallbackHandler {
         tracing::info!(
             event = "streaming_callback_start",
             value = callback.value,
-            "StreamingCallbackHandler starting stream"
+            labels_len = callback.labels.len() as u32,
+            meta_count = callback.metadata.len() as u32,
+            has_dimensions = callback.dimensions.is_some(),
+            events_len = callback.events.len() as u32,
+            "StreamingCallbackHandler starting complex stream"
         );
 
-        // Generate a stream of TestResponse objects based on the callback value
-        let count = callback.value.max(1).min(10); // Limit to reasonable range
+        let count = (callback.value as usize).max(1).min(10) as u32;
+        let labels = callback.labels.clone();
+        let meta_count = callback.metadata.len() as u32;
+        let area = callback
+            .dimensions
+            .as_ref()
+            .map(|d| d.width.saturating_mul(d.height));
+        let last_event = callback.events.last().map(|e| e.kind.clone());
+
         let stream = stream::iter(0..count).map(move |i| {
-            let response_value = callback.value + i + 1; // Generate meaningful response data
-            let response = TestResponse::CallbackRoundtripResult {
-                value: response_value,
+            let label = labels.get(i as usize % labels.len()).cloned();
+            let computed_sum = callback
+                .value as u64
+                + i as u64
+                + (label.as_ref().map(|s| s.len() as u64).unwrap_or(0));
+            let resp = ComplexStreamResponse::Item {
+                index: i,
+                computed_sum,
+                tag: label,
+                meta_count,
+                area,
+                last_event: last_event.clone(),
             };
             tracing::debug!(
                 event = "streaming_callback_item",
-                value = callback.value,
                 item_index = i,
                 total_items = count,
-                ?response,
-                "StreamingCallbackHandler sending stream item"
+                computed_sum,
+                meta_count,
+                area,
+                "StreamingCallbackHandler sending complex stream item"
             );
-            Ok(response)
+            Ok(resp)
         });
 
         Ok(Box::pin(stream))
@@ -340,7 +402,7 @@ async fn run_streaming_callback_test(
     };
 
     let mut pool = PythonChildProcessBuilder::<TestMessage>::new(config)
-        .with_callback_handler::<TestCallbackMessage, _>("test", StreamingCallbackHandler)
+        .with_callback_handler::<ComplexCallbackMessage, _>("test", StreamingCallbackHandler)
         .with_callback_handler::<TestCallbackMessage, _>("basic", TestCallbackHandler)
         .with_callback_handler::<TraderCallbackMessage, _>("trader", TestCallbackHandler)
         .spawn_pool(1, None)
@@ -601,7 +663,7 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         function_name: "handle_message_async".to_string(),
         env_vars: vec![],
         is_async: true,
-        enable_otel_propagation: false,
+        enable_otel_propagation: true,
     };
     let async_pool = PythonChildProcessBuilder::<TestMessage>::new(async_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)

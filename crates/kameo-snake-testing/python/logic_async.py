@@ -31,14 +31,14 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary containing response data
     """
     try:
-        # Create a span to test context propagation
+        # Always create a Python span to validate parent-child relations under python_async_call.
         import opentelemetry.trace as trace
         tracer = trace.get_tracer("kameo_snake_handler")
-        
+
         with tracer.start_as_current_span("handle_message") as span:
             span.set_attribute("message.type", str(type(message)))
             span.set_attribute("message.keys", str(list(message.keys())))
-            
+
             logging.info(f"Received message: {message}")
             # Accept both old and new keys for each operation
             if "CalculatePower" in message or "CalculateWaaaghPower" in message:

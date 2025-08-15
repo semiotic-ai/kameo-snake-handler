@@ -25,7 +25,18 @@ async def handle_message_async(message):
             
             # 1. Test streaming callback handler
             logger.info(f"📞 Calling kameo.test.StreamingCallback()")
-            streaming_data = {'value': value}
+            # Send a complex nested structure to validate typed decoding in Rust
+            streaming_data = {
+                'value': int(value),
+                'labels': ['alpha', 'beta', 'gamma'],
+                'metadata': {'foo': 'bar', 'id': str(value)},
+                'dimensions': {'width': 3, 'height': 5},
+                'events': [
+                    {'kind': 'start', 'weight': 1},
+                    {'kind': 'tick', 'weight': 2},
+                    {'kind': 'stop', 'weight': 1},
+                ],
+            }
             streaming_iterator = await kameo.test.StreamingCallback(streaming_data)
             
             logger.info(f"🌊 Processing streaming callback items")
@@ -58,12 +69,10 @@ async def handle_message_async(message):
             
             logger.info(f"✅ Dynamic callback test completed! Processed {stream_count} streaming, {basic_count} basic, {trader_count} trader items")
             
+            # Return only fields expected by Rust enum variant
             return {
                 'CallbackRoundtripResult': {
-                    'value': value + 1,
-                    'streaming_items': stream_count,
-                    'basic_items': basic_count,
-                    'trader_items': trader_count
+                    'value': value + 1
                 }
             }
         else:

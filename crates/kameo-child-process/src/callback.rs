@@ -91,7 +91,7 @@ impl DynamicCallbackModule {
     /// Register a handler in a specific module
     pub fn register_handler<C, H>(&mut self, module_name: &str, handler: H) -> Result<(), String>
     where
-        C: Send + Sync + Decode<()> + 'static,
+        C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         let type_name = handler.type_name().to_string();
@@ -142,7 +142,7 @@ impl DynamicCallbackModule {
     /// Uses the module path from the handler's type
     pub fn auto_register_handler<C, H>(&mut self, handler: H) -> Result<(), String>
     where
-        C: Send + Sync + Decode<()> + 'static,
+        C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         trace!(
@@ -433,7 +433,7 @@ pub trait CallbackHandlerTrait: Send + Sync {
 /// This handles the serialization/deserialization and async compatibility
 struct TypedCallbackHandlerWrapper<C, H>
 where
-    C: Send + Sync + Decode<()> + 'static,
+    C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
     H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
 {
     handler: H,
@@ -442,7 +442,7 @@ where
 
 impl<C, H> CallbackHandlerTrait for TypedCallbackHandlerWrapper<C, H>
 where
-    C: Send + Sync + Decode<()> + 'static,
+    C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
     H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
 {
     fn type_name(&self) -> &str {
@@ -485,40 +485,56 @@ where
             let callback: C = match bincode::decode_from_slice(&data, bincode::config::standard()) {
                 Ok((callback, _)) => {
                     trace!(
-                        event = "handler_wrapper_deserialize_success",
+                        event = "handler_wrapper_deserialize_success_bincode",
                         handler_type,
                         correlation_id,
-                        "Successfully deserialized callback data"
+                        "Successfully deserialized callback data with bincode"
                     );
                     callback
                 }
-                Err(e) => {
-                    trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, error = %e, "Failed to deserialize callback data");
+                Err(bincode_err) => {
+                    // Fallback: try JSON decoding to support Python dict inputs
+                    match serde_json::from_slice::<C>(&data) {
+                        Ok(callback) => {
+                            trace!(
+                                event = "handler_wrapper_deserialize_success_json",
+                                handler_type,
+                                correlation_id,
+                                "Successfully deserialized callback data with JSON"
+                            );
+                            callback
+                        }
+                        Err(json_err) => {
+                            trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, bincode_error = %bincode_err, json_error = %json_err, "Failed to deserialize callback data with both bincode and JSON");
 
-                    // Provide detailed debugging information for deserialization failures
-                    let data_hex = data
-                        .iter()
-                        .take(100)
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let data_preview = if data.len() > 100 {
-                        format!("{}... (truncated, total {} bytes)", data_hex, data.len())
-                    } else {
-                        format!("{} ({} bytes)", data_hex, data.len())
-                    };
+                            // Provide detailed debugging information for deserialization failures
+                            let data_hex = data
+                                .iter()
+                                .take(100)
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let data_preview = if data.len() > 100 {
+                                format!("{}... (truncated, total {} bytes)", data_hex, data.len())
+                            } else {
+                                format!("{} ({} bytes)", data_hex, data.len())
+                            };
 
-                    return Err(PythonExecutionError::ExecutionError {
-                        message: format!(
-                            "Failed to deserialize callback data for handler '{}' (correlation_id: {}): {}\n\
-                             Expected type: {}\n\
-                             Raw data (hex): {}\n\
-                             This usually indicates a type mismatch between Python and Rust or corrupted data.",
-                            handler_type, correlation_id, e,
-                            std::any::type_name::<C>(),
-                            data_preview
-                        )
-                    });
+                            return Err(PythonExecutionError::ExecutionError {
+                                message: format!(
+                                    "Failed to deserialize callback data for handler '{}' (correlation_id: {}):\n\
+                                     - bincode error: {}\n\
+                                     - json error: {}\n\
+                                     Expected type: {}\n\
+                                     Raw data (hex): {}\n\
+                                     This usually indicates a type mismatch between Python and Rust or corrupted data.",
+                                    handler_type, correlation_id, bincode_err, json_err,
+                                    std::any::type_name::<C>(),
+                                    data_preview
+                                )
+                            });
+                        }
+                    }
                 }
             };
 

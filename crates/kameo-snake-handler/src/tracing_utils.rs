@@ -12,7 +12,6 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-/// Python helper for running a function with an OTEL context attached.
 pub const PY_OTEL_RUNNER: &str = r#"
 import asyncio
 import inspect
@@ -23,181 +22,76 @@ def run_with_otel_context(carrier, user_func, *args, **kwargs):
     sys.stderr.flush()
     sys.stderr.write(f"[DEBUG] run_with_otel_context ENTRY: carrier={carrier}\n")
     sys.stderr.flush()
-    
+
     import opentelemetry.propagate, opentelemetry.context, opentelemetry.trace as trace
-    
+
     # Extract the context from the carrier
     sys.stderr.write(f"[DEBUG] Carrier contents: {carrier}\n")
     sys.stderr.flush()
     ctx = opentelemetry.propagate.extract(carrier)
     sys.stderr.write(f"[DEBUG] Extracted context: {ctx}\n")
     sys.stderr.flush()
-    
-    # Debug: Check what span is in the extracted context
-    try:
-        current_span_in_ctx = trace.get_current_span(ctx)
-        span_context_in_ctx = current_span_in_ctx.get_span_context()
-        sys.stderr.write(f"[DEBUG] Context contains span: {current_span_in_ctx} trace_id=0x{span_context_in_ctx.trace_id:032x} span_id=0x{span_context_in_ctx.span_id:016x} is_remote={span_context_in_ctx.is_remote}\n")
-        sys.stderr.flush()
-    except Exception as e:
-        sys.stderr.write(f"[DEBUG] Failed to get span from context: {e}\n")
-        sys.stderr.flush()
-    
-    # Check current span before attaching
+
+    # Debug current span before attach
     current_span_before = trace.get_current_span()
     span_context_before = current_span_before.get_span_context()
     sys.stderr.write(f"[DEBUG] Before attach: current_span={current_span_before} trace_id=0x{span_context_before.trace_id:032x} span_id=0x{span_context_before.span_id:016x} is_remote={span_context_before.is_remote}\n")
     sys.stderr.flush()
-    
-    # Explicitly detach any existing context to ensure clean state
+
+    # Ensure clean state then attach extracted context
     try:
         opentelemetry.context.detach(opentelemetry.context.attach({}))
         sys.stderr.write("[DEBUG] Detached any existing context\n")
         sys.stderr.flush()
-    except:
-        pass  # No existing context to detach
-    
-    # Force reset the current context to ensure we're using the extracted context
+    except Exception:
+        pass
+
     sys.stderr.write(f"[DEBUG] About to attach extracted context: {ctx}\n")
     sys.stderr.flush()
     token = opentelemetry.context.attach(ctx)
     sys.stderr.write(f"[DEBUG] Attached context with token: {token}\n")
     sys.stderr.flush()
-    
+
     try:
-        # Debug: Check context after attaching
+        # Verify attach
         current_span_after = trace.get_current_span()
         span_context_after = current_span_after.get_span_context()
         sys.stderr.write(f"[DEBUG] After attach: current_span={current_span_after} trace_id=0x{span_context_after.trace_id:032x} span_id=0x{span_context_after.span_id:016x} is_remote={span_context_after.is_remote}\n")
         sys.stderr.flush()
-        
-        # Create a span for the user function call
-        tracer = trace.get_tracer("kameo_snake_handler")
-        
-        # Call the user function and check if it's async
+
+        # Call the user function with context active
         result = user_func(*args, **kwargs)
-        
+
         if inspect.iscoroutine(result):
-            # For async functions, we need to wrap the coroutine in a span
-            # Create an async wrapper that re-attaches the context and creates a span when awaited
             async def async_wrapper():
-                # Re-attach the context inside the async wrapper to ensure it's available in async context
-                token = opentelemetry.context.attach(ctx)
+                # Re-attach inside async await path to keep context
+                inner_token = opentelemetry.context.attach(ctx)
                 try:
-                    # Debug: Check if context is properly attached in async context
-                    current_span_before_span = trace.get_current_span()
-                    span_context_before_span = current_span_before_span.get_span_context()
-                    sys.stderr.write(f"[DEBUG] Async wrapper before span: current_span={current_span_before_span} trace_id=0x{span_context_before_span.trace_id:032x} span_id=0x{span_context_before_span.span_id:016x} is_remote={span_context_before_span.is_remote}\n")
+                    current_span = trace.get_current_span()
+                    sc = current_span.get_span_context()
+                    sys.stderr.write(f"[DEBUG] Async wrapper with attached context: trace_id=0x{sc.trace_id:032x} span_id=0x{sc.span_id:016x} is_remote={sc.is_remote}\n")
                     sys.stderr.flush()
-                    
-                    # Create the handle_message span using the extracted context
-                    # This ensures it inherits from the Rust trace context
-                    with tracer.start_as_current_span("handle_message") as span:
-                        # Add message content as attributes to make each span unique
-                        try:
-                            span.set_attribute("message.content", str(args[0] if args else "no_args"))
-                            sys.stderr.write(f"[DEBUG] Set message.content attribute: {str(args[0] if args else 'no_args')}\n")
-                            sys.stderr.flush()
-                        except Exception as e:
-                            sys.stderr.write(f"[DEBUG] Failed to set message.content attribute: {e}\n")
-                            sys.stderr.flush()
-                        
-                        try:
-                            span.set_attribute("message.type", str(type(args[0] if args else None)))
-                            sys.stderr.write(f"[DEBUG] Set message.type attribute: {str(type(args[0] if args else None))}\n")
-                            sys.stderr.flush()
-                        except Exception as e:
-                            sys.stderr.write(f"[DEBUG] Failed to set message.type attribute: {e}\n")
-                            sys.stderr.flush()
-                        
-                        try:
-                            span.set_attribute("python.span", True)
-                            sys.stderr.write("[DEBUG] Set python.span attribute: True\n")
-                            sys.stderr.flush()
-                        except Exception as e:
-                            sys.stderr.write(f"[DEBUG] Failed to set python.span attribute: {e}\n")
-                            sys.stderr.flush()
-                        
-                        sys.stderr.write(f"[DEBUG] Created span for async user function: {span}\n")
-                        sys.stderr.flush()
-                        current_span = trace.get_current_span()
-                        span_context = current_span.get_span_context()
-                        sys.stderr.write(f"[DEBUG] IN run_with_otel_context (async wrapper): current_span={current_span} trace_id=0x{span_context.trace_id:032x} span_id=0x{span_context.span_id:016x} is_remote={span_context.is_remote}\n")
-                        sys.stderr.flush()
-                        
-                        # Debug: Check if span has parent
-                        span_context = span.get_span_context()
-                        sys.stderr.write(f"[DEBUG] Span context: trace_id=0x{span_context.trace_id:032x} span_id=0x{span_context.span_id:016x} is_remote={span_context.is_remote}\n")
-                        sys.stderr.flush()
-                        
-                        # Debug: Check if span is root or has parent
-                        if span_context.span_id == 0:
-                            sys.stderr.write("[DEBUG] Span appears to be root span (span_id=0)\n")
-                            sys.stderr.flush()
-                        else:
-                            sys.stderr.write(f"[DEBUG] Span has span_id: 0x{span_context.span_id:016x}\n")
-                            sys.stderr.flush()
-                        
-                        # Debug: Check if span has parent span
-                        try:
-                            # Check if span has parent by looking at its attributes
-                            span_attributes = span.get_attributes()
-                            sys.stderr.write(f"[DEBUG] Span attributes: {span_attributes}\n")
-                            sys.stderr.flush()
-                            
-                            # Check if span is a root span
-                            if span_context.is_remote:
-                                sys.stderr.write("[DEBUG] Span is marked as remote (has parent)\n")
-                                sys.stderr.flush()
-                            else:
-                                sys.stderr.write("[DEBUG] Span is marked as local (no parent)\n")
-                                sys.stderr.flush()
-                        except Exception as e:
-                            sys.stderr.write(f"[DEBUG] Failed to check span attributes: {e}\n")
-                            sys.stderr.flush()
-                    
-                    # Debug: Check if span is being exported
-                    try:
-                        provider = trace.get_tracer_provider()
-                        sys.stderr.write(f"[DEBUG] Tracer provider: {provider}\n")
-                        sys.stderr.flush()
-                        
-                        # Check if span has parent
-                        span_context = span.get_span_context()
-                        sys.stderr.write(f"[DEBUG] Span context: trace_id=0x{span_context.trace_id:032x} span_id=0x{span_context.span_id:016x} is_remote={span_context.is_remote}\n")
-                        sys.stderr.flush()
-                        
-                        if hasattr(provider, 'force_flush'):
-                            provider.force_flush()
-                            sys.stderr.write(f"[DEBUG] Forced flush of Python spans\n")
-                            sys.stderr.flush()
-                    except Exception as e:
-                        sys.stderr.write(f"[DEBUG] Force flush failed: {e}\n")
-                        sys.stderr.flush()
-                    
-                    return await result
+                    # Create a minimal Python span so language: python appears in traces
+                    tracer = trace.get_tracer("kameo_snake_handler")
+                    with tracer.start_as_current_span("python.handle_user_function"):
+                        return await result
                 finally:
-                    opentelemetry.context.detach(token)
-            
+                    opentelemetry.context.detach(inner_token)
+
             sys.stderr.write(f"[DEBUG] User function returned coroutine, returning wrapped coroutine\n")
             sys.stderr.flush()
             return async_wrapper()
         else:
-            # For sync functions, create a span and call the function
-            with tracer.start_as_current_span("handle_message") as span:
-                sys.stderr.write(f"[DEBUG] Created span for sync user function: {span}\n")
-                sys.stderr.flush()
-                current_span = trace.get_current_span()
-                span_context = current_span.get_span_context()
-                sys.stderr.write(f"[DEBUG] IN run_with_otel_context (after sync user_func): current_span={current_span} trace_id=0x{span_context.trace_id:032x} span_id=0x{span_context.span_id:016x} is_remote={span_context.is_remote}\n")
-                sys.stderr.flush()
+            # Sync: just return result under attached context
+            tracer = trace.get_tracer("kameo_snake_handler")
+            with tracer.start_as_current_span("python.handle_user_function"):
                 return result
     finally:
         opentelemetry.context.detach(token)
         sys.stderr.write(f"[DEBUG] Detached context with token: {token}\n")
         sys.stderr.flush()
-        
-        # Debug: Check current span after detachment
+
+        # Debug: current span after detachment
         current_span_after_detach = trace.get_current_span()
         span_context_after_detach = current_span_after_detach.get_span_context()
         sys.stderr.write(f"[DEBUG] After detachment: current_span={current_span_after_detach} trace_id=0x{span_context_after_detach.trace_id:032x} span_id=0x{span_context_after_detach.span_id:016x} is_remote={span_context_after_detach.is_remote}\n")

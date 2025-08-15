@@ -8,6 +8,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use opentelemetry_stdout::SpanExporter;
+use opentelemetry::KeyValue;
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::EnvFilter;
@@ -99,7 +100,7 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
     }
 
     let tracer_provider = provider_builder
-        .with_resource(Resource::builder().build())
+        .with_resource(resource_from_env_or_default("kameo-snake"))
         .build();
 
     tracing::warn!("setup_otel_layer_async CALLED!");
@@ -177,7 +178,7 @@ pub fn setup_otel_layer_with_config(
     }
 
     let tracer_provider = provider_builder
-        .with_resource(Resource::builder().build())
+        .with_resource(resource_from_env_or_default("kameo-snake"))
         .build();
 
     let tracer = tracer_provider.tracer("rust_trace_exporter");
@@ -223,7 +224,7 @@ fn setup_metrics() -> SdkMeterProvider {
             tracing::warn!(error = %e, "Failed to create OTLP metrics exporter, using basic provider");
             // Return a basic provider without reader if OTLP setup fails
             return opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-                .with_resource(Resource::builder().build())
+                .with_resource(resource_from_env_or_default("kameo-snake"))
                 .build();
         }
     };
@@ -236,7 +237,7 @@ fn setup_metrics() -> SdkMeterProvider {
     // Build the meter provider with the reader
     let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(reader)
-        .with_resource(Resource::builder().build())
+        .with_resource(resource_from_env_or_default("kameo-snake"))
         .build();
 
     // Set the global meter provider
@@ -257,4 +258,33 @@ fn setup_metrics() -> SdkMeterProvider {
     }
 
     provider
+}
+
+/// Build a Resource honoring OTEL_RESOURCE_ATTRIBUTES. If service.name is not provided,
+/// default_service will be applied.
+fn resource_from_env_or_default(default_service: &str) -> Resource {
+    if let Ok(env) = std::env::var("OTEL_RESOURCE_ATTRIBUTES") {
+        let mut attrs: Vec<KeyValue> = Vec::new();
+        let mut has_service = false;
+        for pair in env.split(',') {
+            let mut iter = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (iter.next(), iter.next()) {
+                let key = k.trim();
+                let val = v.trim();
+                if !key.is_empty() && !val.is_empty() {
+                    if key == "service.name" {
+                        has_service = true;
+                    }
+                    attrs.push(KeyValue::new(key.to_string(), val.to_string()));
+                }
+            }
+        }
+        if !has_service {
+            attrs.push(KeyValue::new("service.name", default_service.to_string()));
+        }
+        return Resource::builder().with_attributes(attrs).build();
+    }
+    Resource::builder()
+        .with_attribute(KeyValue::new("service.name", default_service.to_string()))
+        .build()
 }

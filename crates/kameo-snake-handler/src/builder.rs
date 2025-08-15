@@ -189,7 +189,7 @@ where
     /// ```
     pub fn with_callback_handler<C, H>(mut self, module_name: &str, handler: H) -> Self
     where
-        C: Send + Sync + bincode::Decode<()> + 'static,
+        C: Send + Sync + bincode::Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         if let Err(e) = self.callback_module.register_handler(module_name, handler) {
@@ -212,7 +212,7 @@ where
     /// ```
     pub fn auto_callback_handler<C, H>(mut self, handler: H) -> Self
     where
-        C: Send + Sync + bincode::Decode<()> + 'static,
+        C: Send + Sync + bincode::Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         if let Err(e) = self.callback_module.auto_register_handler(handler) {
