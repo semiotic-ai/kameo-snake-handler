@@ -1,6 +1,6 @@
 //! High-concurrency async tests for core IPC protocol logic (no real process spawning)
 
-use bincode::{Decode, Encode};
+// On-wire uses postcard; tests derive serde only
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Once;
@@ -21,7 +21,7 @@ fn init_tracing() {
 // Import core types from the crate
 use kameo_child_process::framing::{LengthPrefixedRead, LengthPrefixedWrite};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DummyMsg {
     id: u64,
 }
@@ -57,12 +57,12 @@ impl kameo_child_process::callback::TypedCallbackHandler<DummyMsg> for DummyHand
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DummyParentMsg {
     id: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct DummyParentOk {
     id: u64,
 }
@@ -106,6 +106,7 @@ async fn test_single_callback_message() {
             reader,
             writer,
             cancellation_token.clone(),
+            "actor_type",
         );
 
         let receiver_task = tokio::spawn(async move {
@@ -118,8 +119,7 @@ async fn test_single_callback_message() {
             let mut writer = LengthPrefixedWrite::new(write_half);
 
             // Create typed callback envelope
-            let callback_data =
-                bincode::encode_to_vec(&DummyMsg { id: 42 }, bincode::config::standard()).unwrap();
+            let callback_data = postcard::to_allocvec(&DummyMsg { id: 42 }).unwrap();
             let envelope = kameo_child_process::callback::TypedCallbackEnvelope {
                 callback_path: "test.DummyMsg".to_string(),
                 correlation_id: 1,
@@ -282,20 +282,20 @@ async fn test_high_volume_multiple_callback_types() {
     kameo_child_process::metrics::init_metrics();
 
     // Define multiple callback types for testing
-    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct DataFetchCallback {
         id: u64,
         fetch_type: String,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct ComputeCallback {
         id: u64,
         operation: String,
         value: f64,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct BatchCallback {
         id: u64,
         batch_size: usize,
@@ -471,6 +471,7 @@ async fn test_high_volume_multiple_callback_types() {
             reader,
             writer,
             cancellation_token.clone(),
+            "actor_type",
         );
 
         tracing::info!("Spawning receiver task");
@@ -507,7 +508,7 @@ async fn test_high_volume_multiple_callback_types() {
                         };
                         (
                             "data.DataFetchCallback",
-                            bincode::encode_to_vec(&callback, bincode::config::standard()).unwrap(),
+                            postcard::to_allocvec(&callback).unwrap(),
                         )
                     }
                     1 => {
@@ -519,7 +520,7 @@ async fn test_high_volume_multiple_callback_types() {
                         };
                         (
                             "compute.ComputeCallback",
-                            bincode::encode_to_vec(&callback, bincode::config::standard()).unwrap(),
+                            postcard::to_allocvec(&callback).unwrap(),
                         )
                     }
                     _ => {
@@ -529,7 +530,7 @@ async fn test_high_volume_multiple_callback_types() {
                         };
                         (
                             "batch.BatchCallback",
-                            bincode::encode_to_vec(&callback, bincode::config::standard()).unwrap(),
+                            postcard::to_allocvec(&callback).unwrap(),
                         )
                     }
                 };
@@ -648,9 +649,7 @@ async fn test_child_process_exits_on_parent_disconnect() {
     use tokio::time::timeout;
     init_tracing();
 
-    #[derive(
-        Debug, Clone, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode,
-    )]
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct DummyMsg;
     impl KameoChildProcessMessage for DummyMsg {
         type Ok = ();

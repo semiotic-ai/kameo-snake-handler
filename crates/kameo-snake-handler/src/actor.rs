@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
+// Wire format: serde + postcard
 use kameo::actor::Actor;
 use kameo::message::Message;
 use kameo_child_process::error::PythonExecutionError;
@@ -78,7 +78,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 /// - `opentelemetry-sdk`
 ///
 /// The system will validate these dependencies if `validate_otel_dependencies` is true.
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonConfig {
     /// List of Python executable paths to try (in order)
     pub python_path: Vec<String>,
@@ -164,7 +164,7 @@ impl Default for PythonConfig {
 /// ```
 pub struct PythonActor<M, E>
 where
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
+    E: std::fmt::Debug + Send + Sync + 'static,
 {
     /// Handler for Python function execution
     handler: PythonMessageHandler,
@@ -200,7 +200,7 @@ impl Clone for PythonMessageHandler {
 
 impl<M, E> PythonActor<M, E>
 where
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
+    E: std::fmt::Debug + Send + Sync + 'static,
 {
     pub fn new(config: PythonConfig, py_function: Py<PyAny>) -> Self {
         tracing::debug!(
@@ -223,7 +223,7 @@ where
 impl<M, E> Actor for PythonActor<M, E>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
+    E: std::fmt::Debug + Send + Sync + 'static,
 {
     type Error = PythonExecutionError;
     #[allow(refining_impl_trait)]
@@ -232,7 +232,7 @@ where
         _actor_ref: kameo::actor::ActorRef<Self>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(async move {
-            tracing::info!(status = "started", actor_type = "PythonActor");
+            tracing::info!(status = "started");
             Ok(())
         })
     }
@@ -243,7 +243,7 @@ where
         reason: kameo::error::ActorStopReason,
     ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
         Box::pin(async move {
-            tracing::error!(status = "stopped", actor_type = "PythonActor", ?reason);
+            tracing::error!(status = "stopped", ?reason);
             Ok(())
         })
     }
@@ -263,7 +263,7 @@ where
         >,
     > {
         Box::pin(async move {
-            tracing::error!(status = "panicked", actor_type = "PythonActor", ?err);
+            tracing::error!(status = "panicked", ?err);
             Ok(std::ops::ControlFlow::Continue(()))
         })
     }
@@ -273,10 +273,10 @@ where
 impl<M, E> Message<M> for PythonActor<M, E>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
+    E: std::fmt::Debug + Send + Sync + 'static,
 {
     type Reply = kameo::reply::DelegatedReply<Result<M::Ok, PythonExecutionError>>;
-    #[tracing::instrument(skip(self, ctx, message), fields(actor_type = "PythonActor", message_type = std::any::type_name::<M>()), parent = tracing::Span::current())]
+    #[tracing::instrument(skip(self, ctx, message), fields(message_type = std::any::type_name::<M>()), parent = tracing::Span::current())]
     #[allow(refining_impl_trait)]
     fn handle(
         &mut self,
@@ -320,7 +320,7 @@ where
 impl<M, E> RuntimeAware for PythonActor<M, E>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
+    E: std::fmt::Debug + Send + Sync + 'static,
 {
     async fn init_with_runtime(self) -> Result<Self, Self::Error>
     where
@@ -344,7 +344,7 @@ pub async fn child_process_main_with_python_actor<M, E>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     M: KameoChildProcessMessage + Send + Sync + 'static,
-    E: std::fmt::Debug + Send + Sync + 'static + bincode::Encode + bincode::Decode<()>,
+    E: std::fmt::Debug + Send + Sync + 'static,
 {
     use kameo_child_process::{perform_handshake, run_child_actor_loop};
     tracing::info!("child_process_main_with_python_actor: about to handshake");
@@ -353,7 +353,8 @@ where
     tracing::info!("running child actor loop");
 
     // One-time Python OTEL SDK initialization to enable exporting Python spans
-    if let Err(e) = crate::tracing_utils::setup_python_otel_context(&opentelemetry::Context::new()) {
+    if let Err(e) = crate::tracing_utils::setup_python_otel_context(&opentelemetry::Context::new())
+    {
         tracing::warn!(error = ?e, "Failed to initialize Python OpenTelemetry SDK");
     }
     match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn, config).await {
@@ -706,7 +707,7 @@ where
                         bound
                             .call_method0("__anext__")
                             .map(|coro| into_future(coro).unwrap())
-                            .map_err(|e| PythonExecutionError::from(e))
+                            .map_err(PythonExecutionError::from)
                     });
 
                     let next_fut = match next_fut {
@@ -732,7 +733,7 @@ where
 
                     let rust_item = match Python::with_gil(|py| {
                         let bound = item_result.bind(py);
-                        crate::serde_py::from_pyobject(&bound).map_err(|e| {
+                        crate::serde_py::from_pyobject(bound).map_err(|e| {
                             PythonExecutionError::DeserializationError {
                                 message: e.to_string(),
                             }
@@ -1066,7 +1067,7 @@ except Exception:
             async {
                 Python::with_gil(|py| {
                     let bound = result.bind(py);
-                    crate::serde_py::from_pyobject(&bound).map_err(|e| {
+                    crate::serde_py::from_pyobject(bound).map_err(|e| {
                         PythonExecutionError::DeserializationError {
                             message: e.to_string(),
                         }

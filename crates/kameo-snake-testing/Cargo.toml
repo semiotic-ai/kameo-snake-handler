@@ -21,7 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
-bincode = { workspace = true }
+postcard = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
 indoc = "2.0"

@@ -257,10 +257,7 @@ impl SerializeTuple for PythonSeqSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_element<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         SerializeSeq::serialize_element(self, value)
     }
 
@@ -286,10 +283,7 @@ impl SerializeTupleVariant for PythonSeqSerializer<'_> {
     type Ok = PyObject;
     type Error = Error;
 
-    fn serialize_field<T: ?Sized>(&mut self, value: &T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
         SerializeSeq::serialize_element(self, value)
     }
 

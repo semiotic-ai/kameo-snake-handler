@@ -1,4 +1,3 @@
-use bincode::{Decode, Encode};
 #[cfg(feature = "python")]
 use pyo3::exceptions::{
     PyAttributeError, PyImportError, PyModuleNotFoundError, PyRuntimeError, PyTypeError,
@@ -15,10 +14,8 @@ use tracing::error;
 pub enum SubprocessIpcBackendError {
     #[error("IPC error: {0}")]
     Ipc(#[from] io::Error),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::error::EncodeError),
-    #[error("Deserialization error: {0}")]
-    Deserialization(#[from] bincode::error::DecodeError),
+    #[error("Postcard error: {0}")]
+    Postcard(#[from] postcard::Error),
     #[error("Actor panicked: {reason}")]
     Panicked { reason: String },
     #[error("Protocol error: {0}")]
@@ -33,7 +30,7 @@ pub enum SubprocessIpcBackendError {
     Shutdown,
 }
 
-#[derive(Debug, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum SubprocessIpcBackendIpcError {
     Protocol(String),
     HandshakeFailed(String),
@@ -51,11 +48,8 @@ impl From<SubprocessIpcBackendError> for SubprocessIpcBackendIpcError {
                 Self::UnknownActorType { actor_name }
             }
             SubprocessIpcBackendError::Ipc(err) => Self::Protocol(format!("IPC error: {err}")),
-            SubprocessIpcBackendError::Serialization(err) => {
-                Self::Protocol(format!("Serialization error: {err}"))
-            }
-            SubprocessIpcBackendError::Deserialization(err) => {
-                Self::Protocol(format!("Deserialization error: {err}"))
+            SubprocessIpcBackendError::Postcard(err) => {
+                Self::Protocol(format!("Postcard error: {err}"))
             }
             SubprocessIpcBackendError::Shutdown => Self::Protocol("Shutdown".to_string()),
             SubprocessIpcBackendError::Panicked { reason } => {
@@ -77,7 +71,7 @@ pub fn handle_unknown_actor_error(actor_name: &str) -> SubprocessIpcBackendError
     }
 }
 
-#[derive(Debug, thiserror::Error, Serialize, Deserialize, Encode, Decode, Clone)]
+#[derive(Debug, thiserror::Error, Serialize, Deserialize, Clone)]
 pub enum PythonExecutionError {
     #[error("Python module '{module}' not found: {message}")]
     ModuleNotFound { module: String, message: String },

@@ -130,16 +130,15 @@ sequenceDiagram
 ```rust
 use kameo_child_process::callback::{DynamicCallbackModule, TypedCallbackHandler};
 use serde::{Serialize, Deserialize};
-use bincode::{Encode, Decode};
 
 // Define your callback types
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct DataFetchRequest {
     symbol: String,
     start_date: String,
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct DataFetchResponse {
     data: Vec<f64>,
     timestamp: String,
@@ -211,7 +210,7 @@ Handlers can return:
 
 ## Python-Rust Serialization Guide
 
-The Kameo system uses a dual-serialization approach: **bincode** for Rust-to-Rust communication and **Python dict serialization** for Python-to-Rust data exchange (via PyO3's serde integration). `serde_json::Value` can be used on the Rust side for convenience when handling dynamic Python data. This section covers how to design compatible structures and handle common serialization patterns.
+The Kameo system uses **postcard** as the on-wire format for Rust-to-Rust communication (via serde), and Python dict-based serialization for Python-to-Rust data exchange (via PyO3's serde integration). `serde_json::Value` can be used on the Rust side for convenience when handling dynamic Python data. This section covers how to design compatible structures and handle common serialization patterns.
 
 ---
 
@@ -220,7 +219,7 @@ The Kameo system uses a dual-serialization approach: **bincode** for Rust-to-Rus
 #### Primitive Types
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct BasicTypes {
     integer: i32,           // Python: int
     float: f64,             // Python: float  
@@ -244,7 +243,7 @@ struct BasicTypes {
 #### Collections
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct Collections {
     vector: Vec<String>,                    // Python: List[str]
     hashmap: HashMap<String, i32>,         // Python: Dict[str, int]
@@ -272,7 +271,7 @@ struct Collections {
 #### Simple Enums
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 enum SimpleEnum {
     Variant1,
     Variant2,
@@ -288,7 +287,7 @@ enum SimpleEnum {
 #### Enums with Data
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 enum DataEnum {
     Unit,                           // Python: "Unit"
     Tuple(String, i32),            // Python: ["Tuple", "hello", 42]
@@ -309,7 +308,7 @@ enum DataEnum {
 #### Complex Nested Enums
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 enum ComplexEnum {
     Success {
         data: Vec<DataItem>,
@@ -326,7 +325,7 @@ enum ComplexEnum {
     },
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct DataItem {
     id: u64,
     value: String,
@@ -373,7 +372,7 @@ struct DataItem {
 #### Optional Fields
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct OptionalFields {
     required: String,
     optional_string: Option<String>,      // Python: str or None
@@ -403,11 +402,11 @@ struct OptionalFields {
 #### Newtype Wrappers
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct UserId(u64);                    // Python: int
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct Email(String);                   // Python: str
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct Timestamp(chrono::DateTime<Utc>); // Python: str (ISO format)
 ```
 
@@ -423,7 +422,7 @@ struct Timestamp(chrono::DateTime<Utc>); // Python: str (ISO format)
 #### Generic Types
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct GenericContainer<T> {
     data: T,
     metadata: HashMap<String, String>,
@@ -457,7 +456,7 @@ For maximum flexibility when the exact structure is unknown or variable:
 #### Using serde_json::Value for Dynamic Python Data
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 struct FlexibleMessage {
     command: String,
     payload: serde_json::Value,  // Accepts any Python dict structure
@@ -504,7 +503,7 @@ async fn handle_flexible_message(msg: FlexibleMessage) -> Result<(), Error> {
 #### Request-Response Messages
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub enum ParentMessage {
     DataRequest {
         query: String,
@@ -521,7 +520,7 @@ pub enum ParentMessage {
     },
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub enum ChildResponse {
     DataResult {
         items: Vec<DataItem>,
@@ -563,8 +562,6 @@ pub enum ChildResponse {
 }
 ```
 
-
-
 ---
 
 ### 6. Callback System Patterns
@@ -572,7 +569,7 @@ pub enum ChildResponse {
 #### Typed Callback Requests
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub struct ComplexCallbackRequest {
     pub operation: String,
     pub parameters: HashMap<String, serde_json::Value>,
@@ -580,7 +577,7 @@ pub struct ComplexCallbackRequest {
     pub options: Option<CallbackOptions>,
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub struct CallbackMetadata {
     pub correlation_id: String,
     pub timestamp: String,
@@ -613,7 +610,7 @@ await kameo.trading.DataFetch({
 #### Callback Response Streams
 ```rust
 // Rust
-#[derive(Serialize, Deserialize, Encode, Decode)]
+#[derive(Serialize, Deserialize)]
 pub enum CallbackResponse {
     DataChunk {
         chunk_id: u64,
@@ -781,10 +778,9 @@ def test_rust_compatibility():
 ### 9. Performance Considerations
 
 #### Serialization Overhead
-- **bincode**: Fast, compact, Rust-native
+- **postcard**: Compact, serde-native, stable on-wire format for Rust-to-Rust
 - **Python dict serialization**: Via PyO3 serde integration, optimized for Python data structures
 - **serde_json::Value**: Convenience wrapper for dynamic Python data on Rust side
-- **Hybrid approach**: Use bincode for Rust-to-Rust, Python dict serialization for Python interface
 
 #### Memory Usage
 - **Large collections**: Consider streaming for big datasets
@@ -797,4 +793,4 @@ def test_rust_compatibility():
 
 ---
 
-This serialization guide covers how to design compatible structures for Python-Rust communication. Test both directions of serialization to catch compatibility issues early.
+This serialization guide covers how to design compatible structures for Python-Rust communication using serde + postcard. Test both directions of serialization to catch compatibility issues early.

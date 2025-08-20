@@ -33,8 +33,6 @@ where
     M: kameo_child_process::KameoChildProcessMessage + Send + Sync + 'static,
     <M as kameo_child_process::KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
-        + bincode::Encode
-        + bincode::Decode<()>
         + std::fmt::Debug
         + Send
         + Sync
@@ -53,8 +51,6 @@ where
     M: kameo_child_process::KameoChildProcessMessage + Send + Sync + 'static,
     <M as kameo_child_process::KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
-        + bincode::Encode
-        + bincode::Decode<()>
         + std::fmt::Debug
         + Send
         + Sync
@@ -71,7 +67,7 @@ where
 
     pub fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            let _ = child.start_kill();
         }
     }
 }
@@ -125,8 +121,6 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     <M as KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
-        + bincode::Encode
-        + bincode::Decode<()>
         + std::fmt::Debug
         + Send
         + Sync
@@ -147,8 +141,6 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
     <M as KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
-        + bincode::Encode
-        + bincode::Decode<()>
         + std::fmt::Debug
         + Send
         + Sync
@@ -189,7 +181,7 @@ where
     /// ```
     pub fn with_callback_handler<C, H>(mut self, module_name: &str, handler: H) -> Self
     where
-        C: Send + Sync + bincode::Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
+        C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         if let Err(e) = self.callback_module.register_handler(module_name, handler) {
@@ -212,7 +204,7 @@ where
     /// ```
     pub fn auto_callback_handler<C, H>(mut self, handler: H) -> Self
     where
-        C: Send + Sync + bincode::Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
+        C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         if let Err(e) = self.callback_module.auto_register_handler(handler) {
@@ -263,6 +255,7 @@ where
 
         // Set up the Unix domain sockets
         let actor_name = std::any::type_name::<crate::PythonActor<M, ()>>();
+        // Metrics are labeled per-actor at emission time; no global configuration needed
         let request_socket_path =
             kameo_child_process::handshake::unique_socket_path(&format!("{}-req", actor_name));
         let callback_socket_path =
@@ -356,8 +349,13 @@ where
 
         // Create a cancellation token for the callback receiver
         let cancellation_token = CancellationToken::new();
-        let receiver =
-            TypedCallbackReceiver::new(callback_module, reader, writer, cancellation_token.clone());
+        let receiver = TypedCallbackReceiver::new(
+            callback_module,
+            reader,
+            writer,
+            cancellation_token.clone(),
+            std::any::type_name::<crate::PythonActor<M, ()>>(),
+        );
 
         let mut actors = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {

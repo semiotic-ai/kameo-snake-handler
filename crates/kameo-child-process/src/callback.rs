@@ -1,7 +1,6 @@
 use crate::error::PythonExecutionError;
 use crate::framing::{LengthPrefixedRead, LengthPrefixedWrite};
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,7 +11,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, trace};
 
 /// Simple tracing context for now - we can enhance this later
-#[derive(Clone, Debug, Serialize, Deserialize, Encode, Decode)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TracingContext {
     pub trace_id: String,
     pub span_id: String,
@@ -91,7 +90,7 @@ impl DynamicCallbackModule {
     /// Register a handler in a specific module
     pub fn register_handler<C, H>(&mut self, module_name: &str, handler: H) -> Result<(), String>
     where
-        C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
+        C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         let type_name = handler.type_name().to_string();
@@ -125,7 +124,7 @@ impl DynamicCallbackModule {
         // Register in module registry
         self.module_registry
             .entry(module_name.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(type_name.clone());
 
         trace!(
@@ -142,7 +141,7 @@ impl DynamicCallbackModule {
     /// Uses the module path from the handler's type
     pub fn auto_register_handler<C, H>(&mut self, handler: H) -> Result<(), String>
     where
-        C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
+        C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
         trace!(
@@ -230,7 +229,7 @@ impl DynamicCallbackModule {
         );
 
         // Try to find by type name in any module
-        for (full_name, _) in &self.handlers {
+        for full_name in self.handlers.keys() {
             if full_name.ends_with(&format!(".{}", callback_path)) {
                 if let Some(handler) = self.handlers.get(full_name) {
                     trace!(
@@ -285,7 +284,7 @@ impl DynamicCallbackModule {
         let available_modules = self.available_modules();
 
         // Show what routing attempts were made
-        let routing_attempts = vec![
+        let routing_attempts = [
             format!("1. Exact match: '{}'", callback_path),
             format!("2. Type-based routing: '{}' (in any module)", callback_path),
             format!(
@@ -331,7 +330,7 @@ impl DynamicCallbackModule {
         }
 
         // Try to find by type name in any module
-        for (full_name, _) in &self.handlers {
+        for full_name in self.handlers.keys() {
             if full_name.ends_with(&format!(".{}", callback_path)) {
                 if let Some(handler) = self.handlers.get(full_name) {
                     return Some(handler.as_ref());
@@ -388,9 +387,9 @@ impl Default for DynamicCallbackModule {
 #[async_trait]
 pub trait TypedCallbackHandler<C>: Send + Sync + 'static
 where
-    C: Send + Sync + Decode<()> + 'static,
+    C: Send + Sync + 'static,
 {
-    type Response: Encode + Send + Debug + 'static;
+    type Response: Serialize + for<'de> Deserialize<'de> + Send + Debug + 'static;
 
     /// Handle a callback of the specific type
     async fn handle_callback(
@@ -433,7 +432,7 @@ pub trait CallbackHandlerTrait: Send + Sync {
 /// This handles the serialization/deserialization and async compatibility
 struct TypedCallbackHandlerWrapper<C, H>
 where
-    C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
+    C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
     H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
 {
     handler: H,
@@ -442,7 +441,7 @@ where
 
 impl<C, H> CallbackHandlerTrait for TypedCallbackHandlerWrapper<C, H>
 where
-    C: Send + Sync + Decode<()> + for<'de> serde::Deserialize<'de> + 'static,
+    C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
     H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
 {
     fn type_name(&self) -> &str {
@@ -482,17 +481,17 @@ where
             );
 
             // Deserialize the callback data to the specific type
-            let callback: C = match bincode::decode_from_slice(&data, bincode::config::standard()) {
-                Ok((callback, _)) => {
+            let callback: C = match postcard::from_bytes::<C>(&data) {
+                Ok(callback) => {
                     trace!(
-                        event = "handler_wrapper_deserialize_success_bincode",
+                        event = "handler_wrapper_deserialize_success_postcard",
                         handler_type,
                         correlation_id,
-                        "Successfully deserialized callback data with bincode"
+                        "Successfully deserialized callback data with postcard"
                     );
                     callback
                 }
-                Err(bincode_err) => {
+                Err(postcard_err) => {
                     // Fallback: try JSON decoding to support Python dict inputs
                     match serde_json::from_slice::<C>(&data) {
                         Ok(callback) => {
@@ -505,7 +504,7 @@ where
                             callback
                         }
                         Err(json_err) => {
-                            trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, bincode_error = %bincode_err, json_error = %json_err, "Failed to deserialize callback data with both bincode and JSON");
+                            trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, postcard_error = %postcard_err, json_error = %json_err, "Failed to deserialize callback data with both postcard and JSON");
 
                             // Provide detailed debugging information for deserialization failures
                             let data_hex = data
@@ -523,12 +522,12 @@ where
                             return Err(PythonExecutionError::ExecutionError {
                                 message: format!(
                                     "Failed to deserialize callback data for handler '{}' (correlation_id: {}):\n\
-                                     - bincode error: {}\n\
+                                     - postcard error: {}\n\
                                      - json error: {}\n\
                                      Expected type: {}\n\
                                      Raw data (hex): {}\n\
                                      This usually indicates a type mismatch between Python and Rust or corrupted data.",
-                                    handler_type, correlation_id, bincode_err, json_err,
+                                    handler_type, correlation_id, postcard_err, json_err,
                                     std::any::type_name::<C>(),
                                     data_preview
                                 )
@@ -573,7 +572,7 @@ where
             let handler_type_clone = handler_type.to_string();
             let serialized_stream = response_stream.map(move |result| {
                 result.and_then(|response| {
-                    bincode::encode_to_vec(&response, bincode::config::standard())
+                    postcard::to_allocvec(&response)
                         .map_err(|e| PythonExecutionError::ExecutionError {
                             message: format!(
                                 "Failed to serialize response for handler '{}' (correlation_id: {}): {}\n\
@@ -603,7 +602,7 @@ where
 }
 
 /// Callback envelope for typed callbacks
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct TypedCallbackEnvelope {
     pub callback_path: String, // e.g., "DataFetch", "TraderCallback", etc.
     pub correlation_id: u64,
@@ -612,7 +611,7 @@ pub struct TypedCallbackEnvelope {
 }
 
 /// Callback response envelope that includes type information
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct TypedCallbackResponse {
     pub callback_path: String,  // e.g., "trading.DataFetch"
     pub response_type: String,  // e.g., "DataFetchResponse"
@@ -627,6 +626,7 @@ pub struct TypedCallbackReceiver {
     reader: LengthPrefixedRead<tokio::net::unix::OwnedReadHalf>,
     writer: LengthPrefixedWrite<tokio::net::unix::OwnedWriteHalf>,
     cancellation_token: tokio_util::sync::CancellationToken,
+    actor_type: &'static str,
 }
 
 impl TypedCallbackReceiver {
@@ -635,16 +635,19 @@ impl TypedCallbackReceiver {
         reader: LengthPrefixedRead<tokio::net::unix::OwnedReadHalf>,
         writer: LengthPrefixedWrite<tokio::net::unix::OwnedWriteHalf>,
         cancellation_token: tokio_util::sync::CancellationToken,
+        actor_type: &'static str,
     ) -> Self {
         Self {
             dispatcher,
             reader,
             writer,
             cancellation_token,
+            actor_type,
         }
     }
 
     pub async fn run(mut self) -> Result<(), PythonExecutionError> {
+        crate::metrics::init_metrics();
         tracing::info!(
             event = "callback_receiver_start",
             "Starting typed callback receiver"
@@ -681,6 +684,7 @@ impl TypedCallbackReceiver {
                            "Sending response back to Python");
                     if let Err(e) = self.writer.write_msg(&response_envelope).await {
                         error!(event = "callback_receiver_send_failed", error = %e, "Failed to send response");
+                        crate::metrics::MetricsHandle::callback(self.actor_type).track_error("send_response_failed");
                     }
                 }
             }
@@ -699,6 +703,7 @@ impl TypedCallbackReceiver {
                             let callback_data = envelope.callback_data.clone();
                             let correlation_id = envelope.correlation_id;
                             let context = envelope.context;
+                            let actor_type = self.actor_type;
 
                             // Get the response type name before spawning the task
                             let response_type_name = if let Some(handler) = dispatcher.get_handler(&callback_path) {
@@ -709,6 +714,7 @@ impl TypedCallbackReceiver {
 
                             let task = tokio::spawn(async move {
                                 trace!(event = "callback_task_start", callback_path, correlation_id, "Starting callback handling task");
+                                let _tracker = crate::metrics::OperationTracker::track_callback(actor_type);
 
                                 match dispatcher.handle_callback(&callback_path, &callback_data, correlation_id, context).await {
                                     Ok(mut response_stream) => {
@@ -734,12 +740,14 @@ impl TypedCallbackReceiver {
                                                     // Send response back through the channel
                                                     if let Err(e) = response_tx.send(response_envelope) {
                                                         error!(event = "callback_task_channel_send_failed", callback_path, correlation_id, error = %e, "Failed to send response through channel");
+                                                        crate::metrics::MetricsHandle::callback(actor_type).track_error("channel_send_failed");
                                                     } else {
                                                         trace!(event = "callback_task_response_sent", callback_path, correlation_id, response_count, "Response sent through channel");
                                                     }
                                                 }
                                                 Err(e) => {
                                                     error!(event = "callback_task_stream_error", callback_path, correlation_id, error = %e, "Error in response stream");
+                                                    crate::metrics::MetricsHandle::callback(actor_type).track_error("stream_error");
                                                     break;
                                                 }
                                             }
@@ -757,23 +765,26 @@ impl TypedCallbackReceiver {
                                         };
                                         if let Err(e) = response_tx.send(final_response) {
                                             error!(event = "callback_task_final_send_failed", callback_path, correlation_id, error = %e, "Failed to send final response through channel");
+                                            crate::metrics::MetricsHandle::callback(actor_type).track_error("channel_send_final_failed");
                                         } else {
                                             trace!(event = "callback_task_termination_sent", callback_path, correlation_id, "Stream termination signal sent");
                                         }
                                     }
                                     Err(e) => {
                                         error!(event = "callback_task_handler_failed", callback_path, correlation_id, error = %e, "Failed to handle callback");
+                                        crate::metrics::MetricsHandle::callback(actor_type).track_error("handler_failed");
 
                                         // Send error response back to Python
                                         let error_response = TypedCallbackResponse {
                                             callback_path: callback_path.clone(),
                                             response_type: "ErrorResponse".to_string(),
-                                            response_data: bincode::encode_to_vec(&e, bincode::config::standard()).unwrap_or_default(),
+                                            response_data: postcard::to_allocvec(&e).unwrap_or_default(),
                                             correlation_id,
                                             is_final: true, // Error responses are also final
                                         };
                                         if let Err(e) = response_tx.send(error_response) {
                                             error!(event = "callback_task_error_send_failed", callback_path, correlation_id, error = %e, "Failed to send error response through channel");
+                                            crate::metrics::MetricsHandle::callback(actor_type).track_error("channel_send_error_failed");
                                         } else {
                                             trace!(event = "callback_task_error_sent", callback_path, correlation_id, "Error response sent");
                                         }
@@ -792,6 +803,7 @@ impl TypedCallbackReceiver {
                                 break;
                                 } else {
                                 error!("Error reading callback message: {}", e);
+                                crate::metrics::MetricsHandle::callback(self.actor_type).track_error("read_error");
                                 break;
                             }
                         }
@@ -855,194 +867,5 @@ impl TypedCallbackReceiver {
             "Typed callback receiver shutdown complete"
         );
         Ok(())
-    }
-}
-
-/// Macro to create a module with automatic handler registration
-/// Usage: callback_module! { module_name => { handler1, handler2 } }
-#[macro_export]
-macro_rules! callback_module {
-    ($module:ident => { $($handler:ident),* }) => {
-        pub mod $module {
-            use super::*;
-
-            pub fn register_handlers(dispatcher: &mut DynamicCallbackModule) -> Result<(), String> {
-                $(
-                    dispatcher.register_handler(stringify!($module), $handler)?;
-                )*
-                Ok(())
-            }
-
-            #[allow(dead_code)]
-            pub fn available_handlers() -> Vec<&'static str> {
-                vec![$(
-                    stringify!($handler)
-                ),*]
-            }
-        }
-    };
-}
-
-/// Example usage of the new system
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use futures::stream;
-
-    // Example callback types
-    #[derive(Clone, Debug, Encode, Decode)]
-    struct DataFetchRequest {
-        pub symbol: String,
-        pub start_date: String,
-        pub end_date: String,
-    }
-
-    #[derive(Clone, Debug, Encode, Decode)]
-    struct DataFetchResponse {
-        pub data: Vec<f64>,
-        pub timestamps: Vec<String>,
-    }
-
-    #[derive(Clone, Debug, Encode, Decode)]
-    struct TraderCallback {
-        pub action: String,
-        pub quantity: f64,
-    }
-
-    #[derive(Clone, Debug, Encode, Decode)]
-    struct TraderResponse {
-        pub success: bool,
-        pub message: String,
-    }
-
-    // Example handlers
-    #[derive(Clone)]
-    struct DataFetchHandler;
-
-    #[async_trait]
-    impl TypedCallbackHandler<DataFetchRequest> for DataFetchHandler {
-        type Response = DataFetchResponse;
-
-        async fn handle_callback(
-            &self,
-            _callback: DataFetchRequest,
-        ) -> Result<
-            Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>,
-            PythonExecutionError,
-        > {
-            let response = DataFetchResponse {
-                data: vec![100.0, 101.0, 102.0],
-                timestamps: vec![
-                    "2024-01-01".to_string(),
-                    "2024-01-02".to_string(),
-                    "2024-01-03".to_string(),
-                ],
-            };
-
-            let stream = stream::once(async move { Ok(response) });
-            Ok(Box::pin(stream))
-        }
-
-        fn type_name(&self) -> &'static str {
-            "DataFetch"
-        }
-    }
-
-    #[derive(Clone)]
-    struct TraderHandler;
-
-    #[async_trait]
-    impl TypedCallbackHandler<TraderCallback> for TraderHandler {
-        type Response = TraderResponse;
-
-        async fn handle_callback(
-            &self,
-            callback: TraderCallback,
-        ) -> Result<
-            Pin<Box<dyn Stream<Item = Result<Self::Response, PythonExecutionError>> + Send>>,
-            PythonExecutionError,
-        > {
-            let response = TraderResponse {
-                success: true,
-                message: format!("Executed {} of {}", callback.action, callback.quantity),
-            };
-
-            let stream = stream::once(async move { Ok(response) });
-            Ok(Box::pin(stream))
-        }
-
-        fn type_name(&self) -> &'static str {
-            "TraderCallback"
-        }
-    }
-
-    // Create a module with handlers
-    callback_module! {
-        trading => { DataFetchHandler, TraderHandler }
-    }
-
-    #[tokio::test]
-    async fn test_dynamic_callback_module() {
-        let mut dispatcher = DynamicCallbackModule::new();
-
-        // Register handlers from the module
-        trading::register_handlers(&mut dispatcher).unwrap();
-
-        // Test available callbacks
-        let callbacks = dispatcher.available_callbacks();
-        assert!(callbacks.contains(&"trading.DataFetch".to_string()));
-        assert!(callbacks.contains(&"trading.TraderCallback".to_string()));
-
-        // Test module handlers
-        let module_handlers = dispatcher.module_handlers("trading");
-        assert_eq!(module_handlers.len(), 2);
-        assert!(module_handlers.contains(&"DataFetch".to_string()));
-        assert!(module_handlers.contains(&"TraderCallback".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_callback_routing() {
-        let mut dispatcher = DynamicCallbackModule::new();
-
-        // Register handlers
-        dispatcher
-            .register_handler("trading", DataFetchHandler)
-            .unwrap();
-        dispatcher
-            .register_handler("trading", TraderHandler)
-            .unwrap();
-
-        // Test routing by full path
-        let data_request = DataFetchRequest {
-            symbol: "AAPL".to_string(),
-            start_date: "2024-01-01".to_string(),
-            end_date: "2024-01-03".to_string(),
-        };
-
-        let serialized =
-            bincode::encode_to_vec(&data_request, bincode::config::standard()).unwrap();
-
-        // This should work
-        let result = dispatcher
-            .handle_callback(
-                "trading.DataFetch",
-                &serialized,
-                1,
-                TracingContext::default(),
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Test routing by type name only
-        let result = dispatcher
-            .handle_callback("DataFetch", &serialized, 2, TracingContext::default())
-            .await;
-        assert!(result.is_ok());
-
-        // Test routing by module name (should work if only one handler in module)
-        let result = dispatcher
-            .handle_callback("trading", &serialized, 3, TracingContext::default())
-            .await;
-        assert!(result.is_ok());
     }
 }

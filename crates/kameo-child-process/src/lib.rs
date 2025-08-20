@@ -38,8 +38,8 @@
 //! ```rust
 //! use kameo_child_process::prelude::*;
 //!
-//! // Define your message types
-//! #[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+//! // Define your message types (serde only; on-wire serialization uses postcard)
+//! #[derive(Serialize, Deserialize, Debug, Clone)]
 //! struct MyMessage { data: String }
 //!
 //! impl KameoChildProcessMessage for MyMessage {
@@ -78,7 +78,7 @@ pub mod tracing_utils;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use bincode::{Decode, Encode};
+// Wire format: serde + postcard
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::prelude::*;
 use serde::de::DeserializeOwned;
@@ -99,7 +99,7 @@ pub mod error;
 pub use error::PythonExecutionError;
 
 /// A serializable representation of a tracing span's context for OTEL propagation
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TracingContext(pub std::collections::HashMap<String, String>);
 
 impl TracingContext {
@@ -152,7 +152,7 @@ impl TracingContext {
 }
 
 /// A wrapper to send a message with its tracing context.
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct WithTracingContext<T> {
     pub inner: T,
     pub context: TracingContext,
@@ -188,16 +188,9 @@ impl dyn AsyncReadWrite {
 
 /// Trait for messages that can be sent to a Kameo child process actor.
 pub trait KameoChildProcessMessage:
-    Send + Serialize + DeserializeOwned + Encode + Decode<()> + std::fmt::Debug + Clone + 'static
+    Send + Serialize + DeserializeOwned + std::fmt::Debug + Clone + 'static
 {
-    type Ok: Send
-        + Serialize
-        + DeserializeOwned
-        + Encode
-        + Decode<()>
-        + std::fmt::Debug
-        + Clone
-        + 'static;
+    type Ok: Send + Serialize + DeserializeOwned + std::fmt::Debug + Clone + 'static;
 }
 
 /// Control message for the unified IPC protocol.
@@ -225,7 +218,7 @@ pub trait KameoChildProcessMessage:
 /// // Stream termination
 /// Control::StreamEnd(MultiplexEnvelope { correlation_id: 2, inner: Some(final_value), context })
 /// ```
-#[derive(Debug, Serialize, Deserialize, Encode, Decode, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum Control<T> {
     /// Initial handshake message for connection establishment
     Handshake,
@@ -256,7 +249,7 @@ impl<T> Control<T> {
 }
 
 /// Envelope for multiplexed requests
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MultiplexEnvelope<T> {
     pub correlation_id: u64,
     pub inner: T,
@@ -627,11 +620,11 @@ where
                                                 slot.close_stream();
                                             } else {
                                                 tracing::error!(event = "parent_in_flight", correlation_id, "Sync reply slot sender missing");
-                                                metrics::MetricsHandle::parent().track_error("sync_missing_sender");
+                                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("sync_missing_sender");
                                             }
                                         } else {
                                             tracing::error!(event = "parent_in_flight", correlation_id, "Received sync reply for unknown correlation id");
-                                            metrics::MetricsHandle::parent().track_error("sync_unknown_correlation_id");
+                                            metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("sync_unknown_correlation_id");
                                         }
 
                                         // Remove from in_flight after sending sync response
@@ -651,11 +644,11 @@ where
                                                 trace!(event = "parent_in_flight", action = "stream_item_sent", correlation_id, "Sent stream item through streaming channel");
                                     } else {
                                                 tracing::error!(event = "parent_in_flight", correlation_id, "Stream reply slot sender missing");
-                                                metrics::MetricsHandle::parent().track_error("stream_missing_sender");
+                                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("stream_missing_sender");
                                             }
                                         } else {
                                             tracing::error!(event = "parent_in_flight", correlation_id, "Received stream item for unknown correlation id");
-                                            metrics::MetricsHandle::parent().track_error("stream_unknown_correlation_id");
+                                            metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("stream_unknown_correlation_id");
                                         }
                                     }
                                     Control::StreamEnd(envelope) => {
@@ -688,14 +681,14 @@ where
                                         tracing::warn!(event = "reader_task", in_flight_len, "EOF received with pending in-flight requests, waking all with error");
 
                                         // Track error in metrics
-                                        metrics::MetricsHandle::parent().track_error("eof_with_pending");
+                                        metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("eof_with_pending");
                                     }
                                     break;
                                 }
                                 error!(event = "parent_read_error", error = ?e, "Parent reader task error, exiting");
 
                                 // Track error in metrics
-                                metrics::MetricsHandle::parent().track_error("read_error");
+                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("read_error");
                                 break;
                             }
                         }
@@ -1085,7 +1078,7 @@ pub async fn run_child_actor_loop<H, M>(
 where
     H: ChildProcessMessageHandler<M> + Send + Clone + 'static,
     M: KameoChildProcessMessage + Send + 'static,
-    M::Ok: serde::Serialize + bincode::Encode + std::fmt::Debug + 'static,
+    M::Ok: serde::Serialize + std::fmt::Debug + 'static,
 {
     tracing::debug!(
         event = "run_child_actor_loop",
@@ -1118,14 +1111,14 @@ where
                     match read_res {
                         Ok(Some(msg)) => {
                             tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..std::cmp::min(100, msg.len())], "Read message from parent");
-                            let ctrl: Control<M> = match bincode::decode_from_slice(&msg[..], bincode::config::standard()) {
-                                Ok((ctrl, _)) => {
-                                    tracing::trace!(event = "bincode_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
+                            let ctrl: Control<M> = match postcard::from_bytes(&msg[..]) {
+                                Ok(ctrl) => {
+                                    tracing::trace!(event = "postcard_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
                                     tracing::debug!(event = "control_received", control_type = ?ctrl, "Received control message");
                                     ctrl
                                 },
                                 Err(e) => {
-                                    tracing::error!(event = "bincode_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
+                                    tracing::error!(event = "postcard_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
                                     continue;
                                 }
                             };
@@ -1175,7 +1168,7 @@ where
                                         let ctrl = Control::Sync(reply_envelope);
 
                                         // Encode the reply to bytes
-                                        match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
+                                        match postcard::to_allocvec(&ctrl) {
                                             Ok(reply_bytes) => {
                                                 trace!(event = "reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Reply encoded successfully");
                                                 if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
@@ -1242,7 +1235,7 @@ where
                                                     let ctrl = Control::Stream(reply_envelope);
 
                                                     // Encode the reply to bytes
-                                                    match bincode::encode_to_vec(ctrl, bincode::config::standard()) {
+                                                    match postcard::to_allocvec(&ctrl) {
                                                         Ok(reply_bytes) => {
                                                             trace!(event = "stream_reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Stream reply encoded successfully");
                                                             if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
@@ -1267,7 +1260,7 @@ where
                                                 };
                                                 let end_ctrl = Control::StreamEnd(end_envelope);
 
-                                                match bincode::encode_to_vec(end_ctrl, bincode::config::standard()) {
+                                                match postcard::to_allocvec(&end_ctrl) {
                                                     Ok(end_bytes) => {
                                                         trace!(event = "stream_end_encoded", correlation_id = correlation_id, "Stream end encoded successfully");
                                                         if let Err(e) = reply_tx.send((correlation_id, end_bytes)) {
@@ -1290,7 +1283,7 @@ where
                                                 };
                                                 let error_ctrl = Control::StreamEnd(error_envelope);
 
-                                                match bincode::encode_to_vec(error_ctrl, bincode::config::standard()) {
+                                                match postcard::to_allocvec(&error_ctrl) {
                                                     Ok(error_bytes) => {
                                                         trace!(event = "stream_error_encoded", correlation_id = correlation_id, "Stream error encoded successfully");
                                                         if let Err(e) = reply_tx.send((correlation_id, error_bytes)) {
@@ -1404,17 +1397,15 @@ where
     M: KameoChildProcessMessage + Send + Sync + 'static,
 {
     use crate::Control;
-    use bincode::{decode_from_slice, encode_to_vec};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     if is_parent {
         // Parent sends handshake
         let handshake_msg = Control::<M>::Handshake;
-        let handshake_bytes =
-            encode_to_vec(&handshake_msg, bincode::config::standard()).map_err(|e| {
-                PythonExecutionError::SerializationError {
-                    message: format!("Failed to encode handshake: {e}"),
-                }
-            })?;
+        let handshake_bytes = postcard::to_stdvec(&handshake_msg).map_err(|e| {
+            PythonExecutionError::SerializationError {
+                message: format!("Failed to encode handshake: {e}"),
+            }
+        })?;
         conn.write_all(&handshake_bytes).await.map_err(|e| {
             PythonExecutionError::ExecutionError {
                 message: format!("Failed to write handshake: {e}"),
@@ -1433,12 +1424,11 @@ where
                 message: "Connection closed during handshake".into(),
             });
         }
-        let (resp, _): (Control<M>, _) =
-            decode_from_slice(&resp_buf[..n], bincode::config::standard()).map_err(|e| {
-                PythonExecutionError::SerializationError {
-                    message: format!("Failed to decode handshake response: {e}"),
-                }
-            })?;
+        let resp: Control<M> = postcard::from_bytes(&resp_buf[..n]).map_err(|e| {
+            PythonExecutionError::SerializationError {
+                message: format!("Failed to decode handshake response: {e}"),
+            }
+        })?;
         if !resp.is_handshake() {
             return Err(PythonExecutionError::ExecutionError {
                 message: "Invalid handshake response".into(),
@@ -1458,12 +1448,11 @@ where
                 message: "Connection closed during handshake".into(),
             });
         }
-        let (handshake, _): (Control<M>, _) =
-            decode_from_slice(&buf[..n], bincode::config::standard()).map_err(|e| {
-                PythonExecutionError::SerializationError {
-                    message: format!("Failed to decode handshake: {e}"),
-                }
-            })?;
+        let handshake: Control<M> = postcard::from_bytes(&buf[..n]).map_err(|e| {
+            PythonExecutionError::SerializationError {
+                message: format!("Failed to decode handshake: {e}"),
+            }
+        })?;
         if !handshake.is_handshake() {
             return Err(PythonExecutionError::ExecutionError {
                 message: "Invalid handshake message".into(),
@@ -1471,11 +1460,10 @@ where
         }
         // Child sends handshake response
         let resp = Control::<M>::Handshake;
-        let resp_bytes = encode_to_vec(&resp, bincode::config::standard()).map_err(|e| {
-            PythonExecutionError::SerializationError {
+        let resp_bytes =
+            postcard::to_stdvec(&resp).map_err(|e| PythonExecutionError::SerializationError {
                 message: format!("Failed to encode handshake response: {e}"),
-            }
-        })?;
+            })?;
         conn.write_all(&resp_bytes)
             .await
             .map_err(|e| PythonExecutionError::ExecutionError {
@@ -1542,11 +1530,7 @@ where
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        tracing::error!(
-            status = "stopped",
-            actor_type = "SubprocessIpcActor",
-            ?reason
-        );
+        tracing::error!(status = "stopped", ?reason);
         Ok(())
     }
 }
@@ -1712,7 +1696,7 @@ where
     pub async fn run<H>(self, handler: H) -> Result<(), PythonExecutionError>
     where
         H: ChildProcessMessageHandler<M> + Send + Clone + 'static,
-        M::Ok: serde::Serialize + bincode::Encode + std::fmt::Debug + Sync + Send + 'static,
+        M::Ok: serde::Serialize + std::fmt::Debug + Sync + Send + 'static,
     {
         use crate::{Control, MultiplexEnvelope};
 
@@ -1891,7 +1875,7 @@ pub async fn run_reader_loop<M>(
     _message_type: &'static str,
 ) -> Result<(), PythonExecutionError>
 where
-    M: Decode<()> + Send + KameoChildProcessMessage + 'static,
+    M: Send + KameoChildProcessMessage + 'static,
 {
     let mut reader = crate::framing::LengthPrefixedRead::new(read_half);
     trace!(

@@ -12,7 +12,8 @@ python = ["pyo3"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
+heapless = "0.8"
 futures = { workspace = true }
 kameo = { workspace = true }
 kameo_macros = { workspace = true }

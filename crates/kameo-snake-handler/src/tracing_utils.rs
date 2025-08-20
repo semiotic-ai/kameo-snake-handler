@@ -419,16 +419,15 @@ print(f"[DEBUG] Current span (should be default): current_span={{current_span}} 
             carrier_dict = carrier_dict_clone
         );
 
-        let _ = py
-            .run(
-                std::ffi::CString::new(debug_code).unwrap().as_c_str(),
-                None,
-                None,
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to run debug code: {:?}", e);
-                e
-            })?;
+        py.run(
+            std::ffi::CString::new(debug_code).unwrap().as_c_str(),
+            None,
+            None,
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to run debug code: {:?}", e);
+            e
+        })?;
 
         // Get the current tracer
         let _tracer = match otel_trace.call_method1("get_tracer", ("kameo_snake_handler",)) {
@@ -458,16 +457,15 @@ except Exception as e:
     print(f"[DEBUG] Force flush failed: {e}")
 "#;
 
-        let _ = py
-            .run(
-                std::ffi::CString::new(flush_code).unwrap().as_c_str(),
-                None,
-                None,
-            )
-            .map_err(|e| {
-                tracing::error!("Failed to force flush Python spans: {:?}", e);
-                e
-            })?;
+        py.run(
+            std::ffi::CString::new(flush_code).unwrap().as_c_str(),
+            None,
+            None,
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to force flush Python spans: {:?}", e);
+            e
+        })?;
 
         tracing::debug!("Successfully set up Python OTEL context using pyo3");
         Ok(())

@@ -66,7 +66,7 @@ macro_rules! setup_python_subprocess_system {
                         use tokio::sync::Mutex;
                         use kameo_snake_handler::serde_py;
                         use kameo_child_process::callback;
-                        use bincode;
+                        // postcard used for wire format
                         use serde_json;
 
                         // Global callback connection for this child process
@@ -135,7 +135,7 @@ macro_rules! setup_python_subprocess_system {
                                 let mut callback_conn_guard = callback_conn_mutex.lock().await;
 
                                 // Send the envelope using the existing connection with proper framing
-                                let envelope_bytes = bincode::encode_to_vec(&envelope, bincode::config::standard())
+                                let envelope_bytes = postcard::to_stdvec(&envelope)
                                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize envelope: {e}")))?;
 
                                 // Send length-prefixed data (same framing as the existing system)
@@ -259,12 +259,11 @@ macro_rules! setup_python_subprocess_system {
 
                                     // Deserialize the TypedCallbackResponse
                                     let response: kameo_child_process::callback::TypedCallbackResponse =
-                                        bincode::decode_from_slice(&message_bytes, bincode::config::standard())
+                                        postcard::from_bytes(&message_bytes)
                                             .map_err(|e| {
                                                 tracing::error!("Failed to deserialize response: {}", e);
                                                 pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to deserialize response: {}", e))
-                                            })?
-                                            .0;
+                                            })?;
 
                                     tracing::debug!("Received response for correlation_id: {} (expected: {})", response.correlation_id, correlation_id);
 

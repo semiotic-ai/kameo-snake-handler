@@ -1,3 +1,4 @@
+use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use once_cell::sync::Lazy;
 use opentelemetry::metrics::{Counter, Histogram};
@@ -10,6 +11,8 @@ use std::time::Instant;
 // Initialize metrics only once
 static INIT_METRICS: Once = Once::new();
 
+// No global agent type; we pass actor_type per-handle
+
 // Global metrics counters for local tracking
 static PARENT_INFLIGHT_COUNT: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_INFLIGHT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -19,6 +22,15 @@ static PARENT_MAX_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_MAX_INFLIGHT: AtomicU64 = AtomicU64::new(0);
 static PARENT_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Per-actor inflight and max tracking
+static PARENT_INFLIGHT_BY_MESSAGE: Lazy<DashMap<&'static str, AtomicU64>> = Lazy::new(DashMap::new);
+static CALLBACK_INFLIGHT_BY_MESSAGE: Lazy<DashMap<&'static str, AtomicU64>> =
+    Lazy::new(DashMap::new);
+static PARENT_MAX_INFLIGHT_BY_MESSAGE: Lazy<DashMap<&'static str, AtomicU64>> =
+    Lazy::new(DashMap::new);
+static CALLBACK_MAX_INFLIGHT_BY_MESSAGE: Lazy<DashMap<&'static str, AtomicU64>> =
+    Lazy::new(DashMap::new);
 
 // OpenTelemetry instruments
 static INSTRUMENTS: Lazy<Mutex<Option<OtelInstruments>>> = Lazy::new(|| Mutex::new(None));
@@ -32,25 +44,57 @@ struct OtelInstruments {
     callback_latency_histogram: Histogram<f64>,
 }
 
+fn simplify_type_name(full: &str) -> String {
+    let candidate = if let (Some(start), Some(end)) = (full.find('<'), full.rfind('>')) {
+        let inner = &full[start + 1..end];
+        inner.split(',').next().unwrap_or(inner).trim()
+    } else {
+        full
+    };
+    candidate
+        .split("::")
+        .last()
+        .unwrap_or(candidate)
+        .to_string()
+}
+
 /// Tracks metrics for IPC operations
 #[derive(Debug, Clone, Copy)]
 pub struct MetricsHandle {
     operation_type: &'static str,
+    type_name: &'static str,
+    message_type: &'static str,
 }
 
 /// Higher-level metrics reporter that provides readable statistics
 pub struct MetricsReporter;
 
 impl MetricsHandle {
-    pub fn parent() -> Self {
-        Self {
-            operation_type: "parent",
+    fn simplify_and_leak(full: &'static str) -> &'static str {
+        // Compute simplified name once and leak it for 'static lifetime.
+        let simplified = simplify_type_name(full);
+        if simplified.as_str() == full {
+            full
+        } else {
+            Box::leak(simplified.into_boxed_str())
         }
     }
 
-    pub fn callback() -> Self {
+    pub fn parent(type_name: &'static str) -> Self {
+        let message_type = Self::simplify_and_leak(type_name);
+        Self {
+            operation_type: "parent",
+            type_name,
+            message_type,
+        }
+    }
+
+    pub fn callback(type_name: &'static str) -> Self {
+        let message_type = Self::simplify_and_leak(type_name);
         Self {
             operation_type: "callback",
+            type_name,
+            message_type,
         }
     }
 
@@ -63,11 +107,26 @@ impl MetricsHandle {
                 if current < u64::MAX {
                     let new_count = PARENT_INFLIGHT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
 
+                    // Per-actor inflight update and max tracking
+                    let entry = PARENT_INFLIGHT_BY_MESSAGE
+                        .entry(self.type_name)
+                        .or_insert_with(|| AtomicU64::new(0));
+                    let actor_new = entry.value().fetch_add(1, Ordering::SeqCst) + 1;
+
                     // Update max if needed (with overflow protection)
                     let current_max = PARENT_MAX_INFLIGHT.load(Ordering::SeqCst);
                     if new_count > current_max {
                         // Simple approach: just set it if larger, no need for atomic exchange
                         PARENT_MAX_INFLIGHT.store(new_count, Ordering::SeqCst);
+                    }
+
+                    // Update per-actor max inflight
+                    let max_entry = PARENT_MAX_INFLIGHT_BY_MESSAGE
+                        .entry(self.type_name)
+                        .or_insert_with(|| AtomicU64::new(0));
+                    let actor_current_max = max_entry.value().load(Ordering::SeqCst);
+                    if actor_new > actor_current_max {
+                        max_entry.value().store(actor_new, Ordering::SeqCst);
                     }
 
                     // Also increment total messages
@@ -85,12 +144,15 @@ impl MetricsHandle {
 
                     // Record to OpenTelemetry if available
                     if let Some(instruments) = INSTRUMENTS.lock().unwrap().as_ref() {
-                        instruments.parent_messages_counter.add(1, &[]);
+                        instruments
+                            .parent_messages_counter
+                            .add(1, &[KeyValue::new("message_type", self.message_type)]);
                     }
 
                     // Record to metrics
-                    gauge!("kameo_child_process_parent_inflight").increment(1.0);
-                    counter!("kameo_child_process_parent_messages_total").increment(1);
+                    let msg_type = self.message_type.to_string();
+                    gauge!("kameo_child_process_parent_inflight", "message_type" => msg_type.clone()).increment(1.0);
+                    counter!("kameo_child_process_parent_messages_total", "message_type" => msg_type).increment(1);
                 }
             }
             "callback" => {
@@ -99,11 +161,26 @@ impl MetricsHandle {
                 if current < u64::MAX {
                     let new_count = CALLBACK_INFLIGHT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
 
+                    // Per-actor inflight update and max tracking
+                    let entry = CALLBACK_INFLIGHT_BY_MESSAGE
+                        .entry(self.type_name)
+                        .or_insert_with(|| AtomicU64::new(0));
+                    let actor_new = entry.value().fetch_add(1, Ordering::SeqCst) + 1;
+
                     // Update max if needed (with overflow protection)
                     let current_max = CALLBACK_MAX_INFLIGHT.load(Ordering::SeqCst);
                     if new_count > current_max {
                         // Simple approach: just set it if larger, no need for atomic exchange
                         CALLBACK_MAX_INFLIGHT.store(new_count, Ordering::SeqCst);
+                    }
+
+                    // Update per-actor max inflight for callback
+                    let max_entry = CALLBACK_MAX_INFLIGHT_BY_MESSAGE
+                        .entry(self.type_name)
+                        .or_insert_with(|| AtomicU64::new(0));
+                    let actor_current_max = max_entry.value().load(Ordering::SeqCst);
+                    if actor_new > actor_current_max {
+                        max_entry.value().store(actor_new, Ordering::SeqCst);
                     }
 
                     // Also increment total messages
@@ -121,12 +198,15 @@ impl MetricsHandle {
 
                     // Record to OpenTelemetry if available
                     if let Some(instruments) = INSTRUMENTS.lock().unwrap().as_ref() {
-                        instruments.callback_messages_counter.add(1, &[]);
+                        instruments
+                            .callback_messages_counter
+                            .add(1, &[KeyValue::new("message_type", self.message_type)]);
                     }
 
                     // Record to metrics
-                    gauge!("kameo_child_process_callback_inflight").increment(1.0);
-                    counter!("kameo_child_process_callback_messages_total").increment(1);
+                    let msg_type = self.message_type.to_string();
+                    gauge!("kameo_child_process_callback_inflight", "message_type" => msg_type.clone()).increment(1.0);
+                    counter!("kameo_child_process_callback_messages_total", "message_type" => msg_type).increment(1);
                 }
             }
             _ => {}
@@ -150,7 +230,15 @@ impl MetricsHandle {
                 }
 
                 // Record to metrics
-                gauge!("kameo_child_process_parent_inflight").decrement(1.0);
+                let msg_type = self.message_type.to_string();
+                gauge!("kameo_child_process_parent_inflight", "message_type" => msg_type.clone())
+                    .decrement(1.0);
+                if let Some(entry) = PARENT_INFLIGHT_BY_MESSAGE.get(&self.type_name) {
+                    let _ = entry.value().fetch_sub(1, Ordering::SeqCst);
+                    let cur = entry.value().load(Ordering::SeqCst) as f64;
+                    gauge!("kameo_child_process_parent_inflight_count", "message_type" => msg_type)
+                        .set(cur);
+                }
             }
             "callback" => {
                 // Avoid underflow by checking first
@@ -160,7 +248,14 @@ impl MetricsHandle {
                 }
 
                 // Record to metrics
-                gauge!("kameo_child_process_callback_inflight").decrement(1.0);
+                let msg_type = self.message_type.to_string();
+                gauge!("kameo_child_process_callback_inflight", "message_type" => msg_type.clone())
+                    .decrement(1.0);
+                if let Some(entry) = CALLBACK_INFLIGHT_BY_MESSAGE.get(&self.type_name) {
+                    let _ = entry.value().fetch_sub(1, Ordering::SeqCst);
+                    let cur = entry.value().load(Ordering::SeqCst) as f64;
+                    gauge!("kameo_child_process_callback_inflight_count", "message_type" => msg_type).set(cur);
+                }
             }
             _ => {}
         }
@@ -181,13 +276,16 @@ impl MetricsHandle {
             "parent" => {
                 // Record to OpenTelemetry if available
                 if let Some(instruments) = INSTRUMENTS.lock().unwrap().as_ref() {
-                    instruments
-                        .parent_latency_histogram
-                        .record(duration_ms, &[]);
+                    instruments.parent_latency_histogram.record(
+                        duration_ms,
+                        &[KeyValue::new("message_type", self.message_type)],
+                    );
                 }
 
                 // Record to metrics
-                histogram!("kameo_child_process_parent_latency_ms").record(duration_ms);
+                let msg_type = self.message_type.to_string();
+                histogram!("kameo_child_process_parent_latency_ms", "message_type" => msg_type)
+                    .record(duration_ms);
 
                 tracing::trace!(
                     event = "metrics_latency",
@@ -200,13 +298,16 @@ impl MetricsHandle {
             "callback" => {
                 // Record to OpenTelemetry if available
                 if let Some(instruments) = INSTRUMENTS.lock().unwrap().as_ref() {
-                    instruments
-                        .callback_latency_histogram
-                        .record(duration_ms, &[]);
+                    instruments.callback_latency_histogram.record(
+                        duration_ms,
+                        &[KeyValue::new("message_type", self.message_type)],
+                    );
                 }
 
                 // Record to metrics
-                histogram!("kameo_child_process_callback_latency_ms").record(duration_ms);
+                let msg_type = self.message_type.to_string();
+                histogram!("kameo_child_process_callback_latency_ms", "message_type" => msg_type)
+                    .record(duration_ms);
 
                 tracing::trace!(
                     event = "metrics_latency",
@@ -227,26 +328,36 @@ impl MetricsHandle {
 
                 // Record to OpenTelemetry if available
                 if let Some(instruments) = INSTRUMENTS.lock().unwrap().as_ref() {
-                    instruments
-                        .parent_errors_counter
-                        .add(1, &[KeyValue::new("error_type", error_type.to_string())]);
+                    instruments.parent_errors_counter.add(
+                        1,
+                        &[
+                            KeyValue::new("error_type", error_type.to_string()),
+                            KeyValue::new("message_type", self.message_type),
+                        ],
+                    );
                 }
 
                 // Record to metrics
-                counter!("kameo_child_process_parent_errors_total").increment(1);
+                let msg_type = self.message_type.to_string();
+                counter!("kameo_child_process_parent_errors_total", "error_type" => error_type.to_string(), "message_type" => msg_type).increment(1);
             }
             "callback" => {
                 CALLBACK_ERROR_COUNT.fetch_add(1, Ordering::SeqCst);
 
                 // Record to OpenTelemetry if available
                 if let Some(instruments) = INSTRUMENTS.lock().unwrap().as_ref() {
-                    instruments
-                        .callback_errors_counter
-                        .add(1, &[KeyValue::new("error_type", error_type.to_string())]);
+                    instruments.callback_errors_counter.add(
+                        1,
+                        &[
+                            KeyValue::new("error_type", error_type.to_string()),
+                            KeyValue::new("message_type", self.message_type),
+                        ],
+                    );
                 }
 
                 // Record to metrics
-                counter!("kameo_child_process_callback_errors_total").increment(1);
+                let msg_type = self.message_type.to_string();
+                counter!("kameo_child_process_callback_errors_total", "error_type" => error_type.to_string(), "message_type" => msg_type).increment(1);
             }
             _ => {}
         }
@@ -310,11 +421,41 @@ impl MetricsReporter {
             "Metrics summary"
         );
 
-        // Update absolute metrics values
+        // Update absolute metrics values (aggregate)
         gauge!("kameo_child_process_parent_inflight_count").set(parent_inflight as f64);
         gauge!("kameo_child_process_callback_inflight_count").set(callback_inflight as f64);
         gauge!("kameo_child_process_parent_max_inflight").set(parent_max as f64);
         gauge!("kameo_child_process_callback_max_inflight").set(callback_max as f64);
+
+        // Emit per-actor absolute gauges
+        for item in PARENT_INFLIGHT_BY_MESSAGE.iter() {
+            let actor = *item.key();
+            let msg_type = simplify_type_name(actor);
+            let value = item.value().load(Ordering::SeqCst) as f64;
+            gauge!("kameo_child_process_parent_inflight_count", "message_type" => msg_type)
+                .set(value);
+        }
+        for item in CALLBACK_INFLIGHT_BY_MESSAGE.iter() {
+            let actor = *item.key();
+            let msg_type = simplify_type_name(actor);
+            let value = item.value().load(Ordering::SeqCst) as f64;
+            gauge!("kameo_child_process_callback_inflight_count", "message_type" => msg_type)
+                .set(value);
+        }
+        for item in PARENT_MAX_INFLIGHT_BY_MESSAGE.iter() {
+            let actor = *item.key();
+            let msg_type = simplify_type_name(actor);
+            let value = item.value().load(Ordering::SeqCst) as f64;
+            gauge!("kameo_child_process_parent_max_inflight", "message_type" => msg_type)
+                .set(value);
+        }
+        for item in CALLBACK_MAX_INFLIGHT_BY_MESSAGE.iter() {
+            let actor = *item.key();
+            let msg_type = simplify_type_name(actor);
+            let value = item.value().load(Ordering::SeqCst) as f64;
+            gauge!("kameo_child_process_callback_max_inflight", "message_type" => msg_type)
+                .set(value);
+        }
     }
 }
 
@@ -325,8 +466,8 @@ pub struct OperationTracker {
 }
 
 impl OperationTracker {
-    pub fn track_parent() -> Self {
-        let handle = MetricsHandle::parent();
+    pub fn track_parent(actor_type: &'static str) -> Self {
+        let handle = MetricsHandle::parent(actor_type);
         handle.track_inflight_increment();
         Self {
             handle,
@@ -334,8 +475,8 @@ impl OperationTracker {
         }
     }
 
-    pub fn track_callback() -> Self {
-        let handle = MetricsHandle::callback();
+    pub fn track_callback(actor_type: &'static str) -> Self {
+        let handle = MetricsHandle::callback(actor_type);
         handle.track_inflight_increment();
         Self {
             handle,
@@ -469,3 +610,5 @@ pub fn init_metrics() {
         );
     });
 }
+
+// No global setter; actor type is provided per emission

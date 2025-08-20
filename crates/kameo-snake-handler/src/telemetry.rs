@@ -3,12 +3,12 @@ use metrics;
 use metrics_exporter_opentelemetry;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     metrics::SdkMeterProvider, propagation::TraceContextPropagator, trace::SdkTracerProvider,
     Resource,
 };
 use opentelemetry_stdout::SpanExporter;
-use opentelemetry::KeyValue;
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::EnvFilter;

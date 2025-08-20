@@ -167,16 +167,15 @@ sequenceDiagram
 use kameo_snake_handler::{PythonChildProcessBuilder, PythonConfig};
 use kameo_child_process::callback::TypedCallbackHandler;
 use serde::{Serialize, Deserialize};
-use bincode::{Encode, Decode};
 
 // Define your callback request/response types
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DataFetchRequest {
     pub symbol: String,
     pub period: String,
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DataFetchResponse {
     pub timestamp: String,
     pub price: f64,
@@ -296,10 +295,9 @@ async def handle_message(message):
 use kameo_snake_handler::{PythonChildProcessBuilder, PythonConfig};
 use kameo_child_process::callback::TypedCallbackHandler;
 use serde::{Serialize, Deserialize};
-use bincode::{Encode, Decode};
 
 // Define message types for main communication
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TradeOrder {
     pub symbol: String,
     pub quantity: u32,
@@ -310,7 +308,7 @@ impl kameo_child_process::KameoChildProcessMessage for TradeOrder {
     type Ok = TradeResult;
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TradeResult {
     pub order_id: String,
     pub status: String,
@@ -318,13 +316,13 @@ pub struct TradeResult {
 }
 
 // Define callback types for data requests
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct MarketDataRequest {
     pub symbol: String,
     pub timeframe: String,
 }
 
-#[derive(Serialize, Deserialize, Encode, Decode, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct PriceData {
     pub timestamp: String,
     pub price: f64,
