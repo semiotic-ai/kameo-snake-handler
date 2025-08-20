@@ -24,8 +24,8 @@ impl<R: AsyncRead + Unpin> LengthPrefixedRead<R> {
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut msg_buf = vec![0u8; len];
         self.inner.read_exact(&mut msg_buf).await?;
-        let msg: T = postcard::from_bytes(&msg_buf).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("postcard decode error: {e}"))
+        let msg: T = serde_brief::from_slice(&msg_buf).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("serde-brief decode error: {e}"))
         })?;
         trace!(event = "framing_read", len, "Read length-prefixed message");
         Ok(msg)
@@ -47,7 +47,7 @@ impl<W> LengthPrefixedWrite<W> {
 
 impl<W: AsyncWrite + Unpin> LengthPrefixedWrite<W> {
     pub async fn write_msg<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
-        let bytes_storage = postcard::to_allocvec(msg)
+        let bytes_storage = serde_brief::to_vec(msg)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let bytes: Vec<u8> = bytes_storage;
         let len = bytes.len() as u32;

@@ -210,7 +210,7 @@ Handlers can return:
 
 ## Python-Rust Serialization Guide
 
-The Kameo system uses **postcard** as the on-wire format for Rust-to-Rust communication (via serde), and Python dict-based serialization for Python-to-Rust data exchange (via PyO3's serde integration). `serde_json::Value` can be used on the Rust side for convenience when handling dynamic Python data. This section covers how to design compatible structures and handle common serialization patterns.
+The Kameo system uses **serde-brief** as the on-wire format for Rust-to-Rust communication (via serde), and Python dict-based serialization for Python-to-Rust data exchange (via PyO3's serde integration). `serde_json::Value` can be used on the Rust side for convenience when handling dynamic Python data. This section covers how to design compatible structures and handle common serialization patterns.
 
 ---
 
@@ -778,7 +778,7 @@ def test_rust_compatibility():
 ### 9. Performance Considerations
 
 #### Serialization Overhead
-- **postcard**: Compact, serde-native, stable on-wire format for Rust-to-Rust
+- **serde-brief**: Compact, self-describing serde-native binary format for Rust-to-Rust
 - **Python dict serialization**: Via PyO3 serde integration, optimized for Python data structures
 - **serde_json::Value**: Convenience wrapper for dynamic Python data on Rust side
 
@@ -793,4 +793,4 @@ def test_rust_compatibility():
 
 ---
 
-This serialization guide covers how to design compatible structures for Python-Rust communication using serde + postcard. Test both directions of serialization to catch compatibility issues early.
+This serialization guide covers how to design compatible structures for Python-Rust communication using serde + serde-brief. Test both directions of serialization to catch compatibility issues early.

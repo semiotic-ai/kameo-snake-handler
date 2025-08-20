@@ -1,6 +1,6 @@
 //! High-concurrency async tests for core IPC protocol logic (no real process spawning)
 
-// On-wire uses postcard; tests derive serde only
+// On-wire uses serde-brief; tests derive serde only
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::Once;
@@ -119,7 +119,7 @@ async fn test_single_callback_message() {
             let mut writer = LengthPrefixedWrite::new(write_half);
 
             // Create typed callback envelope
-            let callback_data = postcard::to_allocvec(&DummyMsg { id: 42 }).unwrap();
+            let callback_data = serde_brief::to_vec(&DummyMsg { id: 42 }).unwrap();
             let envelope = kameo_child_process::callback::TypedCallbackEnvelope {
                 callback_path: "test.DummyMsg".to_string(),
                 correlation_id: 1,
@@ -508,7 +508,7 @@ async fn test_high_volume_multiple_callback_types() {
                         };
                         (
                             "data.DataFetchCallback",
-                            postcard::to_allocvec(&callback).unwrap(),
+                            serde_brief::to_vec(&callback).unwrap(),
                         )
                     }
                     1 => {
@@ -520,7 +520,7 @@ async fn test_high_volume_multiple_callback_types() {
                         };
                         (
                             "compute.ComputeCallback",
-                            postcard::to_allocvec(&callback).unwrap(),
+                            serde_brief::to_vec(&callback).unwrap(),
                         )
                     }
                     _ => {
@@ -530,7 +530,7 @@ async fn test_high_volume_multiple_callback_types() {
                         };
                         (
                             "batch.BatchCallback",
-                            postcard::to_allocvec(&callback).unwrap(),
+                            serde_brief::to_vec(&callback).unwrap(),
                         )
                     }
                 };

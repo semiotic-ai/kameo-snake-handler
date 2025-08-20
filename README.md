@@ -39,7 +39,7 @@ make run        # Run the full Rust+Python integration test suite
 ### ⚡ **High Performance**
 
 - **Connection Sharing**: Single Unix socket handles multiple concurrent callbacks
-- **Binary Serialization**: postcard (serde) encoding with length prefixing for wire protocol
+- **Binary Serialization**: serde-brief (serde) encoding with length prefixing for wire protocol
 - **Async Support**: async/await support in both Rust and Python
 - **Correlation IDs**: Request/response matching for multiplexed streams
 

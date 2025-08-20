@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-// Wire format: serde + postcard
+// Wire format: serde + serde-brief
 use kameo::actor::Actor;
 use kameo::message::Message;
 use kameo_child_process::error::PythonExecutionError;

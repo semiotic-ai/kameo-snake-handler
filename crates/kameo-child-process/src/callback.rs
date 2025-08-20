@@ -481,17 +481,17 @@ where
             );
 
             // Deserialize the callback data to the specific type
-            let callback: C = match postcard::from_bytes::<C>(&data) {
+            let callback: C = match serde_brief::from_slice::<C>(&data) {
                 Ok(callback) => {
                     trace!(
-                        event = "handler_wrapper_deserialize_success_postcard",
+                        event = "handler_wrapper_deserialize_success_serde_brief",
                         handler_type,
                         correlation_id,
-                        "Successfully deserialized callback data with postcard"
+                        "Successfully deserialized callback data with serde-brief"
                     );
                     callback
                 }
-                Err(postcard_err) => {
+                Err(serde_brief_err) => {
                     // Fallback: try JSON decoding to support Python dict inputs
                     match serde_json::from_slice::<C>(&data) {
                         Ok(callback) => {
@@ -504,7 +504,7 @@ where
                             callback
                         }
                         Err(json_err) => {
-                            trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, postcard_error = %postcard_err, json_error = %json_err, "Failed to deserialize callback data with both postcard and JSON");
+                            trace!(event = "handler_wrapper_deserialize_failed", handler_type, correlation_id, serde_brief_error = %serde_brief_err, json_error = %json_err, "Failed to deserialize callback data with both serde-brief and JSON");
 
                             // Provide detailed debugging information for deserialization failures
                             let data_hex = data
@@ -522,12 +522,12 @@ where
                             return Err(PythonExecutionError::ExecutionError {
                                 message: format!(
                                     "Failed to deserialize callback data for handler '{}' (correlation_id: {}):\n\
-                                     - postcard error: {}\n\
+                                     - serde-brief error: {}\n\
                                      - json error: {}\n\
                                      Expected type: {}\n\
                                      Raw data (hex): {}\n\
                                      This usually indicates a type mismatch between Python and Rust or corrupted data.",
-                                    handler_type, correlation_id, postcard_err, json_err,
+                                    handler_type, correlation_id, serde_brief_err, json_err,
                                     std::any::type_name::<C>(),
                                     data_preview
                                 )
@@ -572,7 +572,7 @@ where
             let handler_type_clone = handler_type.to_string();
             let serialized_stream = response_stream.map(move |result| {
                 result.and_then(|response| {
-                    postcard::to_allocvec(&response)
+                    serde_brief::to_vec(&response)
                         .map_err(|e| PythonExecutionError::ExecutionError {
                             message: format!(
                                 "Failed to serialize response for handler '{}' (correlation_id: {}): {}\n\
@@ -778,7 +778,7 @@ impl TypedCallbackReceiver {
                                         let error_response = TypedCallbackResponse {
                                             callback_path: callback_path.clone(),
                                             response_type: "ErrorResponse".to_string(),
-                                            response_data: postcard::to_allocvec(&e).unwrap_or_default(),
+                                            response_data: serde_brief::to_vec(&e).unwrap_or_default(),
                                             correlation_id,
                                             is_final: true, // Error responses are also final
                                         };

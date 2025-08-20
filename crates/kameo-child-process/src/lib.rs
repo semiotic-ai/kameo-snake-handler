@@ -38,7 +38,7 @@
 //! ```rust
 //! use kameo_child_process::prelude::*;
 //!
-//! // Define your message types (serde only; on-wire serialization uses postcard)
+//! // Define your message types (serde only; on-wire serialization uses serde-brief)
 //! #[derive(Serialize, Deserialize, Debug, Clone)]
 //! struct MyMessage { data: String }
 //!
@@ -78,7 +78,7 @@ pub mod tracing_utils;
 
 use anyhow::Result;
 use async_trait::async_trait;
-// Wire format: serde + postcard
+// Wire format: serde + serde-brief
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::prelude::*;
 use serde::de::DeserializeOwned;
@@ -1111,14 +1111,14 @@ where
                     match read_res {
                         Ok(Some(msg)) => {
                             tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..std::cmp::min(100, msg.len())], "Read message from parent");
-                            let ctrl: Control<M> = match postcard::from_bytes(&msg[..]) {
+                            let ctrl: Control<M> = match serde_brief::from_slice(&msg[..]) {
                                 Ok(ctrl) => {
-                                    tracing::trace!(event = "postcard_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
+                                    tracing::trace!(event = "serde_brief_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
                                     tracing::debug!(event = "control_received", control_type = ?ctrl, "Received control message");
                                     ctrl
                                 },
                                 Err(e) => {
-                                    tracing::error!(event = "postcard_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
+                                    tracing::error!(event = "serde_brief_decode_error", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), error = ?e, "Failed to decode Control envelope");
                                     continue;
                                 }
                             };
@@ -1168,7 +1168,7 @@ where
                                         let ctrl = Control::Sync(reply_envelope);
 
                                         // Encode the reply to bytes
-                                        match postcard::to_allocvec(&ctrl) {
+                                        match serde_brief::to_vec(&ctrl) {
                                             Ok(reply_bytes) => {
                                                 trace!(event = "reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Reply encoded successfully");
                                                 if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
@@ -1235,7 +1235,7 @@ where
                                                     let ctrl = Control::Stream(reply_envelope);
 
                                                     // Encode the reply to bytes
-                                                    match postcard::to_allocvec(&ctrl) {
+                                                    match serde_brief::to_vec(&ctrl) {
                                                         Ok(reply_bytes) => {
                                                             trace!(event = "stream_reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Stream reply encoded successfully");
                                                             if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
@@ -1260,7 +1260,7 @@ where
                                                 };
                                                 let end_ctrl = Control::StreamEnd(end_envelope);
 
-                                                match postcard::to_allocvec(&end_ctrl) {
+                                                match serde_brief::to_vec(&end_ctrl) {
                                                     Ok(end_bytes) => {
                                                         trace!(event = "stream_end_encoded", correlation_id = correlation_id, "Stream end encoded successfully");
                                                         if let Err(e) = reply_tx.send((correlation_id, end_bytes)) {
@@ -1283,7 +1283,7 @@ where
                                                 };
                                                 let error_ctrl = Control::StreamEnd(error_envelope);
 
-                                                match postcard::to_allocvec(&error_ctrl) {
+                                                match serde_brief::to_vec(&error_ctrl) {
                                                     Ok(error_bytes) => {
                                                         trace!(event = "stream_error_encoded", correlation_id = correlation_id, "Stream error encoded successfully");
                                                         if let Err(e) = reply_tx.send((correlation_id, error_bytes)) {
@@ -1401,7 +1401,7 @@ where
     if is_parent {
         // Parent sends handshake
         let handshake_msg = Control::<M>::Handshake;
-        let handshake_bytes = postcard::to_stdvec(&handshake_msg).map_err(|e| {
+        let handshake_bytes = serde_brief::to_vec(&handshake_msg).map_err(|e| {
             PythonExecutionError::SerializationError {
                 message: format!("Failed to encode handshake: {e}"),
             }
@@ -1424,7 +1424,7 @@ where
                 message: "Connection closed during handshake".into(),
             });
         }
-        let resp: Control<M> = postcard::from_bytes(&resp_buf[..n]).map_err(|e| {
+        let resp: Control<M> = serde_brief::from_slice(&resp_buf[..n]).map_err(|e| {
             PythonExecutionError::SerializationError {
                 message: format!("Failed to decode handshake response: {e}"),
             }
@@ -1448,7 +1448,7 @@ where
                 message: "Connection closed during handshake".into(),
             });
         }
-        let handshake: Control<M> = postcard::from_bytes(&buf[..n]).map_err(|e| {
+        let handshake: Control<M> = serde_brief::from_slice(&buf[..n]).map_err(|e| {
             PythonExecutionError::SerializationError {
                 message: format!("Failed to decode handshake: {e}"),
             }
@@ -1461,7 +1461,7 @@ where
         // Child sends handshake response
         let resp = Control::<M>::Handshake;
         let resp_bytes =
-            postcard::to_stdvec(&resp).map_err(|e| PythonExecutionError::SerializationError {
+            serde_brief::to_vec(&resp).map_err(|e| PythonExecutionError::SerializationError {
                 message: format!("Failed to encode handshake response: {e}"),
             })?;
         conn.write_all(&resp_bytes)

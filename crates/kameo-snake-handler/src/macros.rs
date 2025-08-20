@@ -66,7 +66,7 @@ macro_rules! setup_python_subprocess_system {
                         use tokio::sync::Mutex;
                         use kameo_snake_handler::serde_py;
                         use kameo_child_process::callback;
-                        // postcard used for wire format
+                        // serde-brief used for wire format
                         use serde_json;
 
                         // Global callback connection for this child process
@@ -135,7 +135,7 @@ macro_rules! setup_python_subprocess_system {
                                 let mut callback_conn_guard = callback_conn_mutex.lock().await;
 
                                 // Send the envelope using the existing connection with proper framing
-                                let envelope_bytes = postcard::to_stdvec(&envelope)
+                                let envelope_bytes = serde_brief::to_vec(&envelope)
                                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize envelope: {e}")))?;
 
                                 // Send length-prefixed data (same framing as the existing system)
@@ -259,7 +259,7 @@ macro_rules! setup_python_subprocess_system {
 
                                     // Deserialize the TypedCallbackResponse
                                     let response: kameo_child_process::callback::TypedCallbackResponse =
-                                        postcard::from_bytes(&message_bytes)
+                                        serde_brief::from_slice(&message_bytes)
                                             .map_err(|e| {
                                                 tracing::error!("Failed to deserialize response: {}", e);
                                                 pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to deserialize response: {}", e))

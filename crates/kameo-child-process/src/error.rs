@@ -14,8 +14,8 @@ use tracing::error;
 pub enum SubprocessIpcBackendError {
     #[error("IPC error: {0}")]
     Ipc(#[from] io::Error),
-    #[error("Postcard error: {0}")]
-    Postcard(#[from] postcard::Error),
+    #[error("Serialization error: {0}")]
+    SerdeBrief(#[from] serde_brief::Error),
     #[error("Actor panicked: {reason}")]
     Panicked { reason: String },
     #[error("Protocol error: {0}")]
@@ -48,8 +48,8 @@ impl From<SubprocessIpcBackendError> for SubprocessIpcBackendIpcError {
                 Self::UnknownActorType { actor_name }
             }
             SubprocessIpcBackendError::Ipc(err) => Self::Protocol(format!("IPC error: {err}")),
-            SubprocessIpcBackendError::Postcard(err) => {
-                Self::Protocol(format!("Postcard error: {err}"))
+            SubprocessIpcBackendError::SerdeBrief(err) => {
+                Self::Protocol(format!("Serialization error: {err}"))
             }
             SubprocessIpcBackendError::Shutdown => Self::Protocol("Shutdown".to_string()),
             SubprocessIpcBackendError::Panicked { reason } => {
