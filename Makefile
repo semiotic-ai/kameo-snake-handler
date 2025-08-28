@@ -28,6 +28,24 @@ run:
 	PYO3_PYTHON=$$PYTHON_BIN \
 	cargo run --release -p kameo-snake-testing --bin kameo-snake-testing -- $(ARGS)
 
+test:
+	PYTHON_BIN=/opt/homebrew/bin/python3; \
+	if [ "$(shell uname)" = "Darwin" ]; then \
+	  LIBPY_PATH=`$$PYTHON_BIN -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))'`; \
+	  LIBPY_DYLIB="$$LIBPY_PATH/libpython3.13.dylib"; \
+	  if [ -f "$$LIBPY_DYLIB" ]; then \
+	    export DYLD_LIBRARY_PATH="$$LIBPY_PATH:$$DYLD_LIBRARY_PATH"; \
+	    echo "[INFO] Using DYLD_LIBRARY_PATH=$$DYLD_LIBRARY_PATH"; \
+	  fi; \
+	else \
+	  export LD_LIBRARY_PATH=$$LD_LIBRARY_PATH; \
+	fi; \
+	PYTHONPATH=crates/kameo-snake-testing/python/venv/lib/python3.13/site-packages:crates/kameo-snake-testing/python \
+	PATH=crates/kameo-snake-testing/python/venv/bin:$$PATH \
+	PYTHON_GIL=1 \
+	PYO3_PYTHON=$$PYTHON_BIN \
+	cargo test -p kameo-snake-handler --lib -- --nocapture
+
 pyo3-async-test-venv:
 	$(PYTHON) -m venv kameo-pyo3-async-test/python/venv
 
@@ -53,4 +71,4 @@ pyo3-async-test:
 	PYTHON_GIL=1 \
 	cargo run --release -p kameo-pyo3-async-test -- $(ARGS)
 
-.PHONY: pyenv install clean run pyo3-async-test 
+.PHONY: pyenv install clean run test pyo3-async-test 

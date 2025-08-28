@@ -491,6 +491,107 @@ mod tests {
         let _ = std::fs::remove_file(&module_path);
         let _ = std::fs::remove_dir(&dir);
     }
+
+    #[test]
+    fn pyo3_nested_recursive_from_to_wire() {
+        // Define nested types to validate recursive from_wire/to_wire generation
+        let inner = Decl::Struct(StructDecl {
+            name: "Inner".to_string(),
+            fields: vec![
+                ("id".to_string(), TypeRef::Builtin("int".to_string())),
+                ("name".to_string(), TypeRef::Builtin("str".to_string())),
+                ("tags".to_string(), TypeRef::List(Box::new(TypeRef::Builtin("str".to_string())))),
+                ("meta".to_string(), TypeRef::Dict(Box::new(TypeRef::Builtin("str".to_string())))),
+            ],
+        });
+
+        let outer = Decl::Enum(EnumDecl {
+            name: "Outer".to_string(),
+            variants: vec![
+                EnumVariant::Unit { name: "Zero".to_string() },
+                EnumVariant::Newtype { name: "Single".to_string(), ty: TypeRef::Named("Inner".to_string()) },
+                EnumVariant::Tuple { name: "Pair".to_string(), tys: vec![
+                    TypeRef::Option(Box::new(TypeRef::Named("Inner".to_string()))),
+                    TypeRef::List(Box::new(TypeRef::Named("Inner".to_string()))),
+                ]},
+                EnumVariant::Struct { name: "WithMap".to_string(), fields: vec![
+                    ("items".to_string(), TypeRef::Dict(Box::new(TypeRef::Named("Inner".to_string())))),
+                    ("extra".to_string(), TypeRef::Option(Box::new(TypeRef::Builtin("int".to_string())))),
+                ]},
+            ],
+        });
+
+        let module_name = format!("kameo_types_{}", Uuid::new_v4().simple());
+        let py_src = emit_python_module(&module_name, &[inner, outer]);
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("kameo_codegen_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let module_path: PathBuf = dir.join(format!("{}.py", module_name));
+        let mut f = std::fs::File::create(&module_path).expect("create module file");
+        f.write_all(py_src.as_bytes()).expect("write module");
+        f.flush().expect("flush module");
+
+        Python::with_gil(|py| {
+            let sys = py.import("sys").unwrap();
+            sys.getattr("path").unwrap().call_method1("insert", (0, module_path.parent().unwrap().to_string_lossy().to_string(),)).unwrap();
+            let m = py.import("importlib").unwrap().call_method1("import_module", (&module_name,)).unwrap();
+
+            let from_wire_inner = m.getattr("from_wire_inner").unwrap();
+            let to_wire_inner = m.getattr("to_wire_inner").unwrap();
+            let from_wire_outer = m.getattr("from_wire_outer").unwrap();
+            let to_wire_outer = m.getattr("to_wire_outer").unwrap();
+
+            // Build nested wire dict for Outer::Struct WithMap
+            let inner1 = PyDict::new(py);
+            inner1.set_item("id", 1i64).unwrap();
+            inner1.set_item("name", "a").unwrap();
+            inner1.set_item("tags", vec!["x", "y"]).unwrap();
+            let meta1 = PyDict::new(py); meta1.set_item("k1", "v1").unwrap();
+            inner1.set_item("meta", meta1).unwrap();
+
+            let inner2 = PyDict::new(py);
+            inner2.set_item("id", 2i64).unwrap();
+            inner2.set_item("name", "b").unwrap();
+            inner2.set_item("tags", vec!["z"]).unwrap();
+            let meta2 = PyDict::new(py); meta2.set_item("k2", "v2").unwrap();
+            inner2.set_item("meta", meta2).unwrap();
+
+            let items = PyDict::new(py);
+            items.set_item("first", inner1).unwrap();
+            items.set_item("second", inner2).unwrap();
+
+            let payload = PyDict::new(py);
+            payload.set_item("items", items).unwrap();
+            payload.set_item("extra", 99i64).unwrap();
+
+            let wire_outer = PyDict::new(py);
+            wire_outer.set_item("WithMap", payload).unwrap();
+
+            // Parse -> to_wire roundtrip
+            let outer_obj = from_wire_outer.call1((wire_outer,)).unwrap();
+            let wire_back = to_wire_outer.call1((outer_obj.clone(),)).unwrap();
+            // Ensure keys present and match shapes
+            let tag = wire_back.get_item("WithMap").unwrap();
+            let tag_dict = tag.downcast::<PyDict>().unwrap();
+            assert!(tag_dict.contains("items").unwrap());
+            assert!(tag_dict.contains("extra").unwrap());
+
+            // Also test Newtype Single with recursive inner from_wire/to_wire
+            let wire_inner = PyDict::new(py);
+            wire_inner.set_item("id", 7i64).unwrap();
+            wire_inner.set_item("name", "nest").unwrap();
+            wire_inner.set_item("tags", vec!["a"]).unwrap();
+            let meta = PyDict::new(py); meta.set_item("m", "n").unwrap();
+            wire_inner.set_item("meta", meta).unwrap();
+            let inner_obj = from_wire_inner.call1((wire_inner,)).unwrap();
+            let inner_back = to_wire_inner.call1((inner_obj,)).unwrap();
+            assert_eq!(inner_back.get_item("id").unwrap().extract::<i64>().unwrap(), 7);
+        });
+
+        let _ = std::fs::remove_file(&module_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
 
 
