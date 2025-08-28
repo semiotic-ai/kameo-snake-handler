@@ -79,26 +79,40 @@
 //!     # return {"result": "done"}
 //! ```
 
+#[cfg(feature = "python")]
 pub mod serde_py;
+#[cfg(feature = "python")]
 pub use serde_py::{from_pyobject, to_pyobject, FromPyAny};
 
 mod error;
 pub use error::ErrorReply;
 pub use kameo_child_process::error::PythonExecutionError;
 
+#[cfg(feature = "python")]
 mod builder;
+#[cfg(feature = "python")]
 pub use builder::PythonChildProcessBuilder;
 
+#[cfg(feature = "python")]
 mod actor;
+#[cfg(feature = "python")]
 pub use actor::{child_process_main_with_python_actor, PythonActor, PythonConfig};
 
+#[cfg(feature = "python")]
 mod macros;
 
+#[cfg(feature = "python")]
 pub mod telemetry;
+#[cfg(feature = "python")]
 pub mod tracing_utils;
 
+#[cfg(feature = "python")]
 pub use crate::actor::PythonMessageHandler;
 
+// Experimental: static Python code generation (exposed for tests and tooling)
+pub mod codegen_py;
+
+#[cfg(feature = "python")]
 #[tracing::instrument(skip(builder), name = "setup_python_runtime")]
 pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
     pyo3::prepare_freethreaded_python();
@@ -106,8 +120,7 @@ pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
 }
 
 pub mod prelude {
-    pub use super::{
-        setup_python_runtime, PythonActor, PythonChildProcessBuilder, PythonConfig,
-        PythonExecutionError,
-    };
+    pub use super::{PythonExecutionError};
+    #[cfg(feature = "python")]
+    pub use super::{setup_python_runtime, PythonActor, PythonChildProcessBuilder, PythonConfig};
 }

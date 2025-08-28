@@ -22,6 +22,11 @@ This crate provides the Python-specific process actor, configuration, error hand
 
 ---
 
+## Additional Documentation
+
+- IPC internals and runtime: `crates/kameo-child-process/README.md`
+- Generated Python bindings and usage: `crates/kameo-snake-handler/docs/python-bindings.md`
+
 ## The `setup_python_subprocess_system!` Macro
 
 This macro provides a zero-boilerplate entry point for Python subprocesses with dynamic callback systems. It automatically:

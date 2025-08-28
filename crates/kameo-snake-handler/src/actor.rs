@@ -19,6 +19,9 @@ use tracing::instrument;
 use tracing_futures::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+type CreateGenFuture = Pin<Box<dyn Future<Output = Result<(pyo3::PyObject, pyo3::Py<pyo3::PyAny>), PythonExecutionError>> + Send>>;
+type NextItemFuture<T> = Pin<Box<dyn Future<Output = Result<Option<T>, PythonExecutionError>> + Send>>;
+
 /// Configuration for Python subprocess execution.
 ///
 /// This struct defines all the configuration options needed to spawn and configure
@@ -500,24 +503,13 @@ where
     /// Initial state - need to create the generator
     Initial,
     /// Creating the generator (async future)
-    CreatingGenerator {
-        fut: Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            (pyo3::PyObject, pyo3::Py<pyo3::PyAny>),
-                            PythonExecutionError,
-                        >,
-                    > + Send,
-            >,
-        >,
-    },
+    CreatingGenerator { fut: CreateGenFuture },
     /// Generator created, have the async iterator
     Generator { async_iter: pyo3::Py<pyo3::PyAny> },
     /// Getting next item (async future)
     GettingNext {
         async_iter: pyo3::Py<pyo3::PyAny>,
-        fut: Pin<Box<dyn Future<Output = Result<Option<M::Ok>, PythonExecutionError>> + Send>>,
+        fut: NextItemFuture<M::Ok>,
     },
     /// Generator exhausted
     Exhausted,
@@ -546,7 +538,7 @@ where
         Ok(Self {
             handler,
             msg: Some(msg),
-            state: PythonAsyncGeneratorState::Initial,
+            state: PythonAsyncGeneratorState::<M>::Initial,
         })
     }
 }

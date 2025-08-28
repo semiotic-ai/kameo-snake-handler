@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4a4c620814935ba8a2d104c55092b0800d89a9ebc0c32872cc41a75371415990 # shrinks to item = JsonFields { id: 0, meta: Null, array: [], map: {}, maybe: Some(Null) }

@@ -12,12 +12,14 @@ use tokio_util::sync::CancellationToken;
 /// NOTE: SubprocessParentActor is only valid as an in-process actor with DelegatedReply. If used as a child process actor, it will panic.
 pub struct ParentActorLoopConfig {
     pub max_concurrency: usize,
+    pub inflight_limit: Option<usize>,
 }
 
 impl Default for ParentActorLoopConfig {
     fn default() -> Self {
         Self {
             max_concurrency: 10_000,
+            inflight_limit: None,
         }
     }
 }
@@ -132,6 +134,8 @@ where
     log_level: Level,
     /// Dynamic callback module for managing multiple typed handlers
     callback_module: DynamicCallbackModule,
+    /// Collected IR for callback request types keyed by full path (module.HandlerType)
+    callback_request_ir: std::collections::HashMap<String, Vec<crate::codegen_py::Decl>>,
     /// Phantom data for message type
     _phantom: std::marker::PhantomData<M>,
 }
@@ -165,6 +169,7 @@ where
             python_config,
             log_level: Level::INFO,
             callback_module: DynamicCallbackModule::new(),
+            callback_request_ir: std::collections::HashMap::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -181,12 +186,16 @@ where
     /// ```
     pub fn with_callback_handler<C, H>(mut self, module_name: &str, handler: H) -> Self
     where
-        C: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
+        C: Send + Sync + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
     {
-        if let Err(e) = self.callback_module.register_handler(module_name, handler) {
+        if let Err(e) = self.callback_module.register_handler(module_name, handler.clone()) {
             tracing::warn!("Failed to register callback handler: {}", e);
         }
+        // Capture IR for the callback request type using automatic derivation
+        let full_path = format!("{}.{}", module_name, handler.type_name());
+        let decls = crate::codegen_py::derive_decls_for::<C>();
+        self.callback_request_ir.insert(full_path, decls);
         self
     }
 
@@ -226,7 +235,11 @@ where
         use kameo_child_process::callback::TypedCallbackReceiver;
         use kameo_child_process::spawn_subprocess_ipc_actor;
         use tokio::net::UnixListener;
-        let _parent_config = parent_config.unwrap_or_default();
+        let parent_config = parent_config.unwrap_or_default();
+        // Propagate inflight limit (if provided) to child-process backend via env
+        if let Some(limit) = parent_config.inflight_limit {
+            std::env::set_var("KAMEO_INFLIGHT_LIMIT", limit.to_string());
+        }
 
         // Serialize the PythonConfig as JSON for the child
         let config_json = serde_json::to_string(&self.python_config).map_err(|e| {
@@ -246,6 +259,39 @@ where
             std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("Failed to serialize callback registry: {e}"),
+            )
+        })?;
+        // Serialize response type names for precise Python stub annotations
+        let callback_resp_types = self.callback_module.get_response_types();
+        let callback_resp_types_json = serde_json::to_string(&callback_resp_types).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize callback response types: {e}"),
+            )
+        })?;
+        // Serialize request type names for precise Python stub parameter annotations
+        let callback_req_types = self.callback_module.get_request_types();
+        let callback_req_types_json = serde_json::to_string(&callback_req_types).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize callback request types: {e}"),
+            )
+        })?;
+        // Serialize request IR so the child can generate dataclasses
+        let callback_req_ir_json = serde_json::to_string(&self.callback_request_ir).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize callback request IR: {e}"),
+            )
+        })?;
+        // Derive invocation IR for message/response automatically
+        let mut invocation_ir: Vec<crate::codegen_py::Decl> = crate::codegen_py::derive_decls_for::<M>();
+        let mut ok_ir: Vec<crate::codegen_py::Decl> = crate::codegen_py::derive_decls_for::<<M as KameoChildProcessMessage>::Ok>();
+        invocation_ir.append(&mut ok_ir);
+        let invocation_ir_json = serde_json::to_string(&invocation_ir).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize invocation IR: {e}"),
             )
         })?;
         tracing::info!(
@@ -308,6 +354,10 @@ where
         );
         cmd.env("KAMEO_PYTHON_CONFIG", config_json);
         cmd.env("KAMEO_CALLBACK_REGISTRY", &callback_registry_json);
+        cmd.env("KAMEO_CALLBACK_RESP_TYPES", &callback_resp_types_json);
+        cmd.env("KAMEO_CALLBACK_REQ_TYPES", &callback_req_types_json);
+        cmd.env("KAMEO_CALLBACK_REQ_IR", &callback_req_ir_json);
+        cmd.env("KAMEO_INVOCATION_IR", &invocation_ir_json);
         tracing::info!(
             "Set KAMEO_CALLBACK_REGISTRY environment variable with {} bytes",
             callback_registry_json.len()

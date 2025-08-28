@@ -10,6 +10,9 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{error, trace};
 
+type CallbackByteStream = Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>;
+type HandlerFuture = Pin<Box<dyn std::future::Future<Output = Result<CallbackByteStream, PythonExecutionError>> + Send>>;
+
 /// Simple tracing context for now - we can enhance this later
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TracingContext {
@@ -374,6 +377,25 @@ impl DynamicCallbackModule {
     pub fn get_registry(&self) -> &HashMap<String, Vec<String>> {
         &self.module_registry
     }
+
+    /// Build a mapping of full callback path (e.g., "module.HandlerType") to the Rust response type name.
+    /// This enables downstream systems (e.g., Python codegen) to annotate callback stubs precisely.
+    pub fn get_response_types(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for (path, handler) in &self.handlers {
+            out.insert(path.clone(), handler.response_type_name().to_string());
+        }
+        out
+    }
+
+    /// Build a mapping of full callback path to the Rust request type name.
+    pub fn get_request_types(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for (path, handler) in &self.handlers {
+            out.insert(path.clone(), handler.request_type_name().to_string());
+        }
+        out
+    }
 }
 
 impl Default for DynamicCallbackModule {
@@ -411,21 +433,14 @@ pub trait CallbackHandlerTrait: Send + Sync {
 
     fn response_type_name(&self) -> &str;
 
+    fn request_type_name(&self) -> &str;
+
     fn handle_callback_typed(
         &self,
         callback_data: &[u8],
         correlation_id: u64,
         context: TracingContext,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>,
-                        PythonExecutionError,
-                    >,
-                > + Send,
-        >,
-    >;
+    ) -> HandlerFuture;
 }
 
 /// Wrapper that implements CallbackHandlerTrait for TypedCallbackHandler
@@ -452,21 +467,16 @@ where
         std::any::type_name::<H::Response>()
     }
 
+    fn request_type_name(&self) -> &str {
+        std::any::type_name::<C>()
+    }
+
     fn handle_callback_typed(
         &self,
         callback_data: &[u8],
         correlation_id: u64,
         _context: TracingContext,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Pin<Box<dyn Stream<Item = Result<Vec<u8>, PythonExecutionError>> + Send>>,
-                        PythonExecutionError,
-                    >,
-                > + Send,
-        >,
-    > {
+    ) -> HandlerFuture {
         let handler = self.handler.clone();
         let data = callback_data.to_vec();
         let handler_type = self.handler.type_name();

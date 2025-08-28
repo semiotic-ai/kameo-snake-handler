@@ -300,6 +300,8 @@ pub struct ReplySlot<R> {
     stream_sender: Option<mpsc::UnboundedSender<Result<R, PythonExecutionError>>>,
     /// Receiver for streaming response items (used by parent process)
     stream_receiver: Option<mpsc::UnboundedReceiver<Result<R, PythonExecutionError>>>,
+    /// Permit to limit max in-flight requests; dropped when slot is removed
+    inflight_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl<R> ReplySlot<R> {
@@ -308,6 +310,7 @@ impl<R> ReplySlot<R> {
         Self {
             stream_sender: Some(tx),
             stream_receiver: Some(rx),
+            inflight_permit: None,
         }
     }
 
@@ -372,6 +375,10 @@ impl<R> ReplySlot<R> {
         &mut self,
     ) -> Option<mpsc::UnboundedReceiver<Result<R, PythonExecutionError>>> {
         self.stream_receiver.take()
+    }
+
+    pub fn set_inflight_permit(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.inflight_permit = Some(permit);
     }
 }
 
@@ -493,7 +500,7 @@ where
     M: KameoChildProcessMessage + Send + Sync + Clone + 'static,
 {
     /// Channel for sending write requests to the writer task
-    write_tx: tokio::sync::mpsc::UnboundedSender<WriteRequest<M>>,
+    write_tx: tokio::sync::mpsc::Sender<WriteRequest<M>>,
     /// Map of in-flight requests indexed by correlation ID
     in_flight: InFlightMap<Result<M::Ok, PythonExecutionError>>,
     /// Atomic counter for generating unique correlation IDs
@@ -502,6 +509,8 @@ where
     cancellation_token: tokio_util::sync::CancellationToken,
     /// Track pending requests for adaptive throttling
     pending_count: AtomicUsize,
+    /// Limit concurrent in-flight requests to protect IPC channel and slot map
+    inflight_limit: Arc<tokio::sync::Semaphore>,
     /// Phantom data for message type
     _phantom: std::marker::PhantomData<M>,
 }
@@ -522,8 +531,9 @@ where
     ) -> Arc<Self> {
         use crate::error::PythonExecutionError;
         use std::sync::Arc;
-        use tokio::sync::mpsc::unbounded_channel;
-        let (write_tx, mut write_rx) = unbounded_channel::<WriteRequest<M>>();
+        use tokio::sync::mpsc::channel;
+        // Bounded write queue to enforce backpressure across the IPC writer path
+        let (write_tx, mut write_rx) = channel::<WriteRequest<M>>(1024);
         let in_flight: InFlightMap<Result<M::Ok, PythonExecutionError>> = InFlightMap::new();
         let in_flight_reader = in_flight.clone();
         let cancellation_token = tokio_util::sync::CancellationToken::new();
@@ -537,6 +547,12 @@ where
             next_id: AtomicU64::new(1),
             cancellation_token,
             pending_count: AtomicUsize::new(0),
+            inflight_limit: Arc::new(tokio::sync::Semaphore::new(
+                std::env::var("KAMEO_INFLIGHT_LIMIT")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(8192),
+            )),
             _phantom: PhantomData,
         });
 
@@ -619,8 +635,10 @@ where
                                                 trace!(event = "parent_in_flight", action = "sync_item_sent", correlation_id, "Sent sync item through streaming channel");
                                                 slot.close_stream();
                                             } else {
-                                                tracing::error!(event = "parent_in_flight", correlation_id, "Sync reply slot sender missing");
-                                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("sync_missing_sender");
+                                                // Receiver dropped: treat as normal cancellation and clean up
+                                                trace!(event = "parent_in_flight", action = "sync_receiver_dropped", correlation_id, "Sync reply receiver dropped; cleaning up");
+                                                // remove inflight entry below
+                                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("sync_receiver_dropped");
                                             }
                                         } else {
                                             tracing::error!(event = "parent_in_flight", correlation_id, "Received sync reply for unknown correlation id");
@@ -643,8 +661,16 @@ where
                                             if slot.try_send_stream_item(Ok(result.clone())) {
                                                 trace!(event = "parent_in_flight", action = "stream_item_sent", correlation_id, "Sent stream item through streaming channel");
                                     } else {
-                                                tracing::error!(event = "parent_in_flight", correlation_id, "Stream reply slot sender missing");
-                                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("stream_missing_sender");
+                                                // Receiver dropped mid-stream: downgrade to trace and remove inflight entry
+                                                trace!(event = "parent_in_flight", action = "stream_receiver_dropped", correlation_id, "Stream reply receiver dropped; cleaning up");
+                                                // Close and remove to avoid repeated log spam
+                                                if let Some(mut slot) = in_flight_reader.0.get_mut(&correlation_id) {
+                                                    slot.close_stream();
+                                                }
+                                                if in_flight_reader.0.remove(&correlation_id).is_some() {
+                                                    result_clone.pending_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                                }
+                                                metrics::MetricsHandle::parent(std::any::type_name::<M>()).track_error("stream_receiver_dropped");
                                             }
                                         } else {
                                             tracing::error!(event = "parent_in_flight", correlation_id, "Received stream item for unknown correlation id");
@@ -740,6 +766,14 @@ where
     }
 
     pub async fn send(&self, msg: M) -> Result<M::Ok, PythonExecutionError> {
+        // Acquire inflight permit to apply backpressure when too many requests are queued
+        let permit = self
+            .inflight_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| PythonExecutionError::ExecutionError { message: format!("Failed to acquire inflight permit: {e}") })?;
+
         let correlation_id = self.next_correlation_id();
         let msg_type = std::any::type_name::<M>();
 
@@ -752,7 +786,8 @@ where
             tracing_utils::create_ipc_parent_send_span(correlation_id, msg_type, &ipc_message_span);
 
         // Create a reply slot (now always streaming)
-        let slot = ReplySlot::new();
+        let mut slot = ReplySlot::new();
+        slot.set_inflight_permit(permit);
 
         // Insert into in_flight map and track pending count
         {
@@ -777,7 +812,7 @@ where
             correlation_id,
             control: Control::Sync(envelope),
         };
-        if let Err(e) = self.write_tx.send(write_req) {
+        if let Err(e) = self.write_tx.send(write_req).await {
             self.in_flight.0.remove(&correlation_id);
             self.pending_count
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -863,7 +898,7 @@ where
             control_type = "Stream",
             "Sending streaming request"
         );
-        if let Err(e) = self.write_tx.send(write_req) {
+        if let Err(e) = self.write_tx.send(write_req).await {
             self.in_flight.0.remove(&correlation_id);
             self.pending_count
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1388,7 +1423,6 @@ pub struct RuntimeConfig {
     pub worker_threads: Option<usize>,
 }
 
-// 1. Add perform_handshake function for parent/child handshake
 pub async fn perform_handshake<M>(
     conn: &mut (impl AsyncRead + AsyncWrite + Unpin),
     is_parent: bool,

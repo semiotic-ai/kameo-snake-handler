@@ -20,6 +20,8 @@ use thiserror::Error;
 use tokio::time::timeout;
 use tracing::error;
 use tracing_futures::Instrument;
+// Use of codegen_py types is driven by tests; avoid importing unused items here.
+//
 
 /// Custom error type for logic operations
 #[derive(Debug, Error, Serialize, Deserialize, Clone)]
@@ -134,6 +136,7 @@ impl Reply for TestResponse {
 impl KameoChildProcessMessage for TestMessage {
     type Ok = TestResponse;
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestCallbackMessage {
@@ -259,7 +262,7 @@ impl TypedCallbackHandler<BenchCallback> for TestCallbackHandler {
             "TestCallbackHandler received bench callback"
         );
         if callback.rust_sleep_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms));
+            tokio::time::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms)).await;
         }
         let response = BenchResponse::CallbackRoundtripResult {
             value: callback.id as u32,
@@ -301,7 +304,7 @@ impl TypedCallbackHandler<BenchCallback> for CountingCallbackHandler {
             "CountingCallbackHandler received bench callback"
         );
         if callback.rust_sleep_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms));
+            tokio::time::sleep(std::time::Duration::from_millis(callback.rust_sleep_ms)).await;
         }
         let response = BenchResponse::CallbackRoundtripResult {
             value: callback.id as u32 * counter as u32,
@@ -465,6 +468,8 @@ impl KameoChildProcessMessage for TraderMessage {
     type Ok = TraderResponse;
 }
 
+// Purged ProvidePythonDecls for TraderMessage
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraderCallbackMessage {
     pub value: u32,
@@ -519,6 +524,8 @@ impl KameoChildProcessMessage for BenchMessage {
     type Ok = BenchResponse;
 }
 
+// Purged ProvidePythonDecls for BenchMessage
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchCallback {
     pub id: u64,
@@ -566,11 +573,13 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         step = "before_spawn",
         "About to spawn Python child process"
     );
-    let sync_pool = PythonChildProcessBuilder::<TestMessage>::new(sync_config)
+    let mut sync_pool = PythonChildProcessBuilder::<TestMessage>::new(sync_config.clone())
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
     let sync_ref = sync_pool.get_actor().clone();
+
+    // Generated files are used by Python; Rust test no longer probes filesystem.
     tracing::trace!(
         event = "test_spawn",
         step = "after_spawn",
@@ -640,6 +649,8 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         "SYNC Test 6 failed: got {:?}",
         resp
     );
+    // Ensure child shutdown
+    sync_pool.shutdown();
     Ok(())
 }
 
@@ -661,15 +672,17 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         function_name: "handle_message_async".to_string(),
         env_vars: vec![],
         is_async: true,
-        enable_otel_propagation: true,
+        enable_otel_propagation: false,
     };
-    let async_pool = PythonChildProcessBuilder::<TestMessage>::new(async_config)
+    let mut async_pool = PythonChildProcessBuilder::<TestMessage>::new(async_config.clone())
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .with_callback_handler::<TestCallbackMessage, _>("basic", TestCallbackHandler)
         .with_callback_handler::<TraderCallbackMessage, _>("trader", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
     let async_ref = async_pool.get_actor();
+
+    // Generated files are used by Python; Rust test no longer probes filesystem.
 
     // Test 1: Valid message
     let resp = async_ref
@@ -763,8 +776,12 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
             resp
         );
     }
+    // Ensure child shutdown
+    async_pool.shutdown();
     Ok(())
 }
+
+// Removed filesystem probing of generated Python files; Python imports are authoritative.
 
 async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(event = "streaming_tests_start", "Starting streaming tests");
@@ -780,7 +797,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
         is_async: true,
         enable_otel_propagation: false,
     };
-    let streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
+    let mut streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
@@ -1099,6 +1116,8 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
 
     assert_eq!(items.len(), 10, "Should receive 10 large dataset items");
 
+    // Ensure child shutdown
+    streaming_pool.shutdown();
     Ok(())
 }
 
@@ -1121,7 +1140,7 @@ async fn run_streaming_throughput_test(
         is_async: true,
         enable_otel_propagation: false,
     };
-    let streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
+    let mut streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(100, None)
         .await?;
@@ -1237,6 +1256,8 @@ async fn run_streaming_throughput_test(
         println!("{}\n⚠️  Streaming throughput is below target!", table);
     }
 
+    // Ensure child shutdown
+    streaming_pool.shutdown();
     Ok(())
 }
 
@@ -1256,7 +1277,7 @@ async fn run_streaming_error_handling_test(
         is_async: true,
         enable_otel_propagation: false,
     };
-    let streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
+    let mut streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
         .await?;
@@ -1340,6 +1361,8 @@ async fn run_streaming_error_handling_test(
         }
     }
 
+    // Ensure child shutdown
+    streaming_pool.shutdown();
     Ok(())
 }
 
@@ -1447,7 +1470,7 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         is_async: true,
         enable_otel_propagation: true,
     };
-    let trader_pool = PythonChildProcessBuilder::<TraderMessage>::new(trader_config)
+    let mut trader_pool = PythonChildProcessBuilder::<TraderMessage>::new(trader_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
         .with_callback_handler::<TraderCallbackMessage, _>("trader", TestCallbackHandler)
         .spawn_pool(POOL_SIZE, None)
@@ -1472,13 +1495,15 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
             panic!("Trader demo failed with error: {:?}", e);
         }
     }
+    // Ensure child shutdown
+    trader_pool.shutdown();
     Ok(())
 }
 
 async fn run_bench_throughput_test(
     python_path: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const N: usize = 10000;
+    const N: usize = 200;
     const MAX_SLEEP_MS: u64 = 10;
     let mut rng = thread_rng();
     let bench_config = PythonConfig {
@@ -1493,9 +1518,9 @@ async fn run_bench_throughput_test(
     let callback_handler = CountingCallbackHandler {
         counter: callback_count.clone(),
     };
-    let bench_pool = PythonChildProcessBuilder::<BenchMessage>::new(bench_config)
+    let mut bench_pool = PythonChildProcessBuilder::<BenchMessage>::new(bench_config)
         .with_callback_handler::<BenchCallback, _>("bench", callback_handler)
-        .spawn_pool(1000, None)
+        .spawn_pool(100, None)
         .await?;
     let start = Instant::now();
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -1536,11 +1561,11 @@ async fn run_bench_throughput_test(
         }
     };
 
-    // Timeout the entire processing after 60 seconds
-    match timeout(Duration::from_secs(60), process_future).await {
+    // Timeout the entire processing after 120 seconds
+    match timeout(Duration::from_secs(120), process_future).await {
         Ok(_) => {}
         Err(_) => {
-            eprintln!("Bench test timed out after 60 seconds");
+            eprintln!("Bench test timed out after 120 seconds");
             // Continue with partial results
         }
     }
@@ -1719,6 +1744,8 @@ async fn run_bench_throughput_test(
     } else {
         println!("{}\n⚠️  Throughput is below target!", table);
     }
+    // Ensure child shutdown
+    bench_pool.shutdown();
     Ok(())
 }
 

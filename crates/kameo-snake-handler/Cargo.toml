@@ -3,6 +3,14 @@ name = "kameo-snake-handler"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["python"]
+python = [
+    "dep:pyo3",
+    "dep:pyo3-async-runtimes",
+    "kameo-child-process/python",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = "0.1"
@@ -12,7 +20,7 @@ serde-brief = { workspace = true }
 either = "1.13.0"
 futures = { workspace = true }
 kameo = { workspace = true }
-kameo-child-process = { path = "../kameo-child-process" }
+kameo-child-process = { path = "../kameo-child-process", default-features = false }
 kameo_macros = { workspace = true }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.12"
@@ -21,10 +29,11 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-stdout = { workspace = true }
-pyo3 = { version = "0.25.1", features = ["auto-initialize"] }
-pyo3-async-runtimes = { workspace = true }
+pyo3 = { version = "0.25.1", features = ["auto-initialize"], optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde-reflection = "0.3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -37,6 +46,5 @@ tokio-util = "0.7.16"
 
 
 [dev-dependencies]
-kameo-snake-testing = { path = "../kameo-snake-testing" }
 proptest = { workspace = true }
 tokio-test = "0.4"

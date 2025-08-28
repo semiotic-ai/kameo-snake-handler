@@ -152,7 +152,9 @@ mod tests {
         }
     }
 
-    fn integer_strategy() -> BoxedStrategy<(i8, i16, i32, i64, u8, u16, u32, u64)> {
+    type Ints = (i8, i16, i32, i64, u8, u16, u32, u64);
+
+    fn integer_strategy() -> BoxedStrategy<Ints> {
         (
             any::<i8>(),
             any::<i16>(),
@@ -395,8 +397,9 @@ mod tests {
             .boxed()
     }
 
-    fn nested_collection_strategy(
-    ) -> BoxedStrategy<(Vec<Vec<Vec<i32>>>, HashMap<String, HashMap<String, i32>>)> {
+    type Nested = (Vec<Vec<Vec<i32>>>, HashMap<String, HashMap<String, i32>>);
+
+    fn nested_collection_strategy() -> BoxedStrategy<Nested> {
         let nested_vec = Just(vec![vec![vec![1, 2, 3]], vec![vec![4, 5, 6]]]);
         let nested_map = {
             let mut inner = HashMap::new();
