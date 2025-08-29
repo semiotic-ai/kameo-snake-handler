@@ -9,10 +9,10 @@ except ImportError:
     from typing_extensions import TypeGuard  # fallback
 
 class TestCallbackMessage: ...
+class TraderCallbackMessage: ...
 class ComplexCallbackMessage: ...
 class Dimensions: ...
 class EventItem: ...
-class TraderCallbackMessage: ...
 
 @dataclass
 class TestCallbackMessage:
@@ -33,6 +33,26 @@ def from_wire_test_callback_message_strict(d: Dict[str, Any]) -> TestCallbackMes
     if unknown:
         raise ValueError("Unknown keys for TestCallbackMessage: " + repr(unknown))
     return from_wire_test_callback_message(d)
+
+@dataclass
+class TraderCallbackMessage:
+    value: int
+def make_trader_callback_message(value) -> TraderCallbackMessage:
+    return TraderCallbackMessage(value=value)
+def from_wire_trader_callback_message(d: Dict[str, Any]) -> TraderCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
+    return TraderCallbackMessage(value=d.get("value"))
+def to_wire_trader_callback_message(m: TraderCallbackMessage) -> Dict[str, Any]:
+    return {"value": m.value}
+def from_wire_trader_callback_message_strict(d: Dict[str, Any]) -> TraderCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
+    allowed = {"value"}
+    unknown = set(d.keys()) - allowed
+    if unknown:
+        raise ValueError("Unknown keys for TraderCallbackMessage: " + repr(unknown))
+    return from_wire_trader_callback_message(d)
 
 @dataclass
 class ComplexCallbackMessage:
@@ -99,24 +119,4 @@ def from_wire_event_item_strict(d: Dict[str, Any]) -> EventItem:
     if unknown:
         raise ValueError("Unknown keys for EventItem: " + repr(unknown))
     return from_wire_event_item(d)
-
-@dataclass
-class TraderCallbackMessage:
-    value: int
-def make_trader_callback_message(value) -> TraderCallbackMessage:
-    return TraderCallbackMessage(value=value)
-def from_wire_trader_callback_message(d: Dict[str, Any]) -> TraderCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
-    return TraderCallbackMessage(value=d.get("value"))
-def to_wire_trader_callback_message(m: TraderCallbackMessage) -> Dict[str, Any]:
-    return {"value": m.value}
-def from_wire_trader_callback_message_strict(d: Dict[str, Any]) -> TraderCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
-    allowed = {"value"}
-    unknown = set(d.keys()) - allowed
-    if unknown:
-        raise ValueError("Unknown keys for TraderCallbackMessage: " + repr(unknown))
-    return from_wire_trader_callback_message(d)
 

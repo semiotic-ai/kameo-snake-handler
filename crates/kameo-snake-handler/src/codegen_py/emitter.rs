@@ -361,16 +361,16 @@ fn emit_enum(out: &mut String, e: &EnumDecl) {
             EnumVariant::Unit { name } => {
                 writeln!(out, "    {}: Callable[[], R]", name).unwrap();
             }
-            EnumVariant::Newtype { name, .. } => {
-                writeln!(out, "    {}: Callable[[Any], R]", name).unwrap();
+            EnumVariant::Newtype { name, ty } => {
+                let t = py_type(ty);
+                writeln!(out, "    {}: Callable[[{}], R]", name, t).unwrap();
             }
             EnumVariant::Tuple { name, tys } => {
-                let arity = tys.len();
-                let args = std::iter::repeat_n("Any", arity).collect::<Vec<_>>().join(", ");
+                let args = tys.iter().map(|t| py_type(t)).collect::<Vec<_>>().join(", ");
                 writeln!(out, "    {}: Callable[[{}], R]", name, args).unwrap();
             }
             EnumVariant::Struct { name, fields } => {
-                let args = fields.iter().map(|_| "Any").collect::<Vec<_>>().join(", ");
+                let args = fields.iter().map(|(_, t)| py_type(t)).collect::<Vec<_>>().join(", ");
                 writeln!(out, "    {}: Callable[[{}], R]", name, args).unwrap();
             }
         }

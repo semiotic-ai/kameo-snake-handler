@@ -8,28 +8,8 @@ try:
 except ImportError:
     from typing_extensions import TypeGuard  # fallback
 
-class TestCallbackMessage: ...
 class TraderCallbackMessage: ...
-
-@dataclass
-class TestCallbackMessage:
-    value: int
-def make_test_callback_message(value) -> TestCallbackMessage:
-    return TestCallbackMessage(value=value)
-def from_wire_test_callback_message(d: Dict[str, Any]) -> TestCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
-    return TestCallbackMessage(value=d.get("value"))
-def to_wire_test_callback_message(m: TestCallbackMessage) -> Dict[str, Any]:
-    return {"value": m.value}
-def from_wire_test_callback_message_strict(d: Dict[str, Any]) -> TestCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
-    allowed = {"value"}
-    unknown = set(d.keys()) - allowed
-    if unknown:
-        raise ValueError("Unknown keys for TestCallbackMessage: " + repr(unknown))
-    return from_wire_test_callback_message(d)
+class TestCallbackMessage: ...
 
 @dataclass
 class TraderCallbackMessage:
@@ -50,4 +30,24 @@ def from_wire_trader_callback_message_strict(d: Dict[str, Any]) -> TraderCallbac
     if unknown:
         raise ValueError("Unknown keys for TraderCallbackMessage: " + repr(unknown))
     return from_wire_trader_callback_message(d)
+
+@dataclass
+class TestCallbackMessage:
+    value: int
+def make_test_callback_message(value) -> TestCallbackMessage:
+    return TestCallbackMessage(value=value)
+def from_wire_test_callback_message(d: Dict[str, Any]) -> TestCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
+    return TestCallbackMessage(value=d.get("value"))
+def to_wire_test_callback_message(m: TestCallbackMessage) -> Dict[str, Any]:
+    return {"value": m.value}
+def from_wire_test_callback_message_strict(d: Dict[str, Any]) -> TestCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
+    allowed = {"value"}
+    unknown = set(d.keys()) - allowed
+    if unknown:
+        raise ValueError("Unknown keys for TestCallbackMessage: " + repr(unknown))
+    return from_wire_test_callback_message(d)
 

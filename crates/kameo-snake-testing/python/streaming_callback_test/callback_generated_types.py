@@ -34,14 +34,14 @@ async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerato
     async for item in iterator:
         yield item
 
-async def test__streaming_callback(req: 'ComplexCallbackMessage') -> AsyncGenerator['ComplexStreamResponse', None]:
-    it = getattr(kameo, "test").__getattribute__("StreamingCallback")( _to_wire(req) )
+async def basic__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
+    it = getattr(kameo, "basic").__getattribute__("TestCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item
 
-async def basic__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
-    it = getattr(kameo, "basic").__getattribute__("TestCallback")( _to_wire(req) )
+async def test__streaming_callback(req: 'ComplexCallbackMessage') -> AsyncGenerator['ComplexStreamResponse', None]:
+    it = getattr(kameo, "test").__getattribute__("StreamingCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item

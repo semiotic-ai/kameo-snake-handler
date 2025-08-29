@@ -30,14 +30,14 @@ async def test__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['Tes
     async for item in iterator:
         yield item
 
-async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
-    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
+async def basic__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
+    it = getattr(kameo, "basic").__getattribute__("TestCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item
 
-async def basic__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
-    it = getattr(kameo, "basic").__getattribute__("TestCallback")( _to_wire(req) )
+async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
+    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item
