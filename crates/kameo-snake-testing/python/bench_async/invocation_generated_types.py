@@ -171,11 +171,11 @@ def to_wire_bench_response(m: BenchResponse) -> Dict[str, Any]:
     raise TypeError(f"Not a BenchResponse instance: {m!r}")
 
 class BenchResponseHandlers(TypedDict, total=False):
-    Power: Callable[[Any], R]
-    CategoryBonus: Callable[[Any], R]
-    CompetitionResult: Callable[[Any], R]
-    RewardResult: Callable[[Any, Any], R]
-    CallbackRoundtripResult: Callable[[Any], R]
+    Power: Callable[[int], R]
+    CategoryBonus: Callable[[int], R]
+    CompetitionResult: Callable[[bool], R]
+    RewardResult: Callable[[int, int], R]
+    CallbackRoundtripResult: Callable[[int], R]
     default: Callable[[BenchResponse], R]
 def match_bench_response(m: BenchResponse, **handlers: Unpack[BenchResponseHandlers]) -> Any:
     if isinstance(m, BenchResponsePower):

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "kameo-pyo3-async-test"]
+members = ["crates/*", "kameo-pyo3-async-test", "crates/kameo-python-ir-derive"]
 resolver = "2"
 
 [workspace.package]

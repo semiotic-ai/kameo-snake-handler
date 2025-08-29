@@ -33,7 +33,7 @@ pyo3 = { version = "0.25.1", features = ["auto-initialize"], optional = true }
 pyo3-async-runtimes = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde-reflection = "0.3"
+kameo-python-ir-derive = { path = "../kameo-python-ir-derive" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

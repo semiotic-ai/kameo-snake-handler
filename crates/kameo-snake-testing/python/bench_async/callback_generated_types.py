@@ -26,13 +26,3 @@ async def bench__bench_callback(req: 'BenchCallback') -> AsyncGenerator['BenchRe
     async for item in iterator:
         yield item
 
-if inv is not None:
-    try:
-        match_test_response = inv.match_test_response
-    except Exception: pass
-    try:
-        match_trader_response = inv.match_trader_response
-    except Exception: pass
-    try:
-        match_bench_response = inv.match_bench_response
-    except Exception: pass

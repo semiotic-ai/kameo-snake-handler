@@ -279,16 +279,16 @@ def to_wire_test_message(m: TestMessage) -> Dict[str, Any]:
     raise TypeError(f"Not a TestMessage instance: {m!r}")
 
 class TestMessageHandlers(TypedDict, total=False):
-    CalculatePower: Callable[[Any], R]
-    CalculateCategoryBonus: Callable[[Any, Any], R]
-    CalculateCompetitionResult: Callable[[Any, Any], R]
-    CalculateReward: Callable[[Any, Any], R]
-    CallbackRoundtrip: Callable[[Any], R]
-    StreamFibonacci: Callable[[Any], R]
-    StreamRandomNumbers: Callable[[Any, Any], R]
-    StreamWithDelays: Callable[[Any, Any], R]
-    StreamWithErrors: Callable[[Any, Any], R]
-    StreamLargeDataset: Callable[[Any], R]
+    CalculatePower: Callable[[int], R]
+    CalculateCategoryBonus: Callable[[str, int], R]
+    CalculateCompetitionResult: Callable[[int, int], R]
+    CalculateReward: Callable[[int, int], R]
+    CallbackRoundtrip: Callable[[int], R]
+    StreamFibonacci: Callable[[int], R]
+    StreamRandomNumbers: Callable[[int, int], R]
+    StreamWithDelays: Callable[[int, int], R]
+    StreamWithErrors: Callable[[int, Optional[int]], R]
+    StreamLargeDataset: Callable[[int], R]
     default: Callable[[TestMessage], R]
 def match_test_message(m: TestMessage, **handlers: Unpack[TestMessageHandlers]) -> Any:
     if isinstance(m, TestMessageCalculatePower):
@@ -591,14 +591,14 @@ def to_wire_test_response(m: TestResponse) -> Dict[str, Any]:
     raise TypeError(f"Not a TestResponse instance: {m!r}")
 
 class TestResponseHandlers(TypedDict, total=False):
-    Power: Callable[[Any], R]
-    CategoryBonus: Callable[[Any], R]
-    CompetitionResult: Callable[[Any], R]
-    RewardResult: Callable[[Any, Any], R]
-    CallbackRoundtripResult: Callable[[Any], R]
-    StreamItem: Callable[[Any, Any], R]
-    StreamError: Callable[[Any, Any], R]
-    StreamComplete: Callable[[Any], R]
+    Power: Callable[[int], R]
+    CategoryBonus: Callable[[int], R]
+    CompetitionResult: Callable[[bool], R]
+    RewardResult: Callable[[int, int], R]
+    CallbackRoundtripResult: Callable[[int], R]
+    StreamItem: Callable[[int, int], R]
+    StreamError: Callable[[int, str], R]
+    StreamComplete: Callable[[int], R]
     default: Callable[[TestResponse], R]
 def match_test_response(m: TestResponse, **handlers: Unpack[TestResponseHandlers]) -> Any:
     if isinstance(m, TestResponsePower):

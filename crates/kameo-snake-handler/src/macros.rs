@@ -351,8 +351,11 @@ macro_rules! setup_python_subprocess_system {
                             // Parse callback request IR (path -> Vec<Decl>) to generate dataclasses for request types
                             let req_ir_json = std::env::var("KAMEO_CALLBACK_REQ_IR").unwrap_or_else(|_| "{}".to_string());
                             let req_ir_map: std::collections::HashMap<String, Vec<kameo_snake_handler::codegen_py::Decl>> = serde_json::from_str(&req_ir_json).unwrap_or_default();
-                            // Optional: future: full callback IR JSON to generate unions for callback responses
-                            let callback_ir_map: std::collections::HashMap<String, Vec<()>> = std::collections::HashMap::new();
+                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", req_ir_map_keys = ?req_ir_map.keys().collect::<Vec<_>>(), "Parsed callback request IR");
+                            // Parse callback response IR (path -> Vec<Decl>) to generate dataclasses and match functions for response types
+                            let resp_ir_json = std::env::var("KAMEO_CALLBACK_RESP_IR").unwrap_or_else(|_| "{}".to_string());
+                            let resp_ir_map: std::collections::HashMap<String, Vec<kameo_snake_handler::codegen_py::Decl>> = serde_json::from_str(&resp_ir_json).unwrap_or_default();
+                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", resp_ir_map_keys = ?resp_ir_map.keys().collect::<Vec<_>>(), "Parsed callback response IR");
                             // sys.modules and kameo_mod
                             let sys = py.import("sys").expect("import sys");
                             let modules = sys.getattr("modules").expect("get sys.modules");
@@ -367,13 +370,6 @@ macro_rules! setup_python_subprocess_system {
                             };
 
                             // Create dynamic module structure based on callback registry
-                            // Ensure a scoped tracing subscriber is active so codegen debug logs are emitted
-                            let _log_guard = {
-                                let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-                                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-                                let subscriber = tracing_subscriber::fmt().with_env_filter(env_filter).finish();
-                                Some(tracing::subscriber::set_default(subscriber))
-                            };
                             tracing::info!("Starting dynamic module creation for {} modules", callback_registry.len());
                             for (module_name, handler_types) in &callback_registry {
                                 tracing::info!("Creating Python module: kameo.{} with {} handler types", module_name, handler_types.len());
@@ -423,20 +419,24 @@ macro_rules! setup_python_subprocess_system {
                                 sys_path.call_method1("append", (path,)).expect("append python_path");
                                 debug!(added_path = %path, "Appended to sys.path");
                             }
-                            // Determine write directory per module: write into the module's PACKAGE directory.
-                            // For dotted paths like "pkg.subpkg.module", we use pkg/subpkg, not the last segment (which may be a file module).
+                            // Determine write directory per module: write into the module's package directory
                             let path0 = sys_path.get_item(0).expect("sys.path[0]").extract::<String>().expect("path str");
                             let default_dir = if let Some(dir) = config.python_path.last() {
                                 std::path::PathBuf::from(dir)
                             } else {
                                 std::path::PathBuf::from(&path0)
                             };
-                            let parts: Vec<&str> = config.module_name.split('.').collect();
-                            let package_parts: &[&str] = if parts.len() > 1 { &parts[..parts.len()-1] } else { &parts[..] };
-                            let mut module_dir = default_dir.clone();
-                            for seg in package_parts { module_dir.push(seg); }
+                            
+                            // Extract package name from module_name (e.g., "agentflow_agents.a2a_agent" -> "agentflow_agents")
+                            let package_name = config.module_name.split('.').next().unwrap_or(&config.module_name);
+                            let module_dir = default_dir.join(package_name);
                             std::fs::create_dir_all(&module_dir).expect("mkdir module package dir");
-                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", dir = %module_dir.display(), module = %config.module_name, "Ensured Python package directory for generated files");
+                            
+                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", 
+                                dir = %module_dir.display(), 
+                                module = %config.module_name, 
+                                package = %package_name,
+                                "Ensured Python package directory for generated files");
 
                             // Deterministic module names so user code can import them directly
                             let types_mod = "invocation_generated_types".to_string();
@@ -457,23 +457,72 @@ macro_rules! setup_python_subprocess_system {
                                 }
                             }
                             let stubs_src = kameo_snake_handler::codegen_py::emit_callback_module(&stubs_mod, &types_mod, &callback_stubs);
-                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", path = %stubs_path.display(), module = %stubs_mod, "Writing generated callback module");
                             std::fs::write(&stubs_path, stubs_src).expect("write stubs module");
-                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", path = %stubs_path.display(), module = %stubs_mod, "Wrote generated callback module");
-                            std::env::set_var("KAMEO_GEN_CALLBACK_PATH", stubs_path.display().to_string());
-                            // If IR is provided for any callback path in this package, emit a separate module
-                            if !req_ir_map.is_empty() {
-                                // Concatenate all decls (basic merge)
-                                let mut all_decls: Vec<kameo_snake_handler::codegen_py::Decl> = Vec::new();
+                            // If callback IR is provided, regenerate callback_generated_types.py with both wrappers and types
+                            let has_callback_ir = !req_ir_map.is_empty() || !resp_ir_map.is_empty();
+                            tracing::debug!(target: "kameo_snake_handler::macros::codegen", 
+                                has_callback_ir = %has_callback_ir, 
+                                req_ir_map_empty = %req_ir_map.is_empty(), 
+                                resp_ir_map_empty = %resp_ir_map.is_empty(), 
+                                "Checking if callback_generated_types.py should include callback types");
+                            
+                            if has_callback_ir {
+                                // Merge all callback decls (request + response)
+                                let mut all_callback_decls: Vec<kameo_snake_handler::codegen_py::Decl> = Vec::new();
+                                
+                                // Add request types
                                 for decls in req_ir_map.values() {
-                                    all_decls.extend_from_slice(decls);
+                                    all_callback_decls.extend_from_slice(decls);
                                 }
-                                let req_types_src = kameo_snake_handler::codegen_py::emit_python_module("callback_request_types", &all_decls);
-                                let req_types_path = module_dir.join("callback_request_types.py");
-                                tracing::debug!(target: "kameo_snake_handler::macros::codegen", path = %req_types_path.display(), module = "callback_request_types", "Writing generated callback request types module");
-                                std::fs::write(&req_types_path, req_types_src).expect("write callback request types module");
-                                tracing::debug!(target: "kameo_snake_handler::macros::codegen", path = %req_types_path.display(), module = "callback_request_types", "Wrote generated callback request types module");
-                                std::env::set_var("KAMEO_GEN_CALLBACK_REQ_PATH", req_types_path.display().to_string());
+                                
+                                // Add response types
+                                for decls in resp_ir_map.values() {
+                                    all_callback_decls.extend_from_slice(decls);
+                                }
+                                
+                                // Generate callback types and strip out the problematic __future__ import
+                                let mut callback_types_src = kameo_snake_handler::codegen_py::emit_python_module("callback_types", &all_callback_decls);
+                                
+                                // Remove the __future__ import and other imports since they're already in the wrapper file
+                                let lines: Vec<&str> = callback_types_src.lines().collect();
+                                let mut filtered_lines: Vec<&str> = Vec::new();
+                                let mut skip_next_indented = false;
+                                
+                                for line in lines.iter() {
+                                    if line.contains("from __future__") || 
+                                       line.contains("try:") || 
+                                       line.contains("except ImportError:") || 
+                                       line.contains("TypeGuard") || 
+                                       line.contains("# package:") {
+                                        skip_next_indented = true;
+                                        continue;
+                                    }
+                                    
+                                    // If we're skipping indented lines and this line is indented, skip it
+                                    if skip_next_indented && line.starts_with("    ") {
+                                        continue;
+                                    }
+                                    
+                                    // Reset the flag when we hit a non-indented line
+                                    if !line.starts_with("    ") {
+                                        skip_next_indented = false;
+                                    }
+                                    
+                                    filtered_lines.push(line);
+                                }
+                                
+                                let clean_callback_types = filtered_lines.join("\n");
+                                
+                                // Read the existing file and append the clean types
+                                let existing_content = std::fs::read_to_string(&stubs_path).expect("read existing callback_generated_types.py");
+                                let enhanced_content = format!("{}\n\n# Callback type definitions\n{}", existing_content, clean_callback_types);
+                                
+                                std::fs::write(&stubs_path, enhanced_content).expect("write enhanced callback generated types module");
+                                tracing::debug!(target: "kameo_snake_handler::macros::codegen", 
+                                    path = %stubs_path.display(), 
+                                    module = %stubs_mod,
+                                    decl_count = all_callback_decls.len(),
+                                    "Enhanced callback_generated_types.py with callback types");
                             }
                             // If callback IR is available for any paths in this module, append generated unions to the stubs file for strict typing
                             // (ir emission for callbacks can be added when IR is provided from parent)
@@ -488,10 +537,7 @@ macro_rules! setup_python_subprocess_system {
                                 let decls: Vec<kameo_snake_handler::codegen_py::Decl> = serde_json::from_str(&inv_ir_json).unwrap_or_default();
                                 let types_src = emit_python_module(&types_mod, &decls);
                                 let types_path = module_dir.join(format!("{}.py", types_mod));
-                                tracing::debug!(target: "kameo_snake_handler::macros::codegen", path = %types_path.display(), module = %types_mod, "Writing generated invocation types module");
                                 std::fs::write(&types_path, types_src).expect("write types module");
-                                tracing::debug!(target: "kameo_snake_handler::macros::codegen", path = %types_path.display(), module = %types_mod, "Wrote generated invocation types module");
-                                std::env::set_var("KAMEO_GEN_INVOCATION_PATH", types_path.display().to_string());
                                 // No test-type specific additions; depend only on IR-generated content
                             }
 

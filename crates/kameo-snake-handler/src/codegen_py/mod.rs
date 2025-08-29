@@ -15,96 +15,40 @@ pub use ir::{Decl, EnumDecl, EnumVariant, StructDecl, TypeRef};
 pub use emitter::emit_python_module;
 pub use callback::{CallbackStub, emit_callback_module};
 
-// --- Automatic IR derivation from serde-reflection ---
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use serde_reflection::{ContainerFormat, Format, Registry, Tracer, TracerConfig, VariantFormat, Samples};
-
-fn builtin_of(format: &Format) -> Option<String> {
-    Some(match format {
-        Format::Unit => "any".to_string(),
-        Format::Bool => "bool".to_string(),
-        Format::I8 | Format::I16 | Format::I32 | Format::I64 | Format::I128 |
-        Format::U8 | Format::U16 | Format::U32 | Format::U64 | Format::U128 => "int".to_string(),
-        Format::F32 | Format::F64 => "float".to_string(),
-        Format::Char | Format::Str => "str".to_string(),
-        Format::Bytes => "bytes".to_string(),
-        _ => return None,
-    })
+/// Trait allowing types to provide compile-time IR via a proc-macro derive.
+pub trait ProvideIr {
+    fn provide_ir() -> Vec<Decl>;
 }
+// --- ProvideIr blanket impls for primitives and common containers ---
+impl ProvideIr for bool { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for i8 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for i16 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for i32 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for i64 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for i128 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for u8 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for u16 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for u32 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for u64 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for u128 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for f32 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for f64 { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for String { fn provide_ir() -> Vec<Decl> { vec![] } }
+impl ProvideIr for serde_json::Value { fn provide_ir() -> Vec<Decl> { vec![] } }
 
-fn to_typeref(_registry: &Registry, f: &Format) -> TypeRef {
-    if let Some(b) = builtin_of(f) { return TypeRef::Builtin(b); }
-    match f {
-        Format::Option(inner) => TypeRef::Option(Box::new(to_typeref(_registry, inner))),
-        Format::Seq(inner) => TypeRef::List(Box::new(to_typeref(_registry, inner))),
-        Format::Map{key, value} => {
-            // Constrain to dict[str, T] when key can be string; else Dict[Any]
-            let v = to_typeref(_registry, value);
-            if matches!(key.as_ref(), Format::Str | Format::Char) { TypeRef::Dict(Box::new(v)) } else { TypeRef::Dict(Box::new(TypeRef::Builtin("any".to_string()))) }
-        }
-        Format::Tuple(_fields) => {
-            // Represent as Named tuple class if needed; for now, use List[Any]
-            TypeRef::List(Box::new(TypeRef::Builtin("any".to_string())))
-        }
-        Format::TupleArray{ content, .. } => TypeRef::List(Box::new(to_typeref(_registry, content))),
-        Format::TypeName(name) => TypeRef::Named(short_name(name)),
-        _ => TypeRef::Builtin("any".to_string()),
+impl<T: ProvideIr> ProvideIr for Option<T> {
+    fn provide_ir() -> Vec<Decl> {
+        T::provide_ir()
     }
 }
-
-fn short_name(full: &str) -> String { full.rsplit("::").next().unwrap_or(full).to_string() }
-
-fn container_to_decl(name: &str, c: &ContainerFormat) -> Decl {
-    let nm = short_name(name);
-    match c {
-        ContainerFormat::Struct(fields) => {
-            let mut f = Vec::with_capacity(fields.len());
-            for field in fields {
-                f.push((field.name.clone(), to_typeref(&Registry::default(), &field.value)));
-            }
-            Decl::Struct(StructDecl{ name: nm, fields: f })
-        }
-        ContainerFormat::Enum(variants) => {
-            let mut vs = Vec::new();
-            // variants is a map from index to Named<VariantFormat>
-            for (_idx, named) in variants.iter() {
-                let vname = named.name.to_string();
-                match &named.value {
-                    VariantFormat::Unit => vs.push(EnumVariant::Unit{ name: vname }),
-                    VariantFormat::NewType(fmt) => vs.push(EnumVariant::Newtype{ name: vname, ty: to_typeref(&Registry::default(), fmt) }),
-                    VariantFormat::Tuple(fmts) => {
-                        let mut tys = Vec::with_capacity(fmts.len());
-                        for fmt in fmts { tys.push(to_typeref(&Registry::default(), fmt)); }
-                        vs.push(EnumVariant::Tuple{ name: named.name.to_string(), tys });
-                    }
-                    VariantFormat::Struct(fields) => {
-                        let mut f = Vec::with_capacity(fields.len());
-                        for fld in fields { f.push((fld.name.clone(), to_typeref(&Registry::default(), &fld.value))); }
-                        vs.push(EnumVariant::Struct{ name: named.name.to_string(), fields: f });
-                    }
-                    VariantFormat::Variable(_) => {
-                        // Fallback: treat as unit for unknown-at-this-stage
-                        vs.push(EnumVariant::Unit{ name: vname });
-                    }
-                }
-            }
-            Decl::Enum(EnumDecl{ name: nm, variants: vs })
-        }
-        _ => {
-            // Fallback: treat as opaque struct
-            Decl::Struct(StructDecl{ name: nm, fields: vec![] })
-        }
-    }
+impl<T: ProvideIr> ProvideIr for Vec<T> {
+    fn provide_ir() -> Vec<Decl> { T::provide_ir() }
 }
-
-/// Derive IR for all named containers reachable from the given type `T` using serde-reflection.
-pub fn derive_decls_for<T: Serialize + DeserializeOwned>() -> Vec<Decl> {
-    let mut tracer = Tracer::new(TracerConfig::default());
-    let samples = Samples::new();
-    let _ = tracer.trace_type::<T>(&samples);
-    let registry = tracer.registry().unwrap_or_default();
-    registry.iter().map(|(name, cf)| container_to_decl(name, cf)).collect()
+impl<T: ProvideIr> ProvideIr for std::collections::HashMap<String, T> {
+    fn provide_ir() -> Vec<Decl> { T::provide_ir() }
+}
+impl<T: ProvideIr> ProvideIr for std::collections::BTreeMap<String, T> {
+    fn provide_ir() -> Vec<Decl> { T::provide_ir() }
 }
 
 #[cfg(test)]
@@ -592,6 +536,7 @@ mod tests {
         let _ = std::fs::remove_file(&module_path);
         let _ = std::fs::remove_dir(&dir);
     }
+
 }
 
 

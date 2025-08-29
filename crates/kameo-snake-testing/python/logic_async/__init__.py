@@ -72,7 +72,7 @@ async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
             async def on_callback_roundtrip(value: int) -> gen.TestResponse:
-                from .callback_request_types import TestCallbackMessage
+                from .callback_generated_types import TestCallbackMessage
                 iterator = cb.test__test_callback(TestCallbackMessage(value=int(value)))
                 async for _ in iterator:
                     break

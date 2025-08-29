@@ -12,14 +12,12 @@ use tokio_util::sync::CancellationToken;
 /// NOTE: SubprocessParentActor is only valid as an in-process actor with DelegatedReply. If used as a child process actor, it will panic.
 pub struct ParentActorLoopConfig {
     pub max_concurrency: usize,
-    pub inflight_limit: Option<usize>,
 }
 
 impl Default for ParentActorLoopConfig {
     fn default() -> Self {
         Self {
             max_concurrency: 10_000,
-            inflight_limit: None,
         }
     }
 }
@@ -120,13 +118,14 @@ where
 /// 6. **Shutdown**: Graceful cleanup of processes and resources
 pub struct PythonChildProcessBuilder<M>
 where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
+    M: KameoChildProcessMessage + crate::codegen_py::ProvideIr + Send + Sync + 'static,
     <M as KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
         + std::fmt::Debug
         + Send
         + Sync
         + 'static,
+    <M as KameoChildProcessMessage>::Ok: crate::codegen_py::ProvideIr,
 {
     /// Python configuration for subprocess setup
     python_config: crate::PythonConfig,
@@ -136,19 +135,24 @@ where
     callback_module: DynamicCallbackModule,
     /// Collected IR for callback request types keyed by full path (module.HandlerType)
     callback_request_ir: std::collections::HashMap<String, Vec<crate::codegen_py::Decl>>,
+    /// Collected IR for callback response types keyed by full path (module.HandlerType)
+    callback_response_ir: std::collections::HashMap<String, Vec<crate::codegen_py::Decl>>,
+    /// Extra invocation IR to force-include types when automatic derivation misses them
+    extra_invocation_ir: Vec<crate::codegen_py::Decl>,
     /// Phantom data for message type
     _phantom: std::marker::PhantomData<M>,
 }
 
 impl<M> PythonChildProcessBuilder<M>
 where
-    M: KameoChildProcessMessage + Send + Sync + 'static,
+    M: KameoChildProcessMessage + crate::codegen_py::ProvideIr + Send + Sync + 'static,
     <M as KameoChildProcessMessage>::Ok: serde::Serialize
         + for<'de> serde::Deserialize<'de>
         + std::fmt::Debug
         + Send
         + Sync
         + 'static,
+    <M as KameoChildProcessMessage>::Ok: crate::codegen_py::ProvideIr,
 {
     /// Creates a new builder with the given Python configuration and message types.
     pub fn new(python_config: crate::PythonConfig) -> Self {
@@ -170,6 +174,8 @@ where
             log_level: Level::INFO,
             callback_module: DynamicCallbackModule::new(),
             callback_request_ir: std::collections::HashMap::new(),
+            callback_response_ir: std::collections::HashMap::new(),
+            extra_invocation_ir: Vec::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -186,16 +192,31 @@ where
     /// ```
     pub fn with_callback_handler<C, H>(mut self, module_name: &str, handler: H) -> Self
     where
-        C: Send + Sync + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
+        C: Send + Sync + serde::Serialize + for<'de> serde::Deserialize<'de> + crate::codegen_py::ProvideIr + 'static,
         H: TypedCallbackHandler<C> + Clone + Send + Sync + 'static,
+        H::Response: crate::codegen_py::ProvideIr,
     {
         if let Err(e) = self.callback_module.register_handler(module_name, handler.clone()) {
             tracing::warn!("Failed to register callback handler: {}", e);
         }
         // Capture IR for the callback request type using automatic derivation
         let full_path = format!("{}.{}", module_name, handler.type_name());
-        let decls = crate::codegen_py::derive_decls_for::<C>();
-        self.callback_request_ir.insert(full_path, decls);
+        let decls = <C as crate::codegen_py::ProvideIr>::provide_ir();
+        let decl_names: Vec<String> = decls
+            .iter()
+            .map(|d| match d { crate::codegen_py::Decl::Struct(s) => s.name.clone(), crate::codegen_py::Decl::Enum(e) => e.name.clone() })
+            .collect();
+        tracing::debug!(target: "kameo_snake_handler::builder::codegen", path = %full_path, decl_names = ?decl_names, "Collected callback request IR decls via ProvideIr");
+        self.callback_request_ir.insert(full_path.clone(), decls);
+
+        // Capture IR for the callback response type using automatic derivation
+        let resp_decls = <H::Response as crate::codegen_py::ProvideIr>::provide_ir();
+        let resp_decl_names: Vec<String> = resp_decls
+            .iter()
+            .map(|d| match d { crate::codegen_py::Decl::Struct(s) => s.name.clone(), crate::codegen_py::Decl::Enum(e) => e.name.clone() })
+            .collect();
+        tracing::debug!(target: "kameo_snake_handler::builder::codegen", path = %full_path, resp_decl_names = ?resp_decl_names, "Collected callback response IR decls via ProvideIr");
+        self.callback_response_ir.insert(full_path, resp_decls);
         self
     }
 
@@ -235,11 +256,7 @@ where
         use kameo_child_process::callback::TypedCallbackReceiver;
         use kameo_child_process::spawn_subprocess_ipc_actor;
         use tokio::net::UnixListener;
-        let parent_config = parent_config.unwrap_or_default();
-        // Propagate inflight limit (if provided) to child-process backend via env
-        if let Some(limit) = parent_config.inflight_limit {
-            std::env::set_var("KAMEO_INFLIGHT_LIMIT", limit.to_string());
-        }
+        let _parent_config = parent_config.unwrap_or_default();
 
         // Serialize the PythonConfig as JSON for the child
         let config_json = serde_json::to_string(&self.python_config).map_err(|e| {
@@ -284,9 +301,16 @@ where
                 format!("Failed to serialize callback request IR: {e}"),
             )
         })?;
+        // Serialize response IR so the child can generate dataclasses and match functions
+        let callback_resp_ir_json = serde_json::to_string(&self.callback_response_ir).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to serialize callback response IR: {e}"),
+            )
+        })?;
         // Derive invocation IR for message/response automatically
-        let mut invocation_ir: Vec<crate::codegen_py::Decl> = crate::codegen_py::derive_decls_for::<M>();
-        let mut ok_ir: Vec<crate::codegen_py::Decl> = crate::codegen_py::derive_decls_for::<<M as KameoChildProcessMessage>::Ok>();
+        let mut invocation_ir: Vec<crate::codegen_py::Decl> = <M as crate::codegen_py::ProvideIr>::provide_ir();
+        let mut ok_ir: Vec<crate::codegen_py::Decl> = <<M as KameoChildProcessMessage>::Ok as crate::codegen_py::ProvideIr>::provide_ir();
         invocation_ir.append(&mut ok_ir);
         let invocation_ir_json = serde_json::to_string(&invocation_ir).map_err(|e| {
             std::io::Error::new(
@@ -357,6 +381,7 @@ where
         cmd.env("KAMEO_CALLBACK_RESP_TYPES", &callback_resp_types_json);
         cmd.env("KAMEO_CALLBACK_REQ_TYPES", &callback_req_types_json);
         cmd.env("KAMEO_CALLBACK_REQ_IR", &callback_req_ir_json);
+        cmd.env("KAMEO_CALLBACK_RESP_IR", &callback_resp_ir_json);
         cmd.env("KAMEO_INVOCATION_IR", &invocation_ir_json);
         tracing::info!(
             "Set KAMEO_CALLBACK_REGISTRY environment variable with {} bytes",

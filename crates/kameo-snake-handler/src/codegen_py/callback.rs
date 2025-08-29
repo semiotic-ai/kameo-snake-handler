@@ -92,17 +92,7 @@ pub fn emit_callback_module(module_name: &str, _types_module: &str, stubs: &[Cal
         writeln!(out).unwrap();
     }
 
-    // Re-export match helpers for known response unions when available
-    writeln!(out, "if inv is not None:").unwrap();
-    writeln!(out, "    try:").unwrap();
-    writeln!(out, "        match_test_response = inv.match_test_response").unwrap();
-    writeln!(out, "    except Exception: pass").unwrap();
-    writeln!(out, "    try:").unwrap();
-    writeln!(out, "        match_trader_response = inv.match_trader_response").unwrap();
-    writeln!(out, "    except Exception: pass").unwrap();
-    writeln!(out, "    try:").unwrap();
-    writeln!(out, "        match_bench_response = inv.match_bench_response").unwrap();
-    writeln!(out, "    except Exception: pass").unwrap();
+    // No additional re-exports; consumers should import helpers from invocation_generated_types explicitly
 
     out
 }

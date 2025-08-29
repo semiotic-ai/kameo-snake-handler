@@ -17,6 +17,7 @@ impl<R> LengthPrefixedRead<R> {
     }
 }
 
+
 impl<R: AsyncRead + Unpin> LengthPrefixedRead<R> {
     pub async fn read_msg<T: DeserializeOwned>(&mut self) -> io::Result<T> {
         let mut len_buf = [0u8; 4];
@@ -24,9 +25,8 @@ impl<R: AsyncRead + Unpin> LengthPrefixedRead<R> {
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut msg_buf = vec![0u8; len];
         self.inner.read_exact(&mut msg_buf).await?;
-        let msg: T = serde_brief::from_slice(&msg_buf).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("serde-brief decode error: {e}"))
-        })?;
+        let msg: T = serde_brief::from_slice(&msg_buf)
+            .map_err(|e| io::Error::other(format!("serde-brief decode error: {e}")))?;
         trace!(event = "framing_read", len, "Read length-prefixed message");
         Ok(msg)
     }

@@ -49,7 +49,7 @@ def to_wire_trader_message(m: TraderMessage) -> Dict[str, Any]:
     raise TypeError(f"Not a TraderMessage instance: {m!r}")
 
 class TraderMessageHandlers(TypedDict, total=False):
-    OrderDetails: Callable[[Any, Any], R]
+    OrderDetails: Callable[[str, int], R]
     default: Callable[[TraderMessage], R]
 def match_trader_message(m: TraderMessage, **handlers: Unpack[TraderMessageHandlers]) -> Any:
     if isinstance(m, TraderMessageOrderDetails):
@@ -127,8 +127,8 @@ def to_wire_trader_response(m: TraderResponse) -> Dict[str, Any]:
     raise TypeError(f"Not a TraderResponse instance: {m!r}")
 
 class TraderResponseHandlers(TypedDict, total=False):
-    OrderResult: Callable[[Any], R]
-    Error: Callable[[Any], R]
+    OrderResult: Callable[[str], R]
+    Error: Callable[[str], R]
     default: Callable[[TraderResponse], R]
 def match_trader_response(m: TraderResponse, **handlers: Unpack[TraderResponseHandlers]) -> Any:
     if isinstance(m, TraderResponseOrderResult):

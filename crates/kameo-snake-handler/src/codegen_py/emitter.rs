@@ -58,14 +58,15 @@ fn emit_struct(out: &mut String, s: &StructDecl) {
     writeln!(out, "class {}:", s.name).unwrap();
     if s.fields.is_empty() {
         writeln!(out, "    pass").unwrap();
-        return;
-    }
-    for (field, ty) in &s.fields {
-        writeln!(out, "    {}: {}", field, py_type(ty)).unwrap();
+    } else {
+        for (field, ty) in &s.fields {
+            writeln!(out, "    {}: {}", field, py_type(ty)).unwrap();
+        }
     }
 
     // Helpers: make_*, from_wire_*, to_wire_*
     let snake = to_snake(&s.name);
+    
     // make_* constructor
     let args: String = s.fields.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>().join(", ");
     writeln!(out, "def make_{}({}) -> {}:", snake, args, s.name).unwrap();
@@ -366,7 +367,7 @@ fn emit_enum(out: &mut String, e: &EnumDecl) {
                 writeln!(out, "    {}: Callable[[{}], R]", name, t).unwrap();
             }
             EnumVariant::Tuple { name, tys } => {
-                let args = tys.iter().map(|t| py_type(t)).collect::<Vec<_>>().join(", ");
+                let args = tys.iter().map(py_type).collect::<Vec<_>>().join(", ");
                 writeln!(out, "    {}: Callable[[{}], R]", name, args).unwrap();
             }
             EnumVariant::Struct { name, fields } => {

@@ -8,75 +8,11 @@ try:
 except ImportError:
     from typing_extensions import TypeGuard  # fallback
 
-class TestCallbackMessage: ...
-class TraderCallbackMessage: ...
-class ComplexCallbackMessage: ...
 class Dimensions: ...
 class EventItem: ...
-
-@dataclass
-class TestCallbackMessage:
-    value: int
-def make_test_callback_message(value) -> TestCallbackMessage:
-    return TestCallbackMessage(value=value)
-def from_wire_test_callback_message(d: Dict[str, Any]) -> TestCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
-    return TestCallbackMessage(value=d.get("value"))
-def to_wire_test_callback_message(m: TestCallbackMessage) -> Dict[str, Any]:
-    return {"value": m.value}
-def from_wire_test_callback_message_strict(d: Dict[str, Any]) -> TestCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
-    allowed = {"value"}
-    unknown = set(d.keys()) - allowed
-    if unknown:
-        raise ValueError("Unknown keys for TestCallbackMessage: " + repr(unknown))
-    return from_wire_test_callback_message(d)
-
-@dataclass
-class TraderCallbackMessage:
-    value: int
-def make_trader_callback_message(value) -> TraderCallbackMessage:
-    return TraderCallbackMessage(value=value)
-def from_wire_trader_callback_message(d: Dict[str, Any]) -> TraderCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
-    return TraderCallbackMessage(value=d.get("value"))
-def to_wire_trader_callback_message(m: TraderCallbackMessage) -> Dict[str, Any]:
-    return {"value": m.value}
-def from_wire_trader_callback_message_strict(d: Dict[str, Any]) -> TraderCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
-    allowed = {"value"}
-    unknown = set(d.keys()) - allowed
-    if unknown:
-        raise ValueError("Unknown keys for TraderCallbackMessage: " + repr(unknown))
-    return from_wire_trader_callback_message(d)
-
-@dataclass
-class ComplexCallbackMessage:
-    value: int
-    labels: List[str]
-    metadata: Dict[str, str]
-    dimensions: Optional[Dimensions]
-    events: List[EventItem]
-def make_complex_callback_message(value, labels, metadata, dimensions, events) -> ComplexCallbackMessage:
-    return ComplexCallbackMessage(value=value, labels=labels, metadata=metadata, dimensions=dimensions, events=events)
-def from_wire_complex_callback_message(d: Dict[str, Any]) -> ComplexCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid ComplexCallbackMessage wire shape: expected dict")
-    return ComplexCallbackMessage(value=d.get("value"), labels=[__x for __x in d.get("labels")], metadata={k: __v for (k, __v) in d.get("metadata").items()}, dimensions=(d.get("dimensions") if d.get("dimensions") is None else from_wire_dimensions(d.get("dimensions"))), events=[from_wire_event_item(__x) for __x in d.get("events")])
-def to_wire_complex_callback_message(m: ComplexCallbackMessage) -> Dict[str, Any]:
-    return {"value": m.value, "labels": [__x for __x in m.labels], "metadata": {k: __v for (k, __v) in m.metadata.items()}, "dimensions": (m.dimensions if m.dimensions is None else to_wire_dimensions(m.dimensions)), "events": [to_wire_event_item(__x) for __x in m.events]}
-def from_wire_complex_callback_message_strict(d: Dict[str, Any]) -> ComplexCallbackMessage:
-    if not isinstance(d, dict):
-        raise ValueError("Invalid ComplexCallbackMessage wire shape: expected dict")
-    allowed = {"value", "labels", "metadata", "dimensions", "events"}
-    unknown = set(d.keys()) - allowed
-    if unknown:
-        raise ValueError("Unknown keys for ComplexCallbackMessage: " + repr(unknown))
-    return from_wire_complex_callback_message(d)
+class ComplexCallbackMessage: ...
+class TestCallbackMessage: ...
+class TraderCallbackMessage: ...
 
 @dataclass
 class Dimensions:
@@ -119,4 +55,68 @@ def from_wire_event_item_strict(d: Dict[str, Any]) -> EventItem:
     if unknown:
         raise ValueError("Unknown keys for EventItem: " + repr(unknown))
     return from_wire_event_item(d)
+
+@dataclass
+class ComplexCallbackMessage:
+    value: int
+    labels: List[str]
+    metadata: BTreeMap
+    dimensions: Optional[Dimensions]
+    events: List[EventItem]
+def make_complex_callback_message(value, labels, metadata, dimensions, events) -> ComplexCallbackMessage:
+    return ComplexCallbackMessage(value=value, labels=labels, metadata=metadata, dimensions=dimensions, events=events)
+def from_wire_complex_callback_message(d: Dict[str, Any]) -> ComplexCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid ComplexCallbackMessage wire shape: expected dict")
+    return ComplexCallbackMessage(value=d.get("value"), labels=[__x for __x in d.get("labels")], metadata=from_wire_b_tree_map(d.get("metadata")), dimensions=(d.get("dimensions") if d.get("dimensions") is None else from_wire_dimensions(d.get("dimensions"))), events=[from_wire_event_item(__x) for __x in d.get("events")])
+def to_wire_complex_callback_message(m: ComplexCallbackMessage) -> Dict[str, Any]:
+    return {"value": m.value, "labels": [__x for __x in m.labels], "metadata": to_wire_b_tree_map(m.metadata), "dimensions": (m.dimensions if m.dimensions is None else to_wire_dimensions(m.dimensions)), "events": [to_wire_event_item(__x) for __x in m.events]}
+def from_wire_complex_callback_message_strict(d: Dict[str, Any]) -> ComplexCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid ComplexCallbackMessage wire shape: expected dict")
+    allowed = {"value", "labels", "metadata", "dimensions", "events"}
+    unknown = set(d.keys()) - allowed
+    if unknown:
+        raise ValueError("Unknown keys for ComplexCallbackMessage: " + repr(unknown))
+    return from_wire_complex_callback_message(d)
+
+@dataclass
+class TestCallbackMessage:
+    value: int
+def make_test_callback_message(value) -> TestCallbackMessage:
+    return TestCallbackMessage(value=value)
+def from_wire_test_callback_message(d: Dict[str, Any]) -> TestCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
+    return TestCallbackMessage(value=d.get("value"))
+def to_wire_test_callback_message(m: TestCallbackMessage) -> Dict[str, Any]:
+    return {"value": m.value}
+def from_wire_test_callback_message_strict(d: Dict[str, Any]) -> TestCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TestCallbackMessage wire shape: expected dict")
+    allowed = {"value"}
+    unknown = set(d.keys()) - allowed
+    if unknown:
+        raise ValueError("Unknown keys for TestCallbackMessage: " + repr(unknown))
+    return from_wire_test_callback_message(d)
+
+@dataclass
+class TraderCallbackMessage:
+    value: int
+def make_trader_callback_message(value) -> TraderCallbackMessage:
+    return TraderCallbackMessage(value=value)
+def from_wire_trader_callback_message(d: Dict[str, Any]) -> TraderCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
+    return TraderCallbackMessage(value=d.get("value"))
+def to_wire_trader_callback_message(m: TraderCallbackMessage) -> Dict[str, Any]:
+    return {"value": m.value}
+def from_wire_trader_callback_message_strict(d: Dict[str, Any]) -> TraderCallbackMessage:
+    if not isinstance(d, dict):
+        raise ValueError("Invalid TraderCallbackMessage wire shape: expected dict")
+    allowed = {"value"}
+    unknown = set(d.keys()) - allowed
+    if unknown:
+        raise ValueError("Unknown keys for TraderCallbackMessage: " + repr(unknown))
+    return from_wire_trader_callback_message(d)
 

@@ -9,6 +9,7 @@ use kameo_snake_handler::telemetry::build_subscriber_with_otel_and_fmt_async_wit
 use kameo_snake_handler::telemetry::TelemetryExportConfig;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
+use kameo_python_ir_derive::PythonIr;
 use std::env;
 use std::fmt::Write as _;
 use std::pin::Pin;
@@ -35,7 +36,7 @@ pub enum TestError {
 }
 
 /// Message types that can be sent to Python subprocess
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub enum TestMessage {
     CalculatePower {
         count: u32,
@@ -83,7 +84,7 @@ impl Default for TestMessage {
 }
 
 /// Response types from Python subprocess
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PythonIr)]
 pub enum TestResponse {
     Power {
         power: u32,
@@ -138,25 +139,25 @@ impl KameoChildProcessMessage for TestMessage {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct TestCallbackMessage {
     pub value: u32,
 }
 
 // --- Complex streaming callback types ---
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct Dimensions {
     pub width: u64,
     pub height: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct EventItem {
     pub kind: String,
     pub weight: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct ComplexCallbackMessage {
     pub value: u32,
     pub labels: Vec<String>,
@@ -165,7 +166,7 @@ pub struct ComplexCallbackMessage {
     pub events: Vec<EventItem>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PythonIr)]
 pub enum ComplexStreamResponse {
     Item {
         index: u32,
@@ -435,12 +436,12 @@ async fn run_streaming_callback_test(
 }
 
 // --- DSPy Trader Demo Types ---
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub enum TraderMessage {
     OrderDetails { item: String, currency: u32 },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PythonIr)]
 pub enum TraderResponse {
     OrderResult { result: String },
     Error { error: String },
@@ -470,19 +471,19 @@ impl KameoChildProcessMessage for TraderMessage {
 
 // Purged ProvidePythonDecls for TraderMessage
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct TraderCallbackMessage {
     pub value: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct BenchMessage {
     pub id: u64,
     pub py_sleep_ms: u64,
     pub rust_sleep_ms: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PythonIr)]
 pub enum BenchResponse {
     Power {
         power: u32,
@@ -526,13 +527,13 @@ impl KameoChildProcessMessage for BenchMessage {
 
 // Purged ProvidePythonDecls for BenchMessage
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct BenchCallback {
     pub id: u64,
     pub rust_sleep_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PythonIr)]
 pub struct BenchCallbackReply {
     pub id: u64,
 }

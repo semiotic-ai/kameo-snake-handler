@@ -24,25 +24,15 @@ try:
 except Exception:
     TraderResponse = Any
 
-async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
-    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
-    iterator = await it if inspect.isawaitable(it) else it
-    async for item in iterator:
-        yield item
-
 async def test__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
     it = getattr(kameo, "test").__getattribute__("TestCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item
 
-if inv is not None:
-    try:
-        match_test_response = inv.match_test_response
-    except Exception: pass
-    try:
-        match_trader_response = inv.match_trader_response
-    except Exception: pass
-    try:
-        match_bench_response = inv.match_bench_response
-    except Exception: pass
+async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
+    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
+    iterator = await it if inspect.isawaitable(it) else it
+    async for item in iterator:
+        yield item
+

@@ -1071,6 +1071,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kameo-python-ir-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "kameo-snake-handler"
 version = "0.1.0"
 dependencies = [
@@ -1082,6 +1091,7 @@ dependencies = [
  "futures",
  "kameo",
  "kameo-child-process",
+ "kameo-python-ir-derive",
  "kameo_macros",
  "metrics 0.24.2",
  "metrics-exporter-opentelemetry",
@@ -1096,7 +1106,6 @@ dependencies = [
  "pyo3-async-runtimes",
  "serde",
  "serde-brief",
- "serde-reflection",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
@@ -1120,6 +1129,7 @@ dependencies = [
  "indoc",
  "kameo",
  "kameo-child-process",
+ "kameo-python-ir-derive",
  "kameo-snake-handler",
  "kameo_macros",
  "once_cell",
@@ -2023,17 +2033,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34f265ff0aadcff5d8bf0c9e43f6a289b5885b9ea1e9bba3e99e224c476edb14"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "serde-reflection"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05a5f801ac62a51a49d378fdb3884480041b99aced450b28990673e8ff99895"
-dependencies = [
- "once_cell",
- "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]

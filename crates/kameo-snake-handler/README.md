@@ -26,6 +26,7 @@ This crate provides the Python-specific process actor, configuration, error hand
 
 - IPC internals and runtime: `crates/kameo-child-process/README.md`
 - Generated Python bindings and usage: `crates/kameo-snake-handler/docs/python-bindings.md`
+- Proc-macro IR derivation: add `#[derive(PythonIr)]` to your message/response and callback types and include extra IR via `.with_invocation_type::<T>()` where `T: ProvideIr`.
 
 ## The `setup_python_subprocess_system!` Macro
 

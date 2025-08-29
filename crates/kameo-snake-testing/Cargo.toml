@@ -38,6 +38,7 @@ opentelemetry-otlp = { workspace = true }
 tracing-futures = "0.2"
 rand.workspace = true
 uuid = { version = "1", features = ["v4"] }
+kameo-python-ir-derive = { path = "../kameo-python-ir-derive" }
 
 [dev-dependencies]
 proptest = "1.4"
