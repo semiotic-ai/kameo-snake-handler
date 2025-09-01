@@ -14,32 +14,30 @@
 //!
 //! Tracing is emitted for I/O operations and state transitions; a per-request
 //! correlation ID enables cross-process stream attribution.
- 
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
-static CALLBACK_CONNECTION: std::sync::OnceLock<Arc<Mutex<tokio::net::UnixStream>>> = std::sync::OnceLock::new();
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
 #[tracing::instrument(level = "debug", skip(conn))]
 /// Set the shared callback socket used by all child-initiated callbacks.
 ///
 /// Returns `Err("connection already initialized")` if called more than once.
 pub fn set_connection(conn: tokio::net::UnixStream) -> Result<(), &'static str> {
-    let connection_mutex = Arc::new(Mutex::new(conn));
-    CALLBACK_CONNECTION.set(connection_mutex).map_err(|_| "connection already initialized")
+    kameo_child_process::callback_runtime::init(conn)
 }
 
 /// Python async iterator over a single callback stream.
 ///
-/// The iterator reads length-prefixed `TypedCallbackResponse` messages from the
-/// shared socket. When the parent indicates end-of-stream, or an error occurs,
-/// `__anext__` raises `StopAsyncIteration`.
+/// The iterator reads demultiplexed `TypedCallbackResponse` messages from a
+/// per-correlation receiver provided by the callback runtime. When the parent
+/// indicates end-of-stream, or an error occurs, `__anext__` raises
+/// `StopAsyncIteration`.
 #[pyo3::pyclass]
 pub struct CallbackAsyncIterator {
-    callback_conn: Arc<Mutex<tokio::net::UnixStream>>, // shared reader
     correlation_id: u64,
     exhausted: Arc<std::sync::atomic::AtomicBool>,
     count: Arc<std::sync::atomic::AtomicUsize>,
+    rx: Arc<Mutex<mpsc::UnboundedReceiver<kameo_child_process::callback::TypedCallbackResponse>>>,
 }
 
 #[pyo3::pymethods]
@@ -50,50 +48,30 @@ impl CallbackAsyncIterator {
     /// Read and yield the next response item or raise `StopAsyncIteration` when
     /// the stream completes or the socket is closed.
     fn __anext__<'py>(&self, py: pyo3::Python<'py>) -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
-        let callback_conn = self.callback_conn.clone();
         let correlation_id = self.correlation_id;
         let exhausted = self.exhausted.clone();
         let count = self.count.clone();
+        let rx = self.rx.clone();
 
         Ok(pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            use tokio::io::AsyncReadExt;
 
             if exhausted.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
             }
 
-            let mut conn_guard = callback_conn.lock().await;
+            // Receive next demuxed response for this correlation id
+            let resp_opt = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            };
 
-            let mut length_bytes = [0u8; 4];
-            if let Err(e) = conn_guard.read_exact(&mut length_bytes).await {
-                tracing::info!(error = %e, "callback reader length read error or closed");
-                exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
-                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
-            }
-
-            let length = u32::from_le_bytes(length_bytes) as usize;
-            tracing::debug!(length, "reading response message");
-
-            let mut message_bytes = vec![0u8; length];
-            if let Err(e) = conn_guard.read_exact(&mut message_bytes).await {
-                tracing::error!(error = %e, "callback reader body read error");
-                exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
-                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
-            }
-
-            let response: kameo_child_process::callback::TypedCallbackResponse =
-                serde_brief::from_slice(&message_bytes).map_err(|e| {
-                    tracing::error!(error = %e, "deserialize TypedCallbackResponse failed");
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to deserialize response: {}", e))
-                })?;
-
-            tracing::debug!(got = response.correlation_id, expected = correlation_id, "received response");
-
-            if response.correlation_id != correlation_id {
-                tracing::warn!(got = response.correlation_id, expected = correlation_id, "correlation id mismatch");
-                exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
-                return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
-            }
+            let response = match resp_opt {
+                Some(r) => r,
+                None => {
+                    exhausted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                }
+            };
 
             if response.is_final {
                 tracing::info!(correlation_id, "final response, terminating stream");
@@ -151,40 +129,22 @@ pub fn callback_handle_inner<'py>(
     };
 
     Ok(pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let callback_conn_mutex = CALLBACK_CONNECTION
-            .get()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Callback connection not initialized"))?;
-        let mut callback_conn_guard = callback_conn_mutex.lock().await;
-
-        let envelope_bytes = serde_brief::to_vec(&envelope)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to serialize envelope: {e}")))?;
-
-        let length = envelope_bytes.len() as u32;
-        let mut message = Vec::new();
-        message.extend_from_slice(&length.to_le_bytes());
-        message.extend_from_slice(&envelope_bytes);
-
-        use tokio::io::AsyncWriteExt;
-        callback_conn_guard
-            .write_all(&message)
+        // Register a route and get the receiver for this correlation id
+        let rx = kameo_child_process::callback_runtime::register_stream(correlation_id)
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to send callback envelope: {e}")))?;
-        callback_conn_guard
-            .flush()
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to flush callback envelope: {e}")))?;
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
-        let callback_conn_for_reader = CALLBACK_CONNECTION
-            .get()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Callback connection not initialized"))?
-            .clone();
+        // Send the envelope via the writer task
+        kameo_child_process::callback_runtime::send(envelope)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
+        // Wrap the receiver into a PyO3 class
         pyo3::Python::with_gil(|py| -> pyo3::PyResult<pyo3::Py<pyo3::PyAny>> {
             let iterator = CallbackAsyncIterator {
-                callback_conn: callback_conn_for_reader,
                 correlation_id,
                 exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                rx: Arc::new(Mutex::new(rx)),
             };
             let py_iterator = pyo3::Py::new(py, iterator)?;
             Ok(py_iterator.into())

@@ -13,23 +13,31 @@ if TYPE_CHECKING:
 def _to_wire(obj):
     if dataclasses.is_dataclass(obj):
         return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
-    d = getattr(obj, '__dict__', None)
-    if isinstance(d, dict):
-        return d
     return obj
 
 try:
     from .invocation_generated_types import TestResponse as TestResponse
 except Exception:
     TestResponse = Any
-
 try:
-    from .callback_request_types import TestCallbackMessage as TestCallbackMessage
+    from .invocation_generated_types import TraderResponse as TraderResponse
 except Exception:
-    class TestCallbackMessage:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
+    TraderResponse = Any
+
+from .callback_request_types import TestCallbackMessage as TestCallbackMessage
+from .callback_request_types import TraderCallbackMessage as TraderCallbackMessage
+
+async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
+    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
+    iterator = await it if inspect.isawaitable(it) else it
+    async for item in iterator:
+        yield item
+
+async def basic__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
+    it = getattr(kameo, "basic").__getattribute__("TestCallback")( _to_wire(req) )
+    iterator = await it if inspect.isawaitable(it) else it
+    async for item in iterator:
+        yield item
 
 async def test__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
     it = getattr(kameo, "test").__getattribute__("TestCallback")( _to_wire(req) )

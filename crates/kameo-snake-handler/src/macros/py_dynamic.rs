@@ -110,7 +110,21 @@ pub fn create_dynamic_modules(
     std::fs::write(&stubs_path, stubs_src).expect("write stubs module");
 
     let _has_callback_ir = !req_ir_map.is_empty() || !resp_ir_map.is_empty();
-    tracing::debug!(target: "kameo_snake_handler::macros::codegen", has_callback_ir = %_has_callback_ir, req_ir_map_empty = %req_ir_map.is_empty(), resp_ir_map_empty = %resp_ir_map.is_empty(), "Callback IR present (types emission disabled)");
+    tracing::debug!(target: "kameo_snake_handler::macros::codegen", has_callback_ir = %_has_callback_ir, req_ir_map_empty = %req_ir_map.is_empty(), resp_ir_map_empty = %resp_ir_map.is_empty(), "Callback IR presence detected");
+    // Emit callback request types if IR provided
+    if !req_ir_map.is_empty() {
+        let mut all_reqs: Vec<crate::codegen_py::Decl> = Vec::new();
+        for (_path, decls) in &req_ir_map {
+            all_reqs.extend_from_slice(decls);
+        }
+        if !all_reqs.is_empty() {
+            let req_mod = "callback_request_types".to_string();
+            let req_src = crate::codegen_py::emit_python_module(&req_mod, &all_reqs);
+            let req_path = module_dir.join(format!("{}.py", req_mod));
+            std::fs::write(&req_path, req_src).expect("write callback request types module");
+            tracing::info!(target: "kameo_snake_handler::macros::codegen", file = %req_path.display(), count = all_reqs.len(), "Emitted callback request types");
+        }
+    }
     std::env::set_var("KAMEO_GENERATED_CALLBACK_TYPES", &stubs_mod);
     std::env::set_var("KAMEO_GENERATED_INVOCATION_TYPES", &types_mod);
 

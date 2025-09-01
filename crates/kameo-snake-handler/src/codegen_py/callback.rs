@@ -57,9 +57,12 @@ pub fn emit_callback_module(module_name: &str, _types_module: &str, stubs: &[Cal
 
     use std::collections::BTreeSet;
     let mut resp_names: BTreeSet<String> = BTreeSet::new();
+    let mut req_names: BTreeSet<String> = BTreeSet::new();
     for stub in stubs {
         let resp_ty = py_resp_alias(&stub.response_type);
         resp_names.insert(resp_ty);
+        let req_ty = py_req_alias(&stub.request_type);
+        req_names.insert(req_ty);
     }
 
     // Provide fallbacks for response union names not present in this package's inv module
@@ -69,6 +72,13 @@ pub fn emit_callback_module(module_name: &str, _types_module: &str, stubs: &[Cal
         writeln!(out, "    from .invocation_generated_types import {} as {}", name, name).unwrap();
         writeln!(out, "except Exception:").unwrap();
         writeln!(out, "    {} = Any", name).unwrap();
+    }
+    writeln!(out).unwrap();
+
+    // Re-export request types so user code can import from this module
+    for name in req_names {
+        if name == "object" { continue; }
+        writeln!(out, "from .callback_request_types import {} as {}", name, name).unwrap();
     }
     writeln!(out).unwrap();
 

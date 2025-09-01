@@ -20,6 +20,8 @@ try:
 except Exception:
     BenchResponse = Any
 
+from .callback_request_types import BenchCallback as BenchCallback
+
 async def bench__bench_callback(req: 'BenchCallback') -> AsyncGenerator['BenchResponse', None]:
     it = getattr(kameo, "bench").__getattribute__("BenchCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it

@@ -6,7 +6,7 @@ authors = { workspace = true }
 license = { workspace = true }
 
 [features]
-default = ["python"]
+default = []
 python = ["pyo3"]
 
 [dependencies]
@@ -42,3 +42,4 @@ proptest = { workspace = true }
 tokio-test = "0.4"
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
+serial_test = "2"

@@ -75,6 +75,7 @@ pub mod handshake;
 pub use handshake::*;
 pub mod metrics;
 pub mod tracing_utils;
+pub mod callback_runtime;
 
 use anyhow::Result;
 use async_trait::async_trait;
