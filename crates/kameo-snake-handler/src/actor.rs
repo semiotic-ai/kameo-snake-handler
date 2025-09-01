@@ -106,6 +106,13 @@ pub struct PythonConfig {
     /// to skip file emission while still enabling dynamic runtime modules.
     #[serde(default = "crate::actor::default_true")] 
     pub enable_codegen: bool,
+    /// Enable bridging of Python's logging module to Rust tracing
+    ///
+    /// When true (default), Python's `logging` output will be routed into the
+    /// Rust `tracing` subscriber via the `tracing-for-pyo3-logging` crate.
+    /// This allows unified logs and spans across Python and Rust components.
+    #[serde(default = "crate::actor::default_true")] 
+    pub enable_python_logging_bridge: bool,
 }
 
 impl Default for PythonConfig {
@@ -118,6 +125,7 @@ impl Default for PythonConfig {
             is_async: false,
             enable_otel_propagation: false,
             enable_codegen: true,
+            enable_python_logging_bridge: true,
         }
     }
 }
@@ -369,6 +377,24 @@ where
     if let Err(e) = crate::tracing_utils::setup_python_otel_context(&opentelemetry::Context::new())
     {
         tracing::warn!(error = ?e, "Failed to initialize Python OpenTelemetry SDK");
+    }
+
+    // Optionally bridge Python logging to Rust tracing if enabled in config
+    if actor
+        .handler
+        .config
+        .enable_python_logging_bridge
+    {
+        Python::with_gil(|py| {
+            match tracing_for_pyo3_logging::setup_logging(py) {
+                Ok(()) => {
+                    tracing::info!(event = "python_logging_bridge_initialized");
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "Failed to initialize Python logging bridge");
+                }
+            }
+        });
     }
     match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn, config).await {
         Ok(()) => {

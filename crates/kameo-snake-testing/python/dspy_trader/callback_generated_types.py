@@ -24,14 +24,17 @@ try:
 except Exception:
     TraderResponse = Any
 
-async def test__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
-    it = getattr(kameo, "test").__getattribute__("TestCallback")( _to_wire(req) )
+from .callback_request_types import TestCallbackMessage as TestCallbackMessage
+from .callback_request_types import TraderCallbackMessage as TraderCallbackMessage
+
+async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
+    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item
 
-async def trader__trader_callback(req: 'TraderCallbackMessage') -> AsyncGenerator['TraderResponse', None]:
-    it = getattr(kameo, "trader").__getattribute__("TraderCallback")( _to_wire(req) )
+async def test__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
+    it = getattr(kameo, "test").__getattribute__("TestCallback")( _to_wire(req) )
     iterator = await it if inspect.isawaitable(it) else it
     async for item in iterator:
         yield item

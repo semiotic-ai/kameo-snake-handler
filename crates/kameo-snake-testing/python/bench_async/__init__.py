@@ -2,6 +2,7 @@ import asyncio
 import random
 import time
 import sys
+import logging
 
 from typing import Dict, Any, AsyncGenerator
 from . import invocation_generated_types as gen
@@ -26,7 +27,7 @@ async def handle_bench_message(message: Dict[str, Any]) -> Dict[str, Any]:
             break
     except Exception as e:
         # Parent may have closed early; treat as best-effort fire-and-forget for bench
-        print(f"[bench_async] callback iteration ended early: {e}", file=sys.stderr)
+        logging.warning("[bench_async] callback iteration ended early: %s", e, exc_info=True)
 
     return gen.to_wire_bench_response(gen.bench_response_callback_roundtrip_result(value=int(bm.id)))
 

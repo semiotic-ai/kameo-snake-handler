@@ -35,6 +35,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 once_cell = "1.19"
 tokio-util = "0.7.16"
+tracing-for-pyo3-logging = "0.0.5"
 
 [dev-dependencies]
 proptest = { workspace = true }

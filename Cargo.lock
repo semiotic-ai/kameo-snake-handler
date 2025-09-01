@@ -1126,6 +1126,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tracing",
+ "tracing-for-pyo3-logging",
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -2518,6 +2519,16 @@ checksum = "b9d12581f227e93f094d3af2ae690a574abb8a2b9b7a96e7cfe9647b2b617678"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "tracing-for-pyo3-logging"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1102c5df5ac54d8f7bc93b5aa8ec54bb9fa13a3fe3156a7b0037095efa305f5"
+dependencies = [
+ "pyo3",
+ "tracing",
 ]
 
 [[package]]

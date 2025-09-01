@@ -123,6 +123,6 @@ async def handle_message_streaming(message: gen.TestMessage) -> AsyncGenerator[g
         traceback.print_exc()
         yield gen.to_wire_test_response(gen.test_response_stream_error(index=0, error=str(e)))
 
-print("[DEBUG] MODULE LOADED:", __name__, "sys.path:", __import__('sys').path)
+logging.debug("MODULE LOADED: %s", __name__)
 
 
