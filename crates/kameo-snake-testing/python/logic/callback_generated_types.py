@@ -13,9 +13,6 @@ if TYPE_CHECKING:
 def _to_wire(obj):
     if dataclasses.is_dataclass(obj):
         return {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
-    d = getattr(obj, '__dict__', None)
-    if isinstance(d, dict):
-        return d
     return obj
 
 try:
@@ -23,13 +20,7 @@ try:
 except Exception:
     TestResponse = Any
 
-try:
-    from .callback_request_types import TestCallbackMessage as TestCallbackMessage
-except Exception:
-    class TestCallbackMessage:
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items():
-                setattr(self, k, v)
+from .callback_request_types import TestCallbackMessage as TestCallbackMessage
 
 async def test__test_callback(req: 'TestCallbackMessage') -> AsyncGenerator['TestResponse', None]:
     it = getattr(kameo, "test").__getattribute__("TestCallback")( _to_wire(req) )

@@ -401,6 +401,7 @@ async fn run_streaming_callback_test(
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
 
     let mut pool = PythonChildProcessBuilder::<TestMessage>::new(config)
@@ -568,6 +569,7 @@ async fn run_sync_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::err
         env_vars: vec![],
         is_async: false,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     tracing::trace!(
         event = "test_spawn",
@@ -674,6 +676,7 @@ async fn run_async_tests(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let mut async_pool = PythonChildProcessBuilder::<TestMessage>::new(async_config.clone())
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
@@ -797,6 +800,7 @@ async fn run_streaming_tests(python_path: Vec<String>) -> Result<(), Box<dyn std
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let mut streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
@@ -1140,6 +1144,7 @@ async fn run_streaming_throughput_test(
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let mut streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
@@ -1277,6 +1282,7 @@ async fn run_streaming_error_handling_test(
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let mut streaming_pool = PythonChildProcessBuilder::<TestMessage>::new(streaming_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
@@ -1383,6 +1389,7 @@ async fn run_invalid_config_tests(
         env_vars: vec![],
         is_async: false,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
 
     let spawn_result = timeout(
@@ -1413,6 +1420,7 @@ async fn run_invalid_config_tests(
         env_vars: vec![],
         is_async: false,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let spawn_result = timeout(
         Duration::from_secs(31),
@@ -1442,6 +1450,7 @@ async fn run_invalid_config_tests(
         env_vars: vec![],
         is_async: false,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let spawn_result = timeout(
         Duration::from_secs(32),
@@ -1470,6 +1479,7 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: true,
+        enable_codegen: true,
     };
     let mut trader_pool = PythonChildProcessBuilder::<TraderMessage>::new(trader_config)
         .with_callback_handler::<TestCallbackMessage, _>("test", TestCallbackHandler)
@@ -1504,7 +1514,7 @@ async fn run_trader_demo(python_path: Vec<String>) -> Result<(), Box<dyn std::er
 async fn run_bench_throughput_test(
     python_path: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const N: usize = 200;
+    const N: usize = 2000;
     const MAX_SLEEP_MS: u64 = 10;
     let mut rng = thread_rng();
     let bench_config = PythonConfig {
@@ -1514,6 +1524,7 @@ async fn run_bench_throughput_test(
         env_vars: vec![],
         is_async: true,
         enable_otel_propagation: false,
+        enable_codegen: true,
     };
     let callback_count = Arc::new(AtomicUsize::new(0));
     let callback_handler = CountingCallbackHandler {

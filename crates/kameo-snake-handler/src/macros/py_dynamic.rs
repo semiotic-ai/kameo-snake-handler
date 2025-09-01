@@ -105,14 +105,16 @@ pub fn create_dynamic_modules(
             callback_stubs.push(crate::codegen_py::CallbackStub { path: full_path, request_type, response_type });
         }
     }
-    // Generate wrapper callables and typing stubs for callbacks.
-    let stubs_src = crate::codegen_py::emit_callback_module(&stubs_mod, &types_mod, &callback_stubs);
-    std::fs::write(&stubs_path, stubs_src).expect("write stubs module");
+    if config.enable_codegen {
+        // Generate wrapper callables and typing stubs for callbacks.
+        let stubs_src = crate::codegen_py::emit_callback_module(&stubs_mod, &types_mod, &callback_stubs);
+        std::fs::write(&stubs_path, stubs_src).expect("write stubs module");
+    }
 
     let _has_callback_ir = !req_ir_map.is_empty() || !resp_ir_map.is_empty();
     tracing::debug!(target: "kameo_snake_handler::macros::codegen", has_callback_ir = %_has_callback_ir, req_ir_map_empty = %req_ir_map.is_empty(), resp_ir_map_empty = %resp_ir_map.is_empty(), "Callback IR presence detected");
     // Emit callback request types if IR provided
-    if !req_ir_map.is_empty() {
+    if config.enable_codegen && !req_ir_map.is_empty() {
         let mut all_reqs: Vec<crate::codegen_py::Decl> = Vec::new();
         for (_path, decls) in &req_ir_map {
             all_reqs.extend_from_slice(decls);
@@ -128,7 +130,7 @@ pub fn create_dynamic_modules(
     std::env::set_var("KAMEO_GENERATED_CALLBACK_TYPES", &stubs_mod);
     std::env::set_var("KAMEO_GENERATED_INVOCATION_TYPES", &types_mod);
 
-    {
+    if config.enable_codegen {
         let inv_ir_json = std::env::var("KAMEO_INVOCATION_IR").unwrap_or_else(|_| "[]".to_string());
         let decls: Vec<crate::codegen_py::Decl> = serde_json::from_str(&inv_ir_json).unwrap_or_default();
         // Emit invocation types used by the user’s Python package.

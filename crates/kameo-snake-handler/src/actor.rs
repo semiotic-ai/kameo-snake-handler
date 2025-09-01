@@ -99,6 +99,13 @@ pub struct PythonConfig {
     /// Rust and Python processes. This requires the `opentelemetry` Python
     /// package to be installed in the Python environment.
     pub enable_otel_propagation: bool,
+    /// Enable Python code generation (writes generated modules to disk)
+    ///
+    /// When true (default), the child process will emit generated Python files
+    /// such as callback stubs and request/response type modules. Disable this
+    /// to skip file emission while still enabling dynamic runtime modules.
+    #[serde(default = "crate::actor::default_true")] 
+    pub enable_codegen: bool,
 }
 
 impl Default for PythonConfig {
@@ -110,9 +117,12 @@ impl Default for PythonConfig {
             env_vars: Vec::new(),
             is_async: false,
             enable_otel_propagation: false,
+            enable_codegen: true,
         }
     }
 }
+
+pub(crate) fn default_true() -> bool { true }
 
 /// Kameo actor for Python subprocess communication with unified streaming support.
 ///
