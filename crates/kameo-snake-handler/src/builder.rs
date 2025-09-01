@@ -137,8 +137,6 @@ where
     callback_request_ir: std::collections::HashMap<String, Vec<crate::codegen_py::Decl>>,
     /// Collected IR for callback response types keyed by full path (module.HandlerType)
     callback_response_ir: std::collections::HashMap<String, Vec<crate::codegen_py::Decl>>,
-    /// Extra invocation IR to force-include types when automatic derivation misses them
-    extra_invocation_ir: Vec<crate::codegen_py::Decl>,
     /// Phantom data for message type
     _phantom: std::marker::PhantomData<M>,
 }
@@ -175,7 +173,6 @@ where
             callback_module: DynamicCallbackModule::new(),
             callback_request_ir: std::collections::HashMap::new(),
             callback_response_ir: std::collections::HashMap::new(),
-            extra_invocation_ir: Vec::new(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -259,12 +256,8 @@ where
         let _parent_config = parent_config.unwrap_or_default();
 
         // Serialize the PythonConfig as JSON for the child
-        let config_json = serde_json::to_string(&self.python_config).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize PythonConfig: {e}"),
-            )
-        })?;
+        let config_json = serde_json::to_string(&self.python_config)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize PythonConfig: {e}")))?;
 
         // Serialize the callback registry for creating Python modules
         let callback_registry = self.callback_module.get_registry();
@@ -272,52 +265,28 @@ where
             "Callback registry before serialization: {:?}",
             callback_registry
         );
-        let callback_registry_json = serde_json::to_string(&callback_registry).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize callback registry: {e}"),
-            )
-        })?;
+        let callback_registry_json = serde_json::to_string(&callback_registry)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize callback registry: {e}")))?;
         // Serialize response type names for precise Python stub annotations
         let callback_resp_types = self.callback_module.get_response_types();
-        let callback_resp_types_json = serde_json::to_string(&callback_resp_types).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize callback response types: {e}"),
-            )
-        })?;
+        let callback_resp_types_json = serde_json::to_string(&callback_resp_types)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize callback response types: {e}")))?;
         // Serialize request type names for precise Python stub parameter annotations
         let callback_req_types = self.callback_module.get_request_types();
-        let callback_req_types_json = serde_json::to_string(&callback_req_types).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize callback request types: {e}"),
-            )
-        })?;
+        let callback_req_types_json = serde_json::to_string(&callback_req_types)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize callback request types: {e}")))?;
         // Serialize request IR so the child can generate dataclasses
-        let callback_req_ir_json = serde_json::to_string(&self.callback_request_ir).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize callback request IR: {e}"),
-            )
-        })?;
+        let callback_req_ir_json = serde_json::to_string(&self.callback_request_ir)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize callback request IR: {e}")))?;
         // Serialize response IR so the child can generate dataclasses and match functions
-        let callback_resp_ir_json = serde_json::to_string(&self.callback_response_ir).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize callback response IR: {e}"),
-            )
-        })?;
+        let callback_resp_ir_json = serde_json::to_string(&self.callback_response_ir)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize callback response IR: {e}")))?;
         // Derive invocation IR for message/response automatically
         let mut invocation_ir: Vec<crate::codegen_py::Decl> = <M as crate::codegen_py::ProvideIr>::provide_ir();
         let mut ok_ir: Vec<crate::codegen_py::Decl> = <<M as KameoChildProcessMessage>::Ok as crate::codegen_py::ProvideIr>::provide_ir();
         invocation_ir.append(&mut ok_ir);
-        let invocation_ir_json = serde_json::to_string(&invocation_ir).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to serialize invocation IR: {e}"),
-            )
-        })?;
+        let invocation_ir_json = serde_json::to_string(&invocation_ir)
+            .map_err(|e| std::io::Error::other(format!("Failed to serialize invocation IR: {e}")))?;
         tracing::info!(
             "Serialized callback registry JSON: {}",
             callback_registry_json
@@ -399,12 +368,7 @@ where
             tokio::time::timeout(Duration::from_secs(30), request_incoming.accept()).await??;
         kameo_child_process::perform_handshake::<M>(&mut request_conn, true)
             .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Handshake failed: {e:?}"),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("Handshake failed: {e:?}")))?;
 
         // Accept callback connection
         let (callback_conn, _addr) =
