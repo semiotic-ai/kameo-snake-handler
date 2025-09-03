@@ -22,19 +22,30 @@ pub struct OtelGuard {
 
 impl Drop for OtelGuard {
     fn drop(&mut self) {
-        // Ensure all spans are exported on shutdown
+        // Best-effort flush and shutdown for traces
+        let _ = self.tracer_provider.force_flush();
+        std::thread::sleep(Duration::from_millis(50));
         if let Err(e) = self.tracer_provider.shutdown() {
-            tracing::warn!("Failed to shut down tracer provider: {:?}", e);
+            let msg = format!("{:?}", e);
+            // Downgrade common transport errors to debug to avoid noisy shutdowns
+            if msg.contains("Unavailable") || msg.contains("tcp connect error") {
+                tracing::debug!(error = %msg, "Tracer provider shutdown finished with transport error");
+            } else {
+                tracing::warn!(error = %msg, "Failed to shut down tracer provider");
+            }
         }
 
         // Ensure all metrics are exported on shutdown
         if let Some(meter_provider) = self.meter_provider.take() {
-            // Add a small delay to allow pending metrics to be exported
-            std::thread::sleep(Duration::from_millis(100));
-
+            let _ = meter_provider.force_flush();
+            std::thread::sleep(Duration::from_millis(50));
             if let Err(e) = meter_provider.shutdown() {
-                // Only log as warning since this is often expected during process shutdown
-                tracing::warn!("Failed to shut down meter provider: {:?}", e);
+                let msg = format!("{:?}", e);
+                if msg.contains("Failed to shutdown") || msg.contains("Unavailable") {
+                    tracing::debug!(error = %msg, "Meter provider shutdown finished with transport error");
+                } else {
+                    tracing::warn!(error = %msg, "Failed to shut down meter provider");
+                }
             }
         }
     }
@@ -66,7 +77,7 @@ impl Default for TelemetryExportConfig {
 pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
     config: TelemetryExportConfig,
 ) -> (impl tracing::Subscriber + Send + Sync, OtelGuard) {
-    tracing::warn!("build_subscriber_with_otel_and_fmt_async CALLED!");
+    tracing::debug!("build_subscriber_with_otel_and_fmt_async CALLED");
 
     let protocol =
         std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL").unwrap_or_else(|_| "grpc".to_string());
@@ -74,7 +85,7 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
     let mut provider_builder = SdkTracerProvider::builder();
 
     if config.otlp_enabled {
-        tracing::info!(protocol = %protocol, "Adding OTLP exporter");
+        tracing::debug!(protocol = %protocol, "Adding OTLP exporter");
         // Use the SpanExporter builder which respects OTEL_* env vars
         let builder = opentelemetry_otlp::SpanExporter::builder();
         let exporter = match protocol.as_str() {
@@ -94,7 +105,7 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
         provider_builder = provider_builder.with_batch_exporter(exporter);
     }
     if config.stdout_enabled {
-        tracing::info!("Adding opentelemetry_stdout::SpanExporter for local debug");
+        tracing::debug!("Adding opentelemetry_stdout::SpanExporter for local debug");
         let exporter = SpanExporter::default();
         provider_builder = provider_builder.with_simple_exporter(exporter);
     }
@@ -103,7 +114,7 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
         .with_resource(resource_from_env_or_default("kameo-snake"))
         .build();
 
-    tracing::warn!("setup_otel_layer_async CALLED!");
+    tracing::debug!("setup_otel_layer_async CALLED");
     global::set_tracer_provider(tracer_provider.clone());
 
     // Set the global propagator for distributed tracing
@@ -212,7 +223,7 @@ pub fn setup_otel_layer_with_config(
 ///
 /// Returns the SdkMeterProvider for proper shutdown handling.
 fn setup_metrics() -> SdkMeterProvider {
-    tracing::info!("Initializing OpenTelemetry metrics with OTLP exporter");
+    tracing::debug!("Initializing OpenTelemetry metrics with OTLP exporter");
 
     // Create a metrics exporter - this will automatically use OTEL_* environment variables
     let exporter = match opentelemetry_otlp::MetricExporter::builder()
@@ -254,7 +265,7 @@ fn setup_metrics() -> SdkMeterProvider {
     if let Err(err) = metrics::set_global_recorder(recorder) {
         tracing::warn!(error = %err, "Failed to install metrics-exporter-opentelemetry recorder");
     } else {
-        tracing::info!("OTLP metrics exporter and metrics-opentelemetry bridge configured");
+        tracing::debug!("OTLP metrics exporter and metrics-opentelemetry bridge configured");
     }
 
     provider

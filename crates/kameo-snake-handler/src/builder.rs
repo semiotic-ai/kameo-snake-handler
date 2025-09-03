@@ -7,6 +7,9 @@ use tracing_futures::Instrument;
 
 use tokio_util::sync::CancellationToken;
 
+// Externally-scoped helper trait to allow request type inference from handler type
+// (removed module-scope inference trait; reverting to explicit generic form)
+
 /// Builder for a Python child process
 /// NOTE: For PythonActor, use the macro-based entrypoint (setup_python_subprocess_system!). This builder is not supported for PythonActor.
 /// NOTE: SubprocessParentActor is only valid as an in-process actor with DelegatedReply. If used as a child process actor, it will panic.
@@ -152,6 +155,8 @@ where
         + 'static,
     <M as KameoChildProcessMessage>::Ok: crate::codegen_py::ProvideIr,
 {
+    // (moved HasCallbackRequestType to module scope)
+
     /// Creates a new builder with the given Python configuration and message types.
     pub fn new(python_config: crate::PythonConfig) -> Self {
         let mut python_config = python_config.clone();

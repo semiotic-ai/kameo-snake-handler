@@ -12,9 +12,10 @@ from . import callback_generated_types as callbacks  # noqa: F401
 
 import kameo  # type: ignore[import-not-found]
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging: set levels only, let Rust bridge handle handlers
+logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 async def handle_message_async(message: Dict[str, Any]) -> Dict[str, Any]:

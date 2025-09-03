@@ -15,49 +15,51 @@ use pyo3::types::PyDict;
 pub const PY_OTEL_RUNNER: &str = r#"
 import asyncio
 import inspect
+import logging
 
 def run_with_otel_context(carrier, user_func, *args, **kwargs):
-    import sys
-    sys.stderr.write("=== PYTHON HELPER START ===\n")
-    sys.stderr.flush()
-    sys.stderr.write(f"[DEBUG] run_with_otel_context ENTRY: carrier={carrier}\n")
-    sys.stderr.flush()
+    logging.debug("run_with_otel_context ENTRY: carrier=%s", carrier)
 
     import opentelemetry.propagate, opentelemetry.context, opentelemetry.trace as trace
 
     # Extract the context from the carrier
-    sys.stderr.write(f"[DEBUG] Carrier contents: {carrier}\n")
-    sys.stderr.flush()
+    logging.debug("Carrier contents: %s", carrier)
     ctx = opentelemetry.propagate.extract(carrier)
-    sys.stderr.write(f"[DEBUG] Extracted context: {ctx}\n")
-    sys.stderr.flush()
+    logging.debug("Extracted context: %s", ctx)
 
     # Debug current span before attach
     current_span_before = trace.get_current_span()
     span_context_before = current_span_before.get_span_context()
-    sys.stderr.write(f"[DEBUG] Before attach: current_span={current_span_before} trace_id=0x{span_context_before.trace_id:032x} span_id=0x{span_context_before.span_id:016x} is_remote={span_context_before.is_remote}\n")
-    sys.stderr.flush()
+    logging.debug(
+        "Before attach: current_span=%s trace_id=0x%032x span_id=0x%016x is_remote=%s",
+        current_span_before,
+        span_context_before.trace_id,
+        span_context_before.span_id,
+        span_context_before.is_remote,
+    )
 
     # Ensure clean state then attach extracted context
     try:
         opentelemetry.context.detach(opentelemetry.context.attach({}))
-        sys.stderr.write("[DEBUG] Detached any existing context\n")
-        sys.stderr.flush()
+        logging.debug("Detached any existing context")
     except Exception:
         pass
 
-    sys.stderr.write(f"[DEBUG] About to attach extracted context: {ctx}\n")
-    sys.stderr.flush()
+    logging.debug("About to attach extracted context: %s", ctx)
     token = opentelemetry.context.attach(ctx)
-    sys.stderr.write(f"[DEBUG] Attached context with token: {token}\n")
-    sys.stderr.flush()
+    logging.debug("Attached context with token: %s", token)
 
     try:
         # Verify attach
         current_span_after = trace.get_current_span()
         span_context_after = current_span_after.get_span_context()
-        sys.stderr.write(f"[DEBUG] After attach: current_span={current_span_after} trace_id=0x{span_context_after.trace_id:032x} span_id=0x{span_context_after.span_id:016x} is_remote={span_context_after.is_remote}\n")
-        sys.stderr.flush()
+        logging.debug(
+            "After attach: current_span=%s trace_id=0x%032x span_id=0x%016x is_remote=%s",
+            current_span_after,
+            span_context_after.trace_id,
+            span_context_after.span_id,
+            span_context_after.is_remote,
+        )
 
         # Call the user function with context active
         result = user_func(*args, **kwargs)
@@ -69,17 +71,19 @@ def run_with_otel_context(carrier, user_func, *args, **kwargs):
                 try:
                     current_span = trace.get_current_span()
                     sc = current_span.get_span_context()
-                    sys.stderr.write(f"[DEBUG] Async wrapper with attached context: trace_id=0x{sc.trace_id:032x} span_id=0x{sc.span_id:016x} is_remote={sc.is_remote}\n")
-                    sys.stderr.flush()
+                    logging.debug(
+                        "Async wrapper with attached context: trace_id=0x%032x span_id=0x%016x is_remote=%s",
+                        sc.trace_id,
+                        sc.span_id,
+                        sc.is_remote,
+                    )
                     # Create a minimal Python span so language: python appears in traces
                     tracer = trace.get_tracer("kameo_snake_handler")
                     with tracer.start_as_current_span("python.handle_user_function"):
                         return await result
                 finally:
                     opentelemetry.context.detach(inner_token)
-
-            sys.stderr.write(f"[DEBUG] User function returned coroutine, returning wrapped coroutine\n")
-            sys.stderr.flush()
+            logging.debug("User function returned coroutine, returning wrapped coroutine")
             return async_wrapper()
         else:
             # Sync: just return result under attached context
@@ -88,14 +92,18 @@ def run_with_otel_context(carrier, user_func, *args, **kwargs):
                 return result
     finally:
         opentelemetry.context.detach(token)
-        sys.stderr.write(f"[DEBUG] Detached context with token: {token}\n")
-        sys.stderr.flush()
+        logging.debug("Detached context with token: %s", token)
 
         # Debug: current span after detachment
         current_span_after_detach = trace.get_current_span()
         span_context_after_detach = current_span_after_detach.get_span_context()
-        sys.stderr.write(f"[DEBUG] After detachment: current_span={current_span_after_detach} trace_id=0x{span_context_after_detach.trace_id:032x} span_id=0x{span_context_after_detach.span_id:016x} is_remote={span_context_after_detach.is_remote}\n")
-        sys.stderr.flush()
+        logging.debug(
+            "After detachment: current_span=%s trace_id=0x%032x span_id=0x%016x is_remote=%s",
+            current_span_after_detach,
+            span_context_after_detach.trace_id,
+            span_context_after_detach.span_id,
+            span_context_after_detach.is_remote,
+        )
 "#;
 
 /// Create a Python message handler span with proper context.
@@ -241,11 +249,12 @@ from opentelemetry.sdk.trace.export import ConsoleSpanExporter, BatchSpanProcess
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.sampling import ParentBased, ALWAYS_ON
 import os
+import logging
 
 # Only initialize if no real TracerProvider is set (check for proxy or noop)
 provider_class = trace.get_tracer_provider().__class__.__name__
 if provider_class in ['NoOpTracerProvider', 'ProxyTracerProvider']:
-    print("[DEBUG] Initializing Python OpenTelemetry SDK from Rust")
+    logging.debug("Initializing Python OpenTelemetry SDK from Rust")
     
     # Create a resource with Python-specific attributes (let environment handle service attributes)
     resource = Resource.create({
@@ -254,8 +263,8 @@ if provider_class in ['NoOpTracerProvider', 'ProxyTracerProvider']:
         "service.name": "kameo-snake",  # Match Rust service name
     })
     
-    print(f"[DEBUG] Created Python resource: {resource}")
-    print(f"[DEBUG] Resource attributes: {resource.attributes}")
+    logging.debug("Created Python resource: %s", resource)
+    logging.debug("Resource attributes: %s", resource.attributes)
     
     # Create a new TracerProvider with Python resource and proper sampling
     # Use ParentBased sampler to ensure remote spans are recorded
@@ -265,37 +274,37 @@ if provider_class in ['NoOpTracerProvider', 'ProxyTracerProvider']:
     )
     trace.set_tracer_provider(provider)
     
-    print(f"[DEBUG] Set tracer provider with resource: {provider}")
-    print(f"[DEBUG] Provider resource: {provider.resource}")
+    logging.debug("Set tracer provider with resource: %s", provider)
+    logging.debug("Provider resource: %s", provider.resource)
 else:
-    print("[DEBUG] Python OpenTelemetry SDK already initialized")
+    logging.debug("Python OpenTelemetry SDK already initialized")
 
 # Always try to add OTLP exporter if endpoint is configured (even if provider already exists)
 otlp_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
-print(f"[DEBUG] OTEL_EXPORTER_OTLP_ENDPOINT: {otlp_endpoint}")
+logging.debug("OTEL_EXPORTER_OTLP_ENDPOINT: %s", otlp_endpoint)
 if otlp_endpoint:
     try:
-        print("[DEBUG] Attempting to import OTLP exporter...")
+        logging.debug("Attempting to import OTLP exporter...")
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-        print("[DEBUG] OTLP exporter imported successfully")
+        logging.debug("OTLP exporter imported successfully")
         otlp_exporter = OTLPSpanExporter(
             endpoint=otlp_endpoint,
             insecure=True
         )
-        print(f"[DEBUG] OTLP exporter created with endpoint: {otlp_endpoint}")
+        logging.debug("OTLP exporter created with endpoint: %s", otlp_endpoint)
         # Get the current provider (may have just been set above)
         provider = trace.get_tracer_provider()
-        print(f"[DEBUG] Current provider: {provider}")
+        logging.debug("Current provider: %s", provider)
         provider.add_span_processor(
             BatchSpanProcessor(otlp_exporter)
         )
-        print(f"[DEBUG] OTLP exporter configured with endpoint: {otlp_endpoint}")
+        logging.debug("OTLP exporter configured with endpoint: %s", otlp_endpoint)
     except ImportError as e:
-        print(f"[DEBUG] OTLP exporter not available, skipping: {e}")
+        logging.debug("OTLP exporter not available, skipping: %s", e)
     except Exception as e:
-        print(f"[DEBUG] OTLP exporter configuration failed: {e}")
+        logging.debug("OTLP exporter configuration failed: %s", e)
 else:
-    print("[DEBUG] No OTEL_EXPORTER_OTLP_ENDPOINT found, skipping OTLP exporter")
+    logging.debug("No OTEL_EXPORTER_OTLP_ENDPOINT found, skipping OTLP exporter")
 
 # Console exporter removed - only use OTLP exporter for consistency with Rust
 "#;
@@ -402,19 +411,26 @@ else:
             r#"
 import opentelemetry.trace as trace
 import opentelemetry.propagate as otel_propagate
+import logging
 
 # Debug: Print carrier contents before extraction
 carrier = {carrier_dict:?}
-print(f"[DEBUG] Python carrier before extraction: {{carrier}}")
+logging.debug("Python carrier before extraction: %s", carrier)
 
 # Debug: Print result of extract (but don't attach globally)
 extracted_context = otel_propagate.extract(carrier)
-print(f"[DEBUG] Python extracted_context: {{extracted_context}}")
+logging.debug("Python extracted_context: %s", extracted_context)
 
 # Debug: Print current span (should be default/empty)
 current_span = trace.get_current_span()
 span_context = current_span.get_span_context()
-print(f"[DEBUG] Current span (should be default): current_span={{current_span}} trace_id=0x{{span_context.trace_id:032x}} span_id=0x{{span_context.span_id:016x}} is_remote={{span_context.is_remote}}")
+logging.debug(
+    "Current span (should be default): current_span=%s trace_id=0x%032x span_id=0x%016x is_remote=%s",
+    current_span,
+    span_context.trace_id,
+    span_context.span_id,
+    span_context.is_remote,
+)
 "#,
             carrier_dict = carrier_dict_clone
         );
@@ -450,11 +466,14 @@ try:
     provider = trace.get_tracer_provider()
     if hasattr(provider, 'force_flush'):
         provider.force_flush()
-        print("[DEBUG] Forced flush of Python spans")
+        import logging
+        logging.debug("Forced flush of Python spans")
     else:
-        print("[DEBUG] Provider does not support force_flush")
+        import logging
+        logging.debug("Provider does not support force_flush")
 except Exception as e:
-    print(f"[DEBUG] Force flush failed: {e}")
+    import logging
+    logging.debug("Force flush failed: %s", e)
 "#;
 
         py.run(

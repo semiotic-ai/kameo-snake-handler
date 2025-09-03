@@ -20,7 +20,7 @@ from . import callback_generated_types as cb
 
 # Generated callback types are required for this package
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='[PYTHON ASYNC] %(levelname)s %(message)s')
+logging.getLogger().setLevel(logging.INFO)
 
 async def process_async_calculation(func, *args) -> Any:
     return func(*args)

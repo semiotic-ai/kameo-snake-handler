@@ -115,3 +115,11 @@ pub mod prelude {
     pub use super::{PythonExecutionError};
     pub use super::{setup_python_runtime, PythonActor, PythonChildProcessBuilder, PythonConfig};
 }
+
+/// Initialize the Python logging -> Rust tracing bridge.
+///
+/// Call this while holding the GIL, ideally before importing user modules that may configure logging.
+#[inline]
+pub fn setup_python_logging_bridge(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
+    tracing_for_pyo3_logging::setup_logging(py)
+}

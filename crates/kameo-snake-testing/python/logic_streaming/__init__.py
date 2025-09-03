@@ -21,7 +21,7 @@ except Exception:
 from logic import LogicError
 import kameo  # type: ignore[import-not-found]
 
-logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='[PYTHON STREAMING] %(levelname)s %(message)s')
+logging.getLogger().setLevel(logging.INFO)
 
 async def fibonacci_generator(count: int) -> AsyncGenerator[gen.TestResponse, None]:
     a, b = 0, 1

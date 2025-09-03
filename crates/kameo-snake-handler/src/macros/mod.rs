@@ -45,6 +45,13 @@ macro_rules! setup_python_subprocess_system {
                                 let config_json = std::env::var("KAMEO_PYTHON_CONFIG").expect("KAMEO_PYTHON_CONFIG must be set in child");
                                 let config: kameo_snake_handler::PythonConfig = serde_json::from_str(&config_json).expect("Failed to parse KAMEO_PYTHON_CONFIG");
 
+                                // Initialize Python logging -> Rust tracing bridge as early as possible, before importing user modules
+                                if config.enable_python_logging_bridge {
+                                    if let Err(e) = kameo_snake_handler::setup_python_logging_bridge(py) {
+                                        tracing::warn!(error = ?e, "Failed to initialize Python logging bridge prior to import");
+                                    }
+                                }
+
                                 // Extracted: create dynamic modules and emit generated files
                                 $crate::macros::py_dynamic::create_dynamic_modules(py, &config)?;
 

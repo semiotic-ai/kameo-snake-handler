@@ -378,24 +378,6 @@ where
     {
         tracing::warn!(error = ?e, "Failed to initialize Python OpenTelemetry SDK");
     }
-
-    // Optionally bridge Python logging to Rust tracing if enabled in config
-    if actor
-        .handler
-        .config
-        .enable_python_logging_bridge
-    {
-        Python::with_gil(|py| {
-            match tracing_for_pyo3_logging::setup_logging(py) {
-                Ok(()) => {
-                    tracing::info!(event = "python_logging_bridge_initialized");
-                }
-                Err(e) => {
-                    tracing::warn!(error = ?e, "Failed to initialize Python logging bridge");
-                }
-            }
-        });
-    }
     match run_child_actor_loop::<_, M>(actor.handler.clone_with_gil(), conn, config).await {
         Ok(()) => {
             tracing::info!("Child process exited cleanly (no process::exit). Returning from child_process_main_with_python_actor.");
