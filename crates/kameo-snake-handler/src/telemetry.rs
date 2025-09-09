@@ -209,6 +209,11 @@ pub fn setup_otel_layer_with_config(
     tracing_opentelemetry::layer().with_tracer(tracer)
 }
 
+/// Construct an EnvFilter that clamps noisy external crates while keeping our
+/// crates verbose at trace by default. If RUST_LOG is set, it is appended last
+/// to allow users to override any defaults.
+// Note: log filtering is controlled entirely by the executing environment via RUST_LOG/EnvFilter
+
 /// Initialize OpenTelemetry metrics with OTLP exporter.
 ///
 /// This function sets up the OpenTelemetry metrics pipeline:

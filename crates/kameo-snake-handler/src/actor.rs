@@ -605,11 +605,11 @@ where
         use pyo3::prelude::*;
         use pyo3_async_runtimes::tokio::into_future;
 
-        tracing::debug!(event = "stream_poll_next", state = ?self.state, "Stream poll_next called");
+        tracing::trace!(event = "stream_poll_next", state = ?self.state, "Stream poll_next called");
 
         match &mut self.state {
             PythonAsyncGeneratorState::Initial => {
-                tracing::debug!(
+                tracing::trace!(
                     event = "stream_initial_state",
                     "Starting to create generator"
                 );
@@ -690,17 +690,14 @@ where
                 };
 
                 self.state = PythonAsyncGeneratorState::CreatingGenerator { fut: Box::pin(fut) };
-
-                // Poll the future immediately
-                self.poll_next(cx)
+                std::task::Poll::Pending
             }
 
             PythonAsyncGeneratorState::CreatingGenerator { fut } => {
                 match fut.as_mut().poll(cx) {
                     std::task::Poll::Ready(Ok((_gen, async_iter))) => {
                         self.state = PythonAsyncGeneratorState::Generator { async_iter };
-                        // Start getting the first item
-                        self.poll_next(cx)
+                        std::task::Poll::Pending
                     }
                     std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
                     std::task::Poll::Pending => std::task::Poll::Pending,
@@ -763,9 +760,7 @@ where
                     async_iter: Python::with_gil(|py| async_iter.clone_ref(py)),
                     fut: Box::pin(fut),
                 };
-
-                // Poll the future immediately
-                self.poll_next(cx)
+                std::task::Poll::Pending
             }
 
             PythonAsyncGeneratorState::GettingNext { async_iter, fut } => {
