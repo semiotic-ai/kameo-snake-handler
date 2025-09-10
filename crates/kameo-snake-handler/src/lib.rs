@@ -121,5 +121,49 @@ pub mod prelude {
 /// Call this while holding the GIL, ideally before importing user modules that may configure logging.
 #[inline]
 pub fn setup_python_logging_bridge(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
-    tracing_for_pyo3_logging::setup_logging(py)
+    // Initialize the base bridge first
+    tracing_for_pyo3_logging::setup_logging(py)?;
+
+    // Apply a safe, idempotent monkeypatch to sanitize logging extras that collide with
+    // LogRecord reserved attributes (e.g., 'message'), which otherwise cause KeyError.
+    // This prevents crashes when user code logs with reserved keys, especially under concurrency.
+    let patch_code = r#"
+import logging
+
+if not getattr(logging, '_kameo_makeRecord_patched', False):
+    _orig_makeRecord = logging.Logger.makeRecord
+
+    try:
+        _reserved = set(vars(logging.LogRecord(__name__, logging.INFO, __file__, 0, '', (), None)))
+    except Exception:
+        _reserved = {
+            'name','msg','args','levelname','levelno','pathname','filename','module',
+            'exc_info','exc_text','stack_info','lineno','funcName','created','msecs',
+            'relativeCreated','thread','threadName','process','processName'
+        }
+
+    # Ensure 'message' is considered reserved even if not present in the default dict yet
+    _reserved.add('message')
+
+    def _kameo_makeRecord(self, name, level, fn, lno, msg, args, exc_info, func=None, extra=None, sinfo=None, **kwargs):
+        if extra:
+            moved = {}
+            sanitized = {}
+            for k, v in extra.items():
+                if k in _reserved:
+                    moved[k] = v
+                else:
+                    sanitized[k] = v
+            if moved:
+                # Preserve conflicting keys under a namespaced field rather than dropping
+                sanitized.setdefault('py_reserved', moved)
+            extra = sanitized
+        return _orig_makeRecord(self, name, level, fn, lno, msg, args, exc_info, func=func, extra=extra, sinfo=sinfo, **kwargs)
+
+    logging.Logger.makeRecord = _kameo_makeRecord
+    logging._kameo_makeRecord_patched = True
+"#;
+
+    py.run(std::ffi::CString::new(patch_code).unwrap().as_c_str(), None, None)?;
+    Ok(())
 }

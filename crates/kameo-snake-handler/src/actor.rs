@@ -605,11 +605,11 @@ where
         use pyo3::prelude::*;
         use pyo3_async_runtimes::tokio::into_future;
 
-        tracing::trace!(event = "stream_poll_next", state = ?self.state, "Stream poll_next called");
+        tracing::debug!(event = "stream_poll_next", state = ?self.state, "Stream poll_next called");
 
         match &mut self.state {
             PythonAsyncGeneratorState::Initial => {
-                tracing::trace!(
+                tracing::debug!(
                     event = "stream_initial_state",
                     "Starting to create generator"
                 );
@@ -690,16 +690,23 @@ where
                 };
 
                 self.state = PythonAsyncGeneratorState::CreatingGenerator { fut: Box::pin(fut) };
-                std::task::Poll::Pending
+
+                // Poll the future immediately
+                self.poll_next(cx)
             }
 
             PythonAsyncGeneratorState::CreatingGenerator { fut } => {
                 match fut.as_mut().poll(cx) {
                     std::task::Poll::Ready(Ok((_gen, async_iter))) => {
                         self.state = PythonAsyncGeneratorState::Generator { async_iter };
-                        std::task::Poll::Pending
+                        // Start getting the first item
+                        self.poll_next(cx)
                     }
-                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Ready(Err(e)) => {
+                        // Terminal error while creating generator; mark exhausted to prevent repolling a completed future
+                        self.state = PythonAsyncGeneratorState::Exhausted;
+                        std::task::Poll::Ready(Some(Err(e)))
+                    }
                     std::task::Poll::Pending => std::task::Poll::Pending,
                 }
             }
@@ -760,7 +767,9 @@ where
                     async_iter: Python::with_gil(|py| async_iter.clone_ref(py)),
                     fut: Box::pin(fut),
                 };
-                std::task::Poll::Pending
+
+                // Poll the future immediately
+                self.poll_next(cx)
             }
 
             PythonAsyncGeneratorState::GettingNext { async_iter, fut } => {
@@ -775,7 +784,11 @@ where
                         self.state = PythonAsyncGeneratorState::Exhausted;
                         std::task::Poll::Ready(None)
                     }
-                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Ready(Err(e)) => {
+                        // Terminal error from generator; mark exhausted to prevent repoll of completed future
+                        self.state = PythonAsyncGeneratorState::Exhausted;
+                        std::task::Poll::Ready(Some(Err(e)))
+                    }
                     std::task::Poll::Pending => std::task::Poll::Pending,
                 }
             }

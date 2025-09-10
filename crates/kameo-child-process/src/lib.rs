@@ -95,7 +95,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use tokio::sync::mpsc;
-use tracing::{error, trace, debug, warn};
+use tracing::{error, trace};
 pub mod error;
 pub use error::PythonExecutionError;
 
@@ -1046,20 +1046,50 @@ impl From<std::io::Error> for ChildProcessLoopError {
 async fn read_next_message(
     conn: &mut tokio::net::UnixStream,
 ) -> Result<Option<Vec<u8>>, io::Error> {
-    // Reduced trace verbosity for framing reads
+    tracing::trace!(
+        event = "child_read",
+        step = "before_len",
+        "About to read length prefix"
+    );
     let mut len_buf = [0u8; 4];
     match conn.read_exact(&mut len_buf).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            tracing::trace!(
+                event = "child_read",
+                step = "clean_eof",
+                "Clean EOF detected on length read"
+            );
             return Ok(None);
         }
         Err(e) => {
+            tracing::trace!(event = "child_read", step = "error", error = ?e);
             return Err(e);
         }
     }
     let msg_len = u32::from_le_bytes(len_buf) as usize;
+    tracing::trace!(
+        event = "child_read",
+        step = "after_len",
+        ?len_buf,
+        msg_len,
+        "Read length prefix"
+    );
+    tracing::trace!(
+        event = "child_read",
+        step = "before_msg",
+        msg_len,
+        "About to read message of len {}",
+        msg_len
+    );
     let mut msg_buf = vec![0u8; msg_len];
     conn.read_exact(&mut msg_buf).await?;
+    tracing::trace!(
+        event = "child_read",
+        step = "after_msg",
+        len = msg_buf.len(),
+        "Read message"
+    );
     Ok(Some(msg_buf))
 }
 
@@ -1101,17 +1131,25 @@ where
     let mut reply_tx = Some(reply_tx_inner);
     let mut shutdown = false;
     loop {
-        // Trim per-iteration trace noise
+        tracing::trace!(
+            event = "child_loop",
+            step = "enter",
+            shutdown = shutdown,
+            "Entering child actor loop select"
+        );
         if !shutdown {
             tokio::select! {
+                biased;
                 Some(_) = in_flight.next() => {
-                    // frequent completion; leave at debug when needed
+                    tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
                 }
                 read_res = read_next_message(&mut conn) => {
                     match read_res {
                         Ok(Some(msg)) => {
+                            tracing::trace!(event = "child_ipc", step = "read", len = msg.len(), raw = ?&msg[..std::cmp::min(100, msg.len())], "Read message from parent");
                             let ctrl: Control<M> = match serde_brief::from_slice(&msg[..]) {
                                 Ok(ctrl) => {
+                                    tracing::trace!(event = "serde_brief_decode", type_deserialized = std::any::type_name::<Control<M>>(), len = msg.len(), "Decoding Control envelope");
                                     tracing::debug!(event = "control_received", control_type = ?ctrl, "Received control message");
                                     ctrl
                                 },
@@ -1126,139 +1164,192 @@ where
                                 }
                                 Control::Sync(envelope) => {
                                     let correlation_id = envelope.correlation_id;
+
+                                    // Debug: Log the context contents to see what's being extracted
+                                    tracing::debug!(
+                                        event = "context_debug",
+                                        correlation_id = correlation_id,
+                                        context_keys = ?envelope.context.0.keys().collect::<Vec<_>>(),
+                                        context_values = ?envelope.context.0.values().collect::<Vec<_>>(),
+                                        "Extracted parent context from envelope"
+                                    );
+
                                     let mut handler = handler.clone();
                                     let reply_tx = reply_tx.as_ref().unwrap().clone();
+
+                                    // Use encapsulated span lifecycle management
                                     let _msg_type = std::any::type_name::<M>();
+
+                                    // Create the message processing future with ipc-child-receive span
                                     let process_future = async move {
+                                        // Create ipc-child-receive span with proper parent context
                                         let parent_cx = envelope.context.extract_parent();
                                         let child_receive_span = crate::tracing_utils::create_ipc_child_receive_span(
                                             correlation_id,
                                             std::any::type_name::<M>(),
                                             parent_cx,
                                         );
+
+                                        // Process the message with tracing context
                                         let result = async {
                                             handler.handle_child_message_with_context(envelope.inner, envelope.context.clone()).await
                                         }.instrument(child_receive_span).await;
+
+                                        // Send the reply
                                         let reply_envelope = MultiplexEnvelope {
                                             correlation_id,
                                             inner: result,
                                             context: envelope.context,
                                         };
                                         let ctrl = Control::Sync(reply_envelope);
+
+                                        // Encode the reply to bytes
                                         match serde_brief::to_vec(&ctrl) {
                                             Ok(reply_bytes) => {
-                                                debug!(event = "reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Reply encoded successfully");
+                                                trace!(event = "reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Reply encoded successfully");
                                                 if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
-                                                    warn!(event = "reply_send_error", correlation_id = correlation_id, error = ?e, "Failed to send reply");
+                                                    trace!(event = "reply_send_error", correlation_id = correlation_id, error = ?e, "Failed to send reply");
                                                 } else {
-                                                    debug!(event = "reply_sent", correlation_id = correlation_id, "Reply sent successfully");
+                                                    trace!(event = "reply_sent", correlation_id = correlation_id, "Reply sent successfully");
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!(event = "reply_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode reply");
+                                                trace!(event = "reply_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode reply");
                                             }
                                         }
                                     };
+
+                                    // Box the future without redundant span instrumentation
                                     let boxed_future = Box::pin(process_future);
                                     in_flight.push(Box::new(boxed_future));
-                                    tracing::debug!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(),
+                                    tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(),
                                         correlation_id = correlation_id, "Pushed message future to child in_flight");
                                 }
                                 Control::Stream(envelope) => {
                                     let correlation_id = envelope.correlation_id;
                                     let parent_cx = envelope.context.extract_parent();
+
+                                    tracing::debug!(
+                                        event = "context_debug",
+                                        correlation_id = correlation_id,
+                                        context_keys = ?envelope.context.0.keys().collect::<Vec<_>>(),
+                                        context_values = ?envelope.context.0.values().collect::<Vec<_>>(),
+                                        "Extracted parent context from stream envelope"
+                                    );
+
                                     let mut handler = handler.clone();
                                     let reply_tx = reply_tx.as_ref().unwrap().clone();
+
+                                    // Use encapsulated span lifecycle management
                                     let _msg_type = std::any::type_name::<M>();
+
+                                    // Create the streaming message processing future with ipc-child-receive span
                                     let process_future = async move {
+                                        // Create ipc-child-receive span with proper parent context
                                         let child_receive_span = crate::tracing_utils::create_ipc_child_receive_span(
                                             correlation_id,
                                             std::any::type_name::<M>(),
                                             parent_cx,
                                         );
+
+                                        // Process the message as a stream
                                         let stream_result = async {
                                             handler.handle_child_message_stream(envelope.inner).await
                                         }.instrument(child_receive_span).await;
+
                                         match stream_result {
                                             Ok(mut stream) => {
+                                                // Process each item in the stream
                                                 while let Some(item_result) = stream.next().await {
                                                     let reply_envelope = MultiplexEnvelope {
                                                         correlation_id,
                                                         inner: item_result,
                                                         context: envelope.context.clone(),
                                                     };
+
+                                                    // Send as stream item
                                                     let ctrl = Control::Stream(reply_envelope);
+
+                                                    // Encode the reply to bytes
                                                     match serde_brief::to_vec(&ctrl) {
                                                         Ok(reply_bytes) => {
-                                                            debug!(event = "stream_reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Stream reply encoded successfully");
+                                                            trace!(event = "stream_reply_encoded", correlation_id = correlation_id, reply_size = reply_bytes.len(), "Stream reply encoded successfully");
                                                             if let Err(e) = reply_tx.send((correlation_id, reply_bytes)) {
-                                                                warn!(event = "stream_reply_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream reply");
+                                                                trace!(event = "stream_reply_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream reply");
                                                                 break;
                                                             } else {
-                                                                debug!(event = "stream_reply_sent", correlation_id = correlation_id, "Stream reply sent successfully");
+                                                                trace!(event = "stream_reply_sent", correlation_id = correlation_id, "Stream reply sent successfully");
                                                             }
                                                         }
                                                         Err(e) => {
-                                                            warn!(event = "stream_reply_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream reply");
+                                                            trace!(event = "stream_reply_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream reply");
                                                             break;
                                                         }
                                                     }
                                                 }
+
+                                                // Send stream end marker
                                                 let end_envelope: MultiplexEnvelope<Option<Result<(), PythonExecutionError>>> = MultiplexEnvelope {
                                                     correlation_id,
-                                                    inner: None,
+                                                    inner: None, // Stream end marker
                                                     context: envelope.context,
                                                 };
                                                 let end_ctrl = Control::StreamEnd(end_envelope);
+
                                                 match serde_brief::to_vec(&end_ctrl) {
                                                     Ok(end_bytes) => {
-                                                        debug!(event = "stream_end_encoded", correlation_id = correlation_id, "Stream end encoded successfully");
+                                                        trace!(event = "stream_end_encoded", correlation_id = correlation_id, "Stream end encoded successfully");
                                                         if let Err(e) = reply_tx.send((correlation_id, end_bytes)) {
-                                                            warn!(event = "stream_end_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream end");
+                                                            trace!(event = "stream_end_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream end");
                                                         } else {
-                                                            debug!(event = "stream_end_sent", correlation_id = correlation_id, "Stream end sent successfully");
+                                                            trace!(event = "stream_end_sent", correlation_id = correlation_id, "Stream end sent successfully");
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        warn!(event = "stream_end_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream end");
+                                                        trace!(event = "stream_end_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream end");
                                                     }
                                                 }
                                             }
                                             Err(e) => {
+                                                // Send error as stream end
                                                 let error_envelope: MultiplexEnvelope<Option<Result<M::Ok, PythonExecutionError>>> = MultiplexEnvelope {
                                                     correlation_id,
                                                     inner: Some(Err(e)),
                                                     context: envelope.context,
                                                 };
                                                 let error_ctrl = Control::StreamEnd(error_envelope);
+
                                                 match serde_brief::to_vec(&error_ctrl) {
                                                     Ok(error_bytes) => {
-                                                        debug!(event = "stream_error_encoded", correlation_id = correlation_id, "Stream error encoded successfully");
+                                                        trace!(event = "stream_error_encoded", correlation_id = correlation_id, "Stream error encoded successfully");
                                                         if let Err(e) = reply_tx.send((correlation_id, error_bytes)) {
-                                                            warn!(event = "stream_error_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream error");
+                                                            trace!(event = "stream_error_send_error", correlation_id = correlation_id, error = ?e, "Failed to send stream error");
                                                         } else {
-                                                            debug!(event = "stream_error_sent", correlation_id = correlation_id, "Stream error sent successfully");
+                                                            trace!(event = "stream_error_sent", correlation_id = correlation_id, "Stream error sent successfully");
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        warn!(event = "stream_error_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream error");
+                                                        trace!(event = "stream_error_encoding_error", correlation_id = correlation_id, error = ?e, "Failed to encode stream error");
                                                     }
                                                 }
                                             }
                                         }
                                     };
+
+                                    // Box the future without redundant span instrumentation
                                     let boxed_future = Box::pin(process_future);
                                     in_flight.push(Box::new(boxed_future));
-                                    tracing::debug!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(),
+                                    tracing::trace!(event = "child_in_flight", action = "push", in_flight_len = in_flight.len(),
                                         correlation_id = correlation_id, "Pushed streaming message future to child in_flight");
                                 }
                                 Control::StreamEnd(_) => {
+                                    // Stream end messages are only sent from child to parent, not received by child
                                     tracing::warn!(event = "child_ipc", step = "unexpected_stream_end", "Received unexpected stream end message from parent");
                                 }
                             }
                         }
                         Ok(None) => {
-                            tracing::debug!(event = "child_loop", step = "clean_shutdown", "Clean shutdown (EOF) detected, setting shutdown=true");
+                            tracing::trace!(event = "child_loop", step = "clean_shutdown", "Clean shutdown (EOF) detected, setting shutdown=true");
                             shutdown = true;
                             reply_tx.take();  // Drop the sender to close the channel
                         }
@@ -1277,13 +1368,14 @@ where
                         tracing::error!(event = "child_ipc", step = "write_reply_error", correlation_id, error = %e, "Failed to write reply to parent");
                         break;
                     }
-                    tracing::debug!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
+                    tracing::trace!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
                 }
             }
         } else {
             tokio::select! {
+                biased;
                 Some(_) = in_flight.next() => {
-                    // frequent completion; leave at debug when needed
+                    tracing::trace!(event = "child_in_flight", action = "complete", in_flight_len = in_flight.len(), "Handler future completed in child in_flight");
                 }
                 maybe_reply = reply_rx.recv() => {
                     if let Some((correlation_id, reply_bytes)) = maybe_reply {
@@ -1295,7 +1387,7 @@ where
                             tracing::error!(event = "child_ipc", step = "write_reply_error", correlation_id, error = %e, "Failed to write reply to parent");
                             break;
                         }
-                        tracing::debug!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
+                        tracing::trace!(event = "child_ipc", step = "reply_sent", correlation_id, len = reply_bytes.len(), "Sent reply to parent");
                     } else {
                         tracing::trace!(event = "child_loop", step = "reply_channel_closed", "Reply channel closed");
                     }

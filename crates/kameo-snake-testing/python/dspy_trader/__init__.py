@@ -89,7 +89,7 @@ async def handle_message(message: Dict[str, Any]) -> Dict[str, Any]:
     setup_dspy_autologging()
     logging.debug("DSPy autologging configured with OTEL context")
 
-    logging.debug("handle_message ENTRY", extra={"thread": threading.get_ident(), "message": message})
+    logging.debug("handle_message ENTRY", extra={"thread": threading.get_ident(), "payload": message})
 
     # Parse to generated TraderMessage
     tm: gen.TraderMessage = gen.from_wire_trader_message(message)

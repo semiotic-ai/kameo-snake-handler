@@ -1814,7 +1814,7 @@ kameo_snake_handler::setup_python_subprocess_system! {
             let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
                 TelemetryExportConfig {
                     otlp_enabled: true,
-                    stdout_enabled: true,
+                    stdout_enabled: false,
                     metrics_enabled: true,
                 }
             ).await;
