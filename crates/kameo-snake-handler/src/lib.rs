@@ -165,5 +165,50 @@ if not getattr(logging, '_kameo_makeRecord_patched', False):
 "#;
 
     py.run(std::ffi::CString::new(patch_code).unwrap().as_c_str(), None, None)?;
+
+    // Deduplicate output: remove Python StreamHandlers so logs don't print directly to stdout/stderr
+    // and ensure propagation so all library logs reach the root and the Rust bridge handler.
+    let dedup_code = r#"
+import logging
+
+if not getattr(logging, '_kameo_dedup_handlers', False):
+    root = logging.getLogger()
+    # Ensure root level is DEBUG so the Rust bridge can capture everything and rely on Rust filtering
+    try:
+        root.setLevel(logging.DEBUG)
+    except Exception:
+        pass
+
+    # Ensure all named loggers propagate up to root (so the bridge handler sees them)
+    try:
+        for name, logger in list(logging.root.manager.loggerDict.items()):
+            if isinstance(logger, logging.Logger):
+                logger.propagate = True
+    except Exception:
+        pass
+
+    # Remove direct StreamHandlers to avoid duplicate console prints from Python side
+    def _is_stream_handler(h):
+        try:
+            return isinstance(h, logging.StreamHandler)
+        except Exception:
+            return False
+
+    try:
+        # Root
+        for h in list(getattr(root, 'handlers', ())):
+            if _is_stream_handler(h):
+                root.removeHandler(h)
+        # Named loggers
+        for logger in [l for l in logging.root.manager.loggerDict.values() if isinstance(l, logging.Logger)]:
+            for h in list(getattr(logger, 'handlers', ())):
+                if _is_stream_handler(h):
+                    logger.removeHandler(h)
+    except Exception:
+        pass
+
+    logging._kameo_dedup_handlers = True
+"#;
+    py.run(std::ffi::CString::new(dedup_code).unwrap().as_c_str(), None, None)?;
     Ok(())
 }
