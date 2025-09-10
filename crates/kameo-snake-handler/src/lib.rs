@@ -105,6 +105,41 @@ pub use crate::actor::PythonMessageHandler;
 // Experimental: static Python code generation (exposed for tests and tooling)
 pub mod codegen_py;
 
+use pyo3::prelude::*;
+
+#[pyfunction]
+fn _kameo_emit_log(
+    logger: &str,
+    levelno: u32,
+    message: &str,
+    pathname: &str,
+    lineno: u32,
+) -> PyResult<()> {
+    if levelno >= 50 {
+        tracing::error!(target: "py", logger = %logger, pathname = %pathname, lineno = lineno, message = %message);
+    } else if levelno >= 40 {
+        tracing::error!(target: "py", logger = %logger, pathname = %pathname, lineno = lineno, message = %message);
+    } else if levelno >= 30 {
+        tracing::warn!(target: "py", logger = %logger, pathname = %pathname, lineno = lineno, message = %message);
+    } else if levelno >= 20 {
+        tracing::info!(target: "py", logger = %logger, pathname = %pathname, lineno = lineno, message = %message);
+    } else if levelno >= 10 {
+        tracing::debug!(target: "py", logger = %logger, pathname = %pathname, lineno = lineno, message = %message);
+    } else {
+        tracing::trace!(target: "py", logger = %logger, pathname = %pathname, lineno = lineno, message = %message);
+    }
+    Ok(())
+}
+
+fn install_kameo_rs_logging_module(py: Python<'_>) -> PyResult<()> {
+    let m = PyModule::new(py, "kameo_rs_logging")?;
+    m.add_function(pyo3::wrap_pyfunction!(_kameo_emit_log, &m)?)?;
+    let sys = py.import("sys")?;
+    let modules = sys.getattr("modules")?;
+    modules.set_item("kameo_rs_logging", m)?;
+    Ok(())
+}
+
 #[tracing::instrument(skip(builder), name = "setup_python_runtime")]
 pub fn setup_python_runtime(builder: tokio::runtime::Builder) {
     pyo3::prepare_freethreaded_python();
@@ -126,7 +161,7 @@ pub fn setup_python_logging_bridge(py: pyo3::Python<'_>) -> pyo3::PyResult<()> {
 
     // Apply a safe, idempotent monkeypatch to sanitize logging extras that collide with
     // LogRecord reserved attributes (e.g., 'message'), which otherwise cause KeyError.
-    // This prevents crashes when user code logs with reserved keys, especially under concurrency.
+    // This prevents crashes when user code logs with reserved keys
     let patch_code = r#"
 import logging
 
@@ -166,10 +201,10 @@ if not getattr(logging, '_kameo_makeRecord_patched', False):
 
     py.run(std::ffi::CString::new(patch_code).unwrap().as_c_str(), None, None)?;
 
-    // Deduplicate output: remove Python StreamHandlers so logs don't print directly to stdout/stderr
-    // and ensure propagation so all library logs reach the root and the Rust bridge handler.
+    // Deduplicate output: remove Python StreamHandlers so logs don't print directly to stdout/stderr,
+    // ensure propagation, and block future basicConfig/addHandler attempts from re-adding them.
     let dedup_code = r#"
-import logging
+import logging, sys
 
 if not getattr(logging, '_kameo_dedup_handlers', False):
     root = logging.getLogger()
@@ -187,28 +222,165 @@ if not getattr(logging, '_kameo_dedup_handlers', False):
     except Exception:
         pass
 
-    # Remove direct StreamHandlers to avoid duplicate console prints from Python side
+    # Mark all existing handlers for preservation (installed by the bridge/setup phase)
+    try:
+        for logger in [root] + [l for l in logging.root.manager.loggerDict.values() if isinstance(l, logging.Logger)]:
+            for h in list(getattr(logger, 'handlers', ())) :
+                try:
+                    setattr(h, '_kameo_preserve', True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Remove direct console StreamHandlers; keep preserved and bridge handlers
     def _is_stream_handler(h):
         try:
             return isinstance(h, logging.StreamHandler)
         except Exception:
             return False
 
+    # Prevent future basicConfig() calls from installing StreamHandlers that print to console
+    try:
+        if not getattr(logging, '_kameo_basicConfig_patched', False):
+            _orig_basicConfig = logging.basicConfig
+
+            def _kameo_basicConfig(*args, **kwargs):
+                # Only honor level; suppress handler installation
+                level = kwargs.get('level', None)
+                try:
+                    if level is not None:
+                        logging.getLogger().setLevel(level)
+                except Exception:
+                    pass
+                # Do NOT add handlers; users' configs must flow to Rust via the bridge
+                return None
+
+            logging.basicConfig = _kameo_basicConfig
+            logging._kameo_basicConfig_patched = True
+    except Exception:
+        pass
+
     try:
         # Root
-        for h in list(getattr(root, 'handlers', ())):
-            if _is_stream_handler(h):
-                root.removeHandler(h)
+        for h in list(getattr(root, 'handlers', ())) :
+            try:
+                if getattr(h, '_kameo_preserve', False):
+                    continue
+                if _is_stream_handler(h):
+                    stream = getattr(h, 'stream', None)
+                    if stream in (getattr(sys, 'stdout', None), getattr(sys, 'stderr', None)):
+                        root.removeHandler(h)
+            except Exception:
+                pass
         # Named loggers
         for logger in [l for l in logging.root.manager.loggerDict.values() if isinstance(l, logging.Logger)]:
-            for h in list(getattr(logger, 'handlers', ())):
-                if _is_stream_handler(h):
-                    logger.removeHandler(h)
+            for h in list(getattr(logger, 'handlers', ())) :
+                try:
+                    if getattr(h, '_kameo_preserve', False):
+                        continue
+                    if _is_stream_handler(h):
+                        stream = getattr(h, 'stream', None)
+                        if stream in (getattr(sys, 'stdout', None), getattr(sys, 'stderr', None)):
+                            logger.removeHandler(h)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Block future additions of console StreamHandlers; preserve marked handlers
+    try:
+        if not getattr(logging, '_kameo_addHandler_patched', False):
+            _orig_addHandler = logging.Logger.addHandler
+
+            def _kameo_addHandler(self, h):
+                try:
+                    if getattr(h, '_kameo_preserve', False):
+                        return _orig_addHandler(self, h)
+                    is_stream = isinstance(h, logging.StreamHandler)
+                except Exception:
+                    is_stream = False
+                if is_stream:
+                    try:
+                        stream = getattr(h, 'stream', None)
+                        if stream in (getattr(sys, 'stdout', None), getattr(sys, 'stderr', None)):
+                            return None
+                    except Exception:
+                        return None
+                return _orig_addHandler(self, h)
+
+            logging.Logger.addHandler = _kameo_addHandler
+            logging._kameo_addHandler_patched = True
     except Exception:
         pass
 
     logging._kameo_dedup_handlers = True
+    # One-time probe to verify INFO routing through the Rust bridge
+    try:
+        logging.info("kameo_python_bridge_ready")
+    except Exception:
+        pass
 "#;
     py.run(std::ffi::CString::new(dedup_code).unwrap().as_c_str(), None, None)?;
+
+    // Ensure non-stream handlers (e.g., the Rust tracing bridge handler) do not filter below INFO
+    // by forcing their level to NOTSET, letting Rust's EnvFilter control visibility.
+    let level_fix_code = r#"
+import logging
+
+def _is_stream_handler(h):
+    try:
+        return isinstance(h, logging.StreamHandler)
+    except Exception:
+        return False
+
+try:
+    loggers = [logging.getLogger()]
+    for l in logging.root.manager.loggerDict.values():
+        if isinstance(l, logging.Logger):
+            loggers.append(l)
+    for logger in loggers:
+        for h in list(getattr(logger, 'handlers', ())) :
+            try:
+                if not _is_stream_handler(h):
+                    h.setLevel(0)  # NOTSET
+            except Exception:
+                pass
+except Exception:
+    pass
+"#;
+    py.run(std::ffi::CString::new(level_fix_code).unwrap().as_c_str(), None, None)?;
+
+    // Install the kameo_rs_logging module and a Python handler that forwards to Rust tracing
+    install_kameo_rs_logging_module(py)?;
+    let forwarder_code = r#"
+import logging
+import kameo_rs_logging as krl
+
+if not getattr(logging, '_kameo_forward_handler_installed', False):
+    class KameoRustHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                krl._kameo_emit_log(
+                    record.name,
+                    int(record.levelno),
+                    record.getMessage(),
+                    getattr(record, 'pathname', ''),
+                    int(getattr(record, 'lineno', 0)),
+                )
+            except Exception:
+                pass
+
+    h = KameoRustHandler()
+    h.setLevel(logging.NOTSET)
+    root = logging.getLogger()
+    root.addHandler(h)
+    logging._kameo_forward_handler_installed = True
+"#;
+    py.run(std::ffi::CString::new(forwarder_code).unwrap().as_c_str(), None, None)?;
+
+    // Re-assert the bridge handler in case any prior cleanup removed it inadvertently
+    // (idempotent in the bridge crate).
+    let _ = tracing_for_pyo3_logging::setup_logging(py);
     Ok(())
 }
