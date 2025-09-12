@@ -74,7 +74,7 @@ macro_rules! setup_python_subprocess_system {
                                 let actor = kameo_snake_handler::PythonActor::<$msg, ()>::new(config, function);
                                 let async_block = async move {
                                     let (subscriber, _guard) = build_subscriber_with_otel_and_fmt_async_with_config(
-                                        TelemetryExportConfig { otlp_enabled: true, stdout_enabled: true, metrics_enabled: true }
+                                        TelemetryExportConfig { otlp_enabled: true, metrics_enabled: true }
                                     ).await;
                                     tracing::subscriber::set_global_default(subscriber).expect("set global");
                                     tracing::info!("Child process telemetry initialized");

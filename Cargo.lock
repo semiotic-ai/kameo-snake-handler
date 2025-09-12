@@ -230,15 +230,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9555578bc9e57714c812a1f84e4fc5b4d21fcb063490c624de019f7464c91268"
 
 [[package]]
-name = "chrono"
-version = "0.4.41"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c469d952047f47f91b68d1cba3f10d63c11d73e4636f24f08daf0278abf01c4d"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "console-api"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1113,7 +1104,6 @@ dependencies = [
  "once_cell",
  "opentelemetry",
  "opentelemetry-otlp",
- "opentelemetry-stdout",
  "opentelemetry_sdk",
  "proptest",
  "pyo3",
@@ -1489,17 +1479,6 @@ dependencies = [
  "opentelemetry_sdk",
  "prost 0.13.5",
  "tonic 0.13.1",
-]
-
-[[package]]
-name = "opentelemetry-stdout"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "447191061af41c3943e082ea359ab8b64ff27d6d34d30d327df309ddef1eef6f"
-dependencies = [
- "chrono",
- "opentelemetry",
- "opentelemetry_sdk",
 ]
 
 [[package]]

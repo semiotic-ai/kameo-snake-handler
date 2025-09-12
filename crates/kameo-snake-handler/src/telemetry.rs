@@ -8,7 +8,6 @@ use opentelemetry_sdk::{
     metrics::SdkMeterProvider, propagation::TraceContextPropagator, trace::SdkTracerProvider,
     Resource,
 };
-use opentelemetry_stdout::SpanExporter;
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::EnvFilter;
@@ -56,8 +55,6 @@ impl Drop for OtelGuard {
 pub struct TelemetryExportConfig {
     /// Enable OTLP exporter (default: true)
     pub otlp_enabled: bool,
-    /// Enable stdout exporter (default: true)
-    pub stdout_enabled: bool,
     /// Enable metrics exporter (default: true)
     pub metrics_enabled: bool,
 }
@@ -66,7 +63,6 @@ impl Default for TelemetryExportConfig {
     fn default() -> Self {
         Self {
             otlp_enabled: true,
-            stdout_enabled: true,
             metrics_enabled: true,
         }
     }
@@ -104,11 +100,7 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
         };
         provider_builder = provider_builder.with_batch_exporter(exporter);
     }
-    if config.stdout_enabled {
-        tracing::debug!("Adding opentelemetry_stdout::SpanExporter for local debug");
-        let exporter = SpanExporter::default();
-        provider_builder = provider_builder.with_simple_exporter(exporter);
-    }
+    // No stdout span exporter; traces go to OTEL only if enabled
 
     let tracer_provider = provider_builder
         .with_resource(resource_from_env_or_default("kameo-snake"))
@@ -123,16 +115,8 @@ pub async fn build_subscriber_with_otel_and_fmt_async_with_config(
 
     let tracer = tracer_provider.tracer("rust_trace_exporter");
     let otel_layer = OpenTelemetryLayer::new(tracer);
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_level(true)
-        .with_thread_ids(true)
-        .with_thread_names(true)
-        .with_ansi(true);
-
     let subscriber = Registry::default()
         .with(otel_layer)
-        .with(fmt_layer)
         .with(EnvFilter::from_default_env());
 
     // Initialize metrics if enabled
@@ -182,11 +166,7 @@ pub fn setup_otel_layer_with_config(
         };
         provider_builder = provider_builder.with_batch_exporter(exporter);
     }
-    if config.stdout_enabled {
-        tracing::info!("Adding opentelemetry_stdout::SpanExporter for local debug");
-        let exporter = SpanExporter::default();
-        provider_builder = provider_builder.with_simple_exporter(exporter);
-    }
+    // No stdout span exporter; traces go to OTEL only if enabled
 
     let tracer_provider = provider_builder
         .with_resource(resource_from_env_or_default("kameo-snake"))

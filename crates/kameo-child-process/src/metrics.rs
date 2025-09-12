@@ -408,7 +408,7 @@ impl MetricsReporter {
         let (parent_max, callback_max) = Self::get_max_inflight_counts();
         let (parent_errors, callback_errors) = Self::get_error_counts();
 
-        tracing::info!(
+        tracing::debug!(
             event = "metrics_summary",
             parent_inflight,
             callback_inflight,
